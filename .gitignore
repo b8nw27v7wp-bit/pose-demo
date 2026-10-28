@@ -1,0 +1,11 @@
+# 依赖的二进制资产（不进 git，用 scripts/fetch-assets.py 拉取）
+web/vendor/
+web/models/
+
+# 本地临时
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc

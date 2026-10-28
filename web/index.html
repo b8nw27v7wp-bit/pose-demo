@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>通用姿态识别</title>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --card: #ffffff;
+    --line: #e3e3e6;
+    --line-strong: #1d1d1f;
+    --text: #1d1d1f;
+    --sub: #6e6e73;
+    --mute: #8e8e93;
+    --ok: #2f8f5b;
+    --warn: #b07d18;
+    --bad: #b23b2e;
+    --stage: #101012;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+                 "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, select, input { font: inherit; }
+
+  /* ---------- 顶栏 ---------- */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    height: 52px; padding: 0 20px;
+    background: rgba(255,255,255,.86);
+    border-bottom: 1px solid var(--line);
+    backdrop-filter: saturate(1.6) blur(12px);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { display: flex; align-items: baseline; gap: 8px; }
+  .brand h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+  .brand span { font-size: 11px; color: var(--mute); font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+  .metrics { display: flex; align-items: center; gap: 16px; font-size: 12px; color: var(--sub); font-variant-numeric: tabular-nums; }
+  .metrics b { font-weight: 500; color: var(--text); }
+  .status { display: inline-flex; align-items: center; gap: 6px; }
+  .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--mute); }
+  .status.ok::before { background: var(--ok); }
+  .status.busy::before { background: var(--warn); }
+  .status.err::before { background: var(--bad); }
+
+  /* ---------- 工具条 ---------- */
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 20px;
+    background: #fff; border-bottom: 1px solid var(--line);
+  }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    border: 0; background: #fff; color: var(--sub);
+    padding: 6px 10px; font-size: 12.5px; cursor: pointer;
+  }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button.on { background: var(--text); color: #fff; }
+  .toolbar label.file { display: inline-flex; }
+  .toolbar .file input { display: none; }
+  .toolbar .file span {
+    display: inline-block; padding: 6px 10px; font-size: 12.5px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 8px; color: var(--sub); background: #fff;
+  }
+  .toolbar .file:hover span { color: var(--text); }
+  select {
+    border: 1px solid var(--line); border-radius: 8px; background: #fff;
+    color: var(--text); padding: 6px 10px; font-size: 12.5px; cursor: pointer;
+  }
+  .spacer { flex: 1; }
+  .toggles { display: flex; align-items: center; gap: 14px; }
+  .toggles label {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12.5px; color: var(--sub); cursor: pointer; user-select: none;
+  }
+  .toggles input { accent-color: var(--text); width: 13px; height: 13px; margin: 0; cursor: pointer; }
+
+  /* ---------- 主体 ---------- */
+  main {
+    display: grid; grid-template-columns: minmax(0, 1fr) 356px;
+    gap: 16px; padding: 16px 20px 24px; align-items: start;
+  }
+  @media (max-width: 1000px) {
+    main { grid-template-columns: 1fr; }
+  }
+
+  .stage {
+    position: relative; background: var(--stage);
+    border-radius: var(--radius); overflow: hidden;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    /* 竖屏视频会把 aspect-ratio 撑得极高，必须封顶，否则整页被拉到几千像素 */
+    max-height: max(320px, calc(100vh - 190px));
+    display: flex; align-items: center; justify-content: center;
+  }
+  .stage video, .stage canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain;
+  }
+  .stage.mirror video, .stage.mirror canvas { transform: scaleX(-1); }
+  .stage canvas { pointer-events: none; }
+
+  .badges { position: absolute; inset: 10px 12px auto 12px; display: flex; justify-content: space-between; pointer-events: none; }
+  .badge {
+    font-size: 11px; padding: 3px 7px; border-radius: 6px;
+    background: rgba(0,0,0,.45); color: #ebebef; font-variant-numeric: tabular-nums;
+    backdrop-filter: blur(4px);
+  }
+  .badge.warn { background: rgba(178,59,46,.75); color: #fff; }
+  .badge[hidden] { display: none; }
+
+  .placeholder { position: relative; z-index: 2; text-align: center; color: #9a9aa0; padding: 24px; }
+  .placeholder p { margin: 4px 0; }
+  .placeholder .hint { font-size: 12px; color: #6e6e73; }
+  .placeholder[hidden] { display: none; }
+
+  /* ---------- 面板 ---------- */
+  .panel { display: flex; flex-direction: column; gap: 8px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 11px 14px;
+  }
+  .card-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 9px; }
+  .label { font-size: 11px; letter-spacing: .06em; color: var(--mute); }
+  .meta { font-size: 11px; color: var(--mute); font-variant-numeric: tabular-nums; }
+
+  .posture-row { display: flex; align-items: baseline; gap: 10px; }
+  .posture { font-size: 26px; font-weight: 600; letter-spacing: -.02em; line-height: 1.1; }
+  .posture.dim { color: var(--mute); font-weight: 500; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+  .chip {
+    font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--mute); background: #fff;
+  }
+  .chip.on { border-color: var(--line-strong); color: var(--text); background: #fafafa; }
+
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .act {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px;
+    font-size: 12px; color: var(--sub); background: #fff;
+    transition: border-color .12s, color .12s, background .12s;
+  }
+  .act.on { border-color: var(--line-strong); color: var(--text); background: #fafafa; }
+
+  .hands { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
+  .hand {
+    display: flex; align-items: center; justify-content: space-between;
+    border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; font-size: 12px;
+  }
+  .hand .hk { color: var(--mute); font-size: 11px; }
+  .hand .hv { font-weight: 500; color: var(--mute); }
+  .hand.on .hv { color: var(--text); }
+
+  table.kv { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table.kv td { padding: 3px 0; font-size: 12.5px; }
+  table.kv td:first-child { color: var(--sub); }
+  table.kv td:last-child {
+    text-align: right; font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 12px; color: var(--text);
+  }
+  table.kv tr + tr td { border-top: 1px solid #f2f2f4; }
+
+  .spark-wrap { margin-top: 8px; }
+  .spark-wrap canvas { width: 100%; height: 60px; display: block; }
+  .spark-legend { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--mute); margin-top: 2px; }
+
+  .reps { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+  .rep { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+  .rep .num { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .rep .cap { font-size: 10.5px; color: var(--mute); }
+
+  button.ghost {
+    width: 100%; padding: 6px 10px;
+    border: 1px solid var(--line); border-radius: 8px;
+    background: #fff; color: var(--text); font-size: 12.5px; cursor: pointer;
+  }
+  button.ghost:hover { border-color: #c9c9ce; }
+  .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
+  .hint { font-size: 11px; color: var(--mute); margin-top: 7px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <h1>通用姿态识别</h1>
+    <span>pose-demo</span>
+  </div>
+  <div class="metrics">
+    <span id="status" class="status">初始化…</span>
+    <span>推理 <b id="fps">—</b> fps</span>
+  </div>
+</div>
+
+<div class="toolbar">
+  <div class="seg">
+    <button id="btnCamera" class="on">摄像头</button>
+    <button id="btnStop">停止</button>
+  </div>
+  <label class="file"><span>上传视频</span><input id="fileInput" type="file" accept="video/*"></label>
+  <select id="modelSel" title="姿态模型">
+    <option value="lite" selected>lite</option>
+    <option value="full">full</option>
+  </select>
+  <select id="delegateSel" title="推理后端">
+    <option value="GPU">GPU</option>
+    <option value="CPU">CPU</option>
+  </select>
+  <select id="fpsCapSel" title="推理帧率上限">
+    <option value="10">10 fps</option>
+    <option value="15" selected>15 fps</option>
+    <option value="30">30 fps</option>
+  </select>
+  <div class="spacer"></div>
+  <div class="toggles">
+    <label><input id="chkSkeleton" type="checkbox" checked>骨架</label>
+    <label><input id="chkHands" type="checkbox" checked>手部</label>
+    <label><input id="chkPoints" type="checkbox" checked>关键点</label>
+    <label><input id="chkMirror" type="checkbox" checked>镜像</label>
+  </div>
+</div>
+
+<main>
+  <section class="stage mirror" id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div class="badges">
+      <span class="badge" id="badgeRes" hidden>—</span>
+      <span class="badge warn" id="badgeNoPerson" hidden>未检出人体</span>
+    </div>
+    <div class="placeholder" id="placeholder">
+      <p>还没有输入画面</p>
+      <p class="hint">点「摄像头」开始，或「上传视频」用已有片段</p>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <div class="card">
+      <div class="card-head">
+        <span class="label">当前姿态</span>
+        <span class="meta" id="postureMeta">—</span>
+      </div>
+      <div class="posture-row">
+        <div class="posture dim" id="posture">—</div>
+      </div>
+      <div class="chips" id="postureChips"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="label">手臂与手势</span>
+        <span class="meta" id="handMeta">—</span>
+      </div>
+      <div class="actions" id="armGrid"></div>
+      <div class="hands">
+        <div class="hand" id="handLCard"><span class="hk">左手</span><span class="hv" id="handL">—</span></div>
+        <div class="hand" id="handRCard"><span class="hk">右手</span><span class="hv" id="handR">—</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="label">信号</span>
+        <span class="meta" id="signalMeta">—</span>
+      </div>
+      <table class="kv" id="angles"></table>
+      <div class="spark-wrap">
+        <canvas id="spark" width="640" height="128"></canvas>
+        <div class="spark-legend"><span>膝角 · 最近 5 秒</span><span>下阈 100° / 上阈 150°</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="label">计数 · 记录</span>
+        <span class="meta" id="repMeta">—</span>
+      </div>
+      <div class="reps">
+        <div class="rep"><div class="num" id="repSquat">0</div><div class="cap">深蹲</div></div>
+        <div class="rep"><div class="num" id="repPushup">0</div><div class="cap">俯卧撑</div></div>
+        <div class="rep"><div class="num" id="repClap">0</div><div class="cap">鼓掌</div></div>
+      </div>
+      <div class="btn-row">
+        <button id="btnReset" class="ghost">重置计数</button>
+        <button id="btnExport" class="ghost">导出 JSON</button>
+      </div>
+      <div class="hint" id="logInfo">—</div>
+    </div>
+  </aside>
+</main>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

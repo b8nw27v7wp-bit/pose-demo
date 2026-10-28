@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>pose-demo 自检</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Consolas, monospace; background:#f5f5f7; color:#1d1d1f; margin:16px; }
+  h1 { font-size: 15px; }
+  #out { white-space: pre-wrap; background:#fff; border:1px solid #e5e5e7; border-radius:8px; padding:12px; }
+  #wrap { display:flex; gap:16px; align-items:flex-start; }
+  canvas { border:1px solid #e5e5e7; border-radius:8px; background:#fff; max-width:320px; height:auto; }
+  .ok { color:#2f8f5b; } .bad { color:#b23b2e; }
+</style>
+</head>
+<body>
+<h1>pose-demo 自检 · <span id="mode"></span></h1>
+<div id="wrap">
+  <div>
+    <img id="img" alt="" hidden>
+    <video id="vid" muted playsinline loop hidden></video>
+    <canvas id="cv"></canvas>
+  </div>
+  <div id="out">running…</div>
+</div>
+
+<script type="module">
+import { createEstimator, detectImage, detectVideo, toPersons } from '../js/pose.js';
+import { createHandEstimator, detectHandsImage, toHands, classifyHand } from '../js/hands.js';
+import { SignalEngine, angleDeg } from '../js/signals.js';
+import { ActionEngine } from '../js/actions.js';
+import { drawSkeleton, drawHand } from '../js/draw.js';
+
+const params = new URLSearchParams(location.search);
+const mode = params.get('mode') || 'image';
+const model = params.get('model') || 'full';
+const numPoses = Number(params.get('poses') || 1) || 1;
+const detConf = Number(params.get('conf') || 0.5) || 0.5;
+document.getElementById('mode').textContent = `${mode} / ${model} / ${numPoses}人 / conf ${detConf}`;
+
+const out = document.getElementById('out');
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const log = (o) => { out.textContent = JSON.stringify(o, null, 2); window.__verifyResult = o; };
+
+function sigOf(person, ts) {
+  const se = new SignalEngine();
+  const sig = se.update(person, ts);
+  const ae = new ActionEngine();
+  const act = ae.update(sig, ts);
+  return {
+    knee_avg: +sig.knee_avg.toFixed(1),
+    elbow_avg: +sig.elbow_avg.toFixed(1),
+    uprightness: +sig.uprightness.toFixed(3),
+    leg_vertical: +sig.leg_vertical.toFixed(2),
+    scale: +sig.scale.toFixed(1),
+    posture: act.posture,
+    flags: act.flags,
+  };
+}
+
+async function runImage() {
+  const img = document.getElementById('img');
+  img.src = params.get('img') || '../../data/pose-test.jpg';
+  await img.decode();
+
+  await createEstimator({ model, delegate: 'CPU', runningMode: 'IMAGE', numPoses, detConf });
+  const res = detectImage(img);
+  const persons = toPersons(res, img.naturalWidth, img.naturalHeight);
+
+  cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+  if (persons.length) {
+    persons.forEach((p, i) => drawSkeleton(ctx, p.kp_raw, cv.width, cv.height, { clear: i === 0, alpha: i === 0 ? 1 : 0.5 }));
+  }
+
+  const p = persons[0];
+  log({
+    mode: 'image',
+    image: [img.naturalWidth, img.naturalHeight],
+    person_count: persons.length,
+    raw_landmarks: res.landmarks ? res.landmarks.length : 0,
+    num_poses_opt: numPoses,
+    bboxes: persons.map((q) => q.bbox.map(Math.round)),
+    landmark_count: p ? p.kp_raw.length : 0,
+    kp_format: p ? p.kp_format : null,
+    score: p ? +p.score.toFixed(3) : null,
+    signals: p ? sigOf(p, 1000) : null,
+    sample_kp: p ? { nose: p.kp[0].map(Math.round), knee_L: p.kp[9].map(Math.round), ankle_R: p.kp[12].map(Math.round) } : null,
+    pass: !!p && p.kp_raw.length === 33,
+  });
+}
+
+async function runVideo() {
+  const vid = document.getElementById('vid');
+  vid.src = params.get('vid') || '../../data/pose-test-vp8.webm';
+  await new Promise((r, j) => { vid.onloadeddata = r; vid.onerror = () => j(new Error('video load failed')); });
+  await vid.play();
+
+  await createEstimator({ model, delegate: 'CPU', runningMode: 'VIDEO', numPoses });
+  const se = new SignalEngine();
+  const ae = new ActionEngine();
+
+  const frames = [];
+  let n = 0;
+  let maxPersons = 0;
+  const t0 = performance.now();
+
+  await new Promise((resolve) => {
+    function step() {
+      if (n >= 30) return resolve();
+      const ts = performance.now();
+      const res = detectVideo(vid, ts);
+      const persons = toPersons(res, vid.videoWidth, vid.videoHeight);
+      maxPersons = Math.max(maxPersons, persons.length);
+      if (persons.length) {
+        const sig = se.update(persons[0], ts);
+        const act = ae.update(sig, ts);
+        frames.push({ n, knee: +sig.knee_avg.toFixed(1), up: +sig.uprightness.toFixed(2), posture: act.posture });
+        if (n === 0) { cv.width = vid.videoWidth; cv.height = vid.videoHeight; drawSkeleton(ctx, persons[0].kp_raw, cv.width, cv.height); }
+      }
+      n++;
+      requestAnimationFrame(step);
+    }
+    step();
+  });
+
+  const dt = performance.now() - t0;
+  const detected = frames.length;
+  log({
+    mode: 'video',
+    video: [vid.videoWidth, vid.videoHeight],
+    num_poses_opt: numPoses,
+    frames_processed: n,
+    frames_with_person: detected,
+    max_persons: maxPersons,
+    fps: +(n / (dt / 1000)).toFixed(1),
+    first: frames[0] || null,
+    last: frames[frames.length - 1] || null,
+    pass: detected >= 25,
+  });
+}
+
+async function runHand() {
+  const img = document.getElementById('img');
+  img.src = params.get('img') || '../../data/pose-test-two.jpg';
+  await img.decode();
+
+  await createHandEstimator({ delegate: 'CPU', runningMode: 'IMAGE', numHands: 2 });
+  const res = detectHandsImage(img);
+  const hands = toHands(res, img.naturalWidth, img.naturalHeight);
+
+  cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+  for (const hd of hands) drawHand(ctx, hd.kp, cv.width, cv.height);
+
+  log({
+    mode: 'hand',
+    image: [img.naturalWidth, img.naturalHeight],
+    hand_count: hands.length,
+    hands: hands.map((hd) => {
+      const cls = classifyHand(hd.kp);
+      return {
+        side: hd.handedness,
+        score: +hd.score.toFixed(3),
+        shape: cls.shape,
+        label: cls.label,
+        fingers: cls.fingers,
+        bbox: hd.bbox.map(Math.round),
+      };
+    }),
+    pass: hands.length > 0,
+  });
+}
+
+try {
+  if (mode === 'hand') await runHand();
+  else if (mode === 'video') await runVideo();
+  else await runImage();
+} catch (e) {
+  log({ mode, pass: false, error: String(e && e.stack || e) });
+}
+</script>
+</body>
+</html>
