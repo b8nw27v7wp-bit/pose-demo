@@ -1,0 +1,29 @@
+{
+  "name": "sample（合成数据，非实拍）",
+  "source": "web/test/make-sample.mjs",
+  "note": "合成姿态，仅用于验证评估链路。真实阈值必须用实拍素材拟合。",
+  "segments": [
+    {
+      "action": "stand",
+      "start": 500,
+      "end": 1900
+    },
+    {
+      "action": "squat",
+      "start": 2000,
+      "end": 4000,
+      "count": 1,
+      "tol": 0
+    },
+    {
+      "action": "stand",
+      "start": 4200,
+      "end": 4900
+    },
+    {
+      "action": "armRaised",
+      "start": 5400,
+      "end": 6700
+    }
+  ]
+}

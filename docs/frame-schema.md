@@ -69,11 +69,24 @@
 
 ## 记录与导出
 
-Demo 里最多保留 600 帧（`app.js` 的 `MAX_LOG`），导出为：
+Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 10%），导出为 **JSONL**：
 
-```json
-{ "exported_at": "...", "schema": "frame.jsonl v0", "kp_format": "mediapipe33",
-  "fps": 30.2, "frame_count": 562, "frames": [ /* 上面那种记录 */ ] }
+```
+第一行：{"exported_at":"...","schema":"frame.jsonl v0","kp_format":"mediapipe33",
+        "profile":"fitness","params":{...},"fps":15.3,"frame_count":562}
+后续每行：一条帧记录（上面那种结构）
 ```
 
+为什么是 JSONL 而不是一个大 JSON 对象：20000 帧的整份 `JSON.stringify` 实测产生 40MB 字符串、
+峰值堆 184MB、阻塞主线程约 300ms。按行导出后浏览器分块拼 Blob，主线程只处理 500 行一块。
+
+`evaluate.mjs` 直接读这个格式（首行 meta 会被跳过），也兼容旧版 `{frames:[...]}` 与裸数组。
+
 引擎侧落盘格式相同，一行一条（JSONL），便于 `jq` 与逐帧回放。
+
+## persons 里的 kp_world
+
+`kp_world` 是 MediaPipe 的米制世界坐标（33 点，原点在髋中心，y 轴向下为正）。
+
+**必须导出**：动作层的举手判定在 `has_world` 为真时用 3D 抬臂角，为假时退回 2D。
+漏掉 `kp_world` 会让离线评估永远走 2D，报告的结论就不是页面实际执行的规则。

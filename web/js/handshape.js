@@ -19,8 +19,64 @@ export const SHAPE_LABELS = {
   pointing: '指方向',
   thumbs_up: '竖拇指',
   ok: 'OK',
+  gun: '手枪',
+  rock: '摇滚',
   unknown: '—',
 };
+
+/**
+ * 手势去抖：连续 N 帧命中同一手势才切换。
+ * 没有它，「张开」和「剪刀手」在阈值附近会来回闪（PLAN §12.1 的「手势偶尔串」就是它）。
+ * 当前手势持续命中时保持；出现新的稳定手势才切换；判不出来时保留上一结果若干帧再清空。
+ */
+export class HandShapeStabilizer {
+  constructor({ streak = 3, keepMs = 250 } = {}) {
+    this.streak = streak;
+    this.keepMs = keepMs;
+    this.last = 'unknown';
+    this.candidate = null;
+    this.candidateCount = 0;
+    this.lastSeenTs = 0;
+  }
+
+  update(shape, ts) {
+    if (shape && shape !== 'unknown') {
+      if (shape === this.last) {
+        this.candidate = null;
+        this.candidateCount = 0;
+        this.lastSeenTs = ts;
+        return this.last;
+      }
+      if (shape === this.candidate) this.candidateCount++;
+      else { this.candidate = shape; this.candidateCount = 1; }
+
+      if (this.candidateCount >= this.streak) {
+        this.last = shape;
+        this.candidate = null;
+        this.candidateCount = 0;
+        this.lastSeenTs = ts;
+      }
+      return this.last;
+    }
+
+    // 判不出来：中断候选计数。streak 必须是**连续**命中，
+    // 否则 unknown 隔开的零散误判也能凑满（victory,victory,unknown,victory 就会切换）。
+    this.candidate = null;
+    this.candidateCount = 0;
+    // 但短时间内保留上一次结果（手转个角度不该让面板闪成「—」）
+    if (this.last !== 'unknown' && ts - this.lastSeenTs > this.keepMs) {
+      this.last = 'unknown';
+    }
+    return this.last;
+  }
+
+  reset() {
+    this.last = 'unknown';
+    this.candidate = null;
+    this.candidateCount = 0;
+    this.lastSeenTs = 0;
+  }
+}
 
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 
@@ -70,6 +126,10 @@ export function classifyHand(kp) {
   if (pinch < 0.45 && ext.middle && ext.ring && ext.pinky) shape = 'ok';
   else if (ext.thumb && extendedCount === 0 && thumbUp > 0.35) shape = 'thumbs_up';
   else if (ext.index && ext.middle && !ext.ring && !ext.pinky) shape = 'victory';
+  // 手枪：拇指 + 食指伸，其余三指弯（比「只有食指」好认，且是和 thumbs_up 区分开的）
+  else if (ext.thumb && ext.index && !ext.middle && !ext.ring && !ext.pinky) shape = 'gun';
+  // 摇滚：食指 + 小指伸，中指无名指弯
+  else if (ext.index && !ext.middle && !ext.ring && ext.pinky) shape = 'rock';
   else if (ext.index && !ext.middle && !ext.ring && !ext.pinky) shape = 'pointing';
   else if (extendedCount === 0 && !ext.thumb) shape = 'fist';
   else if (extendedCount >= 4) shape = 'open';
@@ -82,6 +142,8 @@ export function classifyHand(kp) {
     pointing: ext.index && !ext.middle && !ext.ring && !ext.pinky,
     thumbs_up: ext.thumb && extendedCount === 0,
     ok: pinch < 0.45,
+    gun: ext.thumb && ext.index && !ext.middle && !ext.ring && !ext.pinky,
+    rock: ext.index && !ext.middle && !ext.ring && ext.pinky,
   }[shape];
 
   return { shape, label: SHAPE_LABELS[shape], fingers: ext, pinch, score: clean ? 1 : 0.5 };

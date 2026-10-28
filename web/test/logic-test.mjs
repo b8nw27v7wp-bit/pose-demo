@@ -4,10 +4,10 @@
 // 说明：这里验证的是**判定逻辑**（角度、滤波、滞回、计数门控、姿态互斥、置信冻结），
 // 用人工构造的骨架/信号序列，不代表真实场景精度。真实精度必须用实拍素材校准。
 
-import { angleDeg, OneEuro, Hold, RepCounter, SignalEngine } from '../js/signals.js';
+import { angleDeg, angleDeg3, OneEuro, Hold, RepCounter, SignalEngine } from '../js/signals.js';
 import { ActionEngine } from '../js/actions.js';
-import { classifyHand } from '../js/handshape.js';
-import { toHands } from '../js/handformat.js';
+import { classifyHand, HandShapeStabilizer } from '../js/handshape.js';
+import { toHands, handOrientation, spreadRatio } from '../js/handformat.js';
 
 let pass = 0;
 let fail = 0;
@@ -279,9 +279,18 @@ console.log('\n[10] 手臂信号');
   const cross = se3.update(person(base([120, 160, 1], [80, 160, 1])), 1000);
   check('两腕顺序相对肩膀翻转 → 抱臂', cross.armPose.crossed === true);
 
+  // 手自然下垂：腕就在髋旁（旧判据会误判成叉腰），但肘没有外张 → 不算叉腰
   const se4 = new SignalEngine();
-  const hips = se4.update(person(base([95, 215, 1], [105, 215, 1])), 1000);
-  check('两腕贴髋 → 叉腰', hips.armPose.on_hips === true);
+  const hang = se4.update(person(base([95, 215, 1], [105, 215, 1])), 1000);
+  check('手自然下垂 → 不算叉腰', hang.armPose.on_hips === false);
+
+  // 真叉腰：腕贴髋 **且肘外张**（肘的 x 明显离开肩-髋连线）
+  const se4b = new SignalEngine();
+  const hipsKp = base([95, 215, 1], [105, 215, 1]);
+  hipsKp[3] = [60, 165, 1];   // 左肘外张
+  hipsKp[4] = [140, 165, 1];  // 右肘外张
+  const hips = se4b.update(person(hipsKp), 1000);
+  check('腕贴髋 + 肘外张 → 叉腰', hips.armPose.on_hips === true);
 
   const se5 = new SignalEngine();
   const wide = se5.update(person(base([-20, 100, 1], [220, 100, 1])), 1000);
@@ -477,6 +486,276 @@ console.log('\n[16] 手部结果映射');
 
   const empty = toHands({ landmarks: [[{ x: 0, y: 0 }]] }, 1000, 1000);
   check('点数不足 21 的手被跳过', empty.length === 0);
+}
+
+// —— 17. 三维夹角 + 3D 抬臂角（抗俯仰）——
+console.log('\n[17] 3D 信号');
+{
+  check('3D 直角', near(angleDeg3([1, 0, 0], [0, 0, 0], [0, 1, 0]), 90));
+  check('3D 零向量返回 NaN', Number.isNaN(angleDeg3([0, 0, 0], [0, 0, 0], [1, 0, 0])));
+
+  // 带 world 的站姿：手臂自然下垂（腕在肩下方），3D 抬臂角应接近 180°
+  const withWorld = (kp, world) => ({ ...person(kp), kp_world: world });
+  const mkW = (over = {}) => {
+    const w = new Array(33).fill(null).map(() => ({ x: 0, y: 0, z: 0 }));
+    const set = (i, x, y, z) => { w[i] = { x, y, z }; };
+    // 躯干：hip 在 y=0，肩在 y=-0.48（世界坐标 y 向下为正）
+    set(23, -0.1, 0, 0); set(24, 0.1, 0, 0);
+    set(11, -0.16, -0.48, 0); set(12, 0.16, -0.48, 0);
+    set(0, 0, -0.62, 0);
+    // 左臂自然下垂：腕在肩正下方
+    set(13, -0.2, -0.25, 0); set(15, -0.2, 0.05, 0);
+    // 右臂举起：腕在肩正上方
+    set(14, 0.2, -0.75, 0); set(16, 0.2, -1.05, 0);
+    for (const [k, v] of Object.entries(over)) set(Number(k), v[0], v[1], v[2]);
+    return w.map((p) => [p.x, p.y, p.z]);
+  };
+  const se = new SignalEngine();
+  const s = se.update(withWorld(standKp, mkW()), 1000);
+  check('有 world → has_world=true', s.armPose.has_world === true);
+  check('自然下垂 3D 抬臂角 ≈180°', near(s.armPose.elev_torso_L, 180, 20), `L=${s.armPose.elev_torso_L.toFixed(0)}`);
+  check('举起 3D 抬臂角 ≈0°', near(s.armPose.elev_torso_R, 0, 20), `R=${s.armPose.elev_torso_R.toFixed(0)}`);
+  check('右臂举起 → raised3d_R', s.arm.raised3d_R === true);
+  check('左臂下垂 → 不 raised3d_L', s.arm.raised3d_L === false);
+
+  // 没有 world 时不崩，has_world=false，下游退回 2D
+  const se2 = new SignalEngine();
+  const s2 = se2.update(person(standKp), 1000);
+  check('无 world → has_world=false', s2.armPose.has_world === false);
+  check('无 world → 3D 抬臂角 NaN', Number.isNaN(s2.armPose.elev_torso_L));
+}
+
+// —— 18. 手在头部附近 ——
+console.log('\n[18] 手在头部');
+{
+  const base = (wl, wr) => [
+    [100, 50, 1],
+    [90, 100, 1], [110, 100, 1],
+    [85, 150, 1], [115, 150, 1],
+    wl, wr,
+    [92, 220, 1], [108, 220, 1],
+    [90, 300, 1], [110, 300, 1],
+    [88, 380, 1], [112, 380, 1],
+  ];
+  const se = new SignalEngine();
+  // 腕贴近鼻尖（鼻在 [100,50]，scale≈120，阈值 0.85·scale≈102px）
+  const near2 = se.update(person(base([120, 60, 1], [110, 210, 1])), 1000);
+  check('腕贴近鼻尖 → head_near_L', near2.arm.head_near_L === true,
+    `reach=${near2.armPose.reach_head_L?.toFixed(2)}`);
+  check('另一只手自然下垂 → 不 head_near_R', near2.arm.head_near_R === false);
+
+  const se2 = new SignalEngine();
+  const far = se2.update(person(base([80, 210, 1], [120, 210, 1])), 1000);
+  check('手在髋旁 → 不在头部', far.arm.head_near_L === false);
+
+  // 走路时手臂前摆经过脸前：腕离鼻尖不远，但明显低于肩 → 不能算「手在头部」
+  const se3 = new SignalEngine();
+  const swing = se3.update(person(base([105, 150, 1], [95, 210, 1])), 1000);
+  check('走路前摆（腕低于肩）→ 不算手在头部', swing.arm.head_near_R === false,
+    `reach=${swing.armPose.reach_head_R?.toFixed(2)}`);
+}
+
+// —— 18b. 双手高举 ——
+console.log('\n[18b] 双手高举');
+{
+  const both = (wl, wr) => [
+    [100, 50, 1],
+    [90, 100, 1], [110, 100, 1],
+    [85, 150, 1], [115, 150, 1],
+    wl, wr,
+    [92, 220, 1], [108, 220, 1],
+    [90, 300, 1], [110, 300, 1],
+    [88, 380, 1], [112, 380, 1],
+  ];
+  const mkSig = (o = {}) => ({
+    ok: true, knee_pick: 170, elbow_pick: 170, uprightness: 0.95, leg_vertical: 1.3,
+    arm: { any_raised: true, raised_L: true, raised_R: true, raised3d_L: true, raised3d_R: true, head_near_L: false, head_near_R: false },
+    armPose: {
+      elev_L: 10, elev_R: 10, elev_torso_L: 10, elev_torso_R: 10,
+      reach_L: 0.6, reach_R: 0.6, hands_close: 2.0,
+      crossed: false, on_hips: false, open_wide: false, chest_height: false, has_world: false,
+    },
+    wave: { L: 0, R: 0, amp: 0 },
+    ...o,
+  });
+
+  const ae = new ActionEngine();
+  let t = 0;
+  let r = null;
+  for (let i = 0; i < 8; i++) r = ae.update(mkSig(), t += 100);
+  check('双臂都举起 → bothHandsUp', r.flags.bothHandsUp === true);
+
+  // 只举一只手不算双手高举
+  const ae2 = new ActionEngine();
+  let t2 = 0;
+  let r2 = null;
+  for (let i = 0; i < 8; i++) {
+    r2 = ae2.update(mkSig({
+      arm: { any_raised: true, raised_L: true, raised_R: false, raised3d_L: true, raised3d_R: false, head_near_L: false, head_near_R: false },
+    }), t2 += 100);
+  }
+  check('只举一手 → 不算双手高举', r2.flags.bothHandsUp === false);
+  check('只举一手 → 仍算举手', r2.flags.armRaised === true);
+}
+
+// —— 19. 手势抗抖（连续帧才切换）——
+console.log('\n[19] 手势去抖');
+{
+  const st = new HandShapeStabilizer({ streak: 3, keepMs: 250 });
+  check('首帧不切换', st.update('open', 0) === 'unknown');
+  check('第 2 帧不切换', st.update('open', 100) === 'unknown');
+  check('第 3 帧切换', st.update('open', 200) === 'open');
+
+  // 单帧误判不能把稳定手势打掉
+  check('单帧异常保持原手势', st.update('victory', 300) === 'open');
+  check('异常消失仍是原手势', st.update('open', 400) === 'open');
+
+  // 连续 3 帧新手势才切换
+  st.update('victory', 500);
+  st.update('victory', 600);
+  check('新手势连续 3 帧 → 切换', st.update('victory', 700) === 'victory');
+
+  // 判不出来时短暂保持，超过 keepMs 才清空
+  check('判不出来短时保持', st.update('unknown', 800) === 'victory');
+  check('超过 keepMs 清空', st.update('unknown', 1100) === 'unknown');
+}
+
+// —— 20. 新手势 / 朝向 / 张开度 ——
+console.log('\n[20] 手部信号扩展');
+{
+  function buildHand({ index = false, middle = false, ring = false, pinky = false, thumb = 'in' }) {
+    const mcp = { index: [0.35, -1.0], middle: [0.05, -1.05], ring: [-0.25, -1.0], pinky: [-0.5, -0.85] };
+    const base = { index: 5, middle: 9, ring: 13, pinky: 17 };
+    const ext = { index, middle, ring, pinky };
+    const kp = new Array(21).fill(null);
+    kp[0] = [0, 0];
+    for (const f of ['index', 'middle', 'ring', 'pinky']) {
+      const m = mcp[f];
+      const i0 = base[f];
+      let pip, dip, tip;
+      if (ext[f]) {
+        pip = [m[0], m[1] - 0.35]; dip = [m[0], m[1] - 0.6]; tip = [m[0], m[1] - 0.85];
+      } else {
+        pip = [m[0], m[1] - 0.25]; dip = [pip[0] + 0.02, pip[1] - 0.12]; tip = [dip[0] + 0.02, dip[1] + 0.15];
+      }
+      kp[i0] = m; kp[i0 + 1] = pip; kp[i0 + 2] = dip; kp[i0 + 3] = tip;
+    }
+    if (thumb === 'out') {
+      kp[1] = [0.3, -0.3]; kp[2] = [0.55, -0.55]; kp[3] = [0.8, -0.75]; kp[4] = [1.0, -0.9];
+    } else {
+      kp[1] = [0.3, -0.35]; kp[2] = [0.45, -0.5]; kp[3] = [0.4, -0.62]; kp[4] = [0.38, -0.75];
+    }
+    return kp;
+  }
+
+  check('拇指+食指 → 手枪', classifyHand(buildHand({ index: true, thumb: 'out' })).shape === 'gun');
+  check('食指+小指 → 摇滚', classifyHand(buildHand({ index: true, pinky: true })).shape === 'rock');
+  check('手枪不比竖拇指误命中', classifyHand(buildHand({ index: true, thumb: 'out' })).shape !== 'thumbs_up');
+
+  // 朝向：手掌正对镜头 vs 侧对
+  const flat = buildHand({ index: true, middle: true, ring: true, pinky: true, thumb: 'out' });
+  const o = handOrientation(flat);
+  check('张开手 → 有朝向标量', Number.isFinite(o.side));
+  check('朝向含 facing 字段', ['front', 'edge'].includes(o.facing), `facing=${o.facing}`);
+
+  // 张开度：食指与小指的扇开夹角。用「真实握拳」几何——蜷进掌心，指尖收向腕部
+  const openHand = buildHand({ index: true, middle: true, ring: true, pinky: true, thumb: 'out' });
+  const fistHand = buildHand({});
+  // 握拳：把四点指尖收拢到掌心（腕上方一点），这是真实握拳的样子
+  const palm = [0, -0.55];
+  for (const tip of [8, 12, 16, 20]) {
+    fistHand[tip] = [palm[0] + (fistHand[tip][0] - palm[0]) * 0.15, palm[1] + (fistHand[tip][1] - palm[1]) * 0.15];
+  }
+  const spreadOpen = spreadRatio(openHand);
+  const spreadFist = spreadRatio(fistHand);
+  check('张开手比握拳扇开更大', spreadOpen > spreadFist, `open=${spreadOpen}° fist=${spreadFist}°`);
+
+  // toHands 要透传新字段
+  const res = toHands({
+    landmarks: [Array.from({ length: 21 }, (_, i) => ({ x: i * 0.01, y: i * 0.02, z: 0 }))],
+    handednesses: [[{ categoryName: 'Left', score: 0.9 }]],
+  }, 1000, 1000);
+  check('toHands 含 orient', !!res[0].orient);
+  check('toHands 含 spread', Number.isFinite(res[0].spread));
+}
+
+// —— 21. 回归：代码审查发现 ——
+console.log('\n[21] 回归（审查修复）');
+{
+  // 21.1 叉腰：肘被遮挡时不能因为"测不出"就否定真叉腰
+  const mk = (elbow, vis) => [
+    [100, 50, 1],
+    [90, 100, 1], [110, 100, 1],
+    [elbow[0], elbow[1], vis], [140, 165, 1],
+    [95, 215, 1], [105, 215, 1],
+    [92, 220, 1], [108, 220, 1],
+    [90, 300, 1], [110, 300, 1],
+    [88, 380, 1], [112, 380, 1],
+  ];
+  const hipsVisible = new SignalEngine().update(person(mk([60, 165], 1)), 1000);
+  check('真叉腰（肘可见）→ on_hips', hipsVisible.armPose.on_hips === true);
+  // 左肘被遮挡且坐标漂到中线：不能因此判成"不是叉腰"
+  const hipsOccluded = new SignalEngine().update(person(mk([95, 180], 0.1)), 1000);
+  check('真叉腰但肘被遮挡 → 仍判叉腰（不因测不出而否定）',
+    hipsOccluded.armPose.on_hips === true);
+
+  // 21.2 举手/挥手一致性：挥手必须蕴含举手（同一套 2D/3D 选择）
+  const mkSig = (o = {}) => ({
+    ok: true, knee_pick: 170, elbow_pick: 170, uprightness: 0.95, leg_vertical: 1.3,
+    arm: {
+      any_raised: true, any_raised3d: false, raised_L: true, raised_R: true,
+      raised3d_L: false, raised3d_R: false, head_near_L: false, head_near_R: false,
+    },
+    armPose: {
+      elev_L: 170, elev_R: 170, elev_torso_L: 95, elev_torso_R: 95,
+      reach_L: 0.6, reach_R: 0.6, hands_close: 2.0,
+      crossed: false, on_hips: false, open_wide: false, chest_height: false, has_world: true,
+    },
+    wave: { L: 4, R: 0, amp: 0.6 },
+    ...o,
+  });
+  const ae = new ActionEngine();
+  let t = 0; let r = null;
+  for (let i = 0; i < 8; i++) r = ae.update(mkSig(), t += 100);
+  check('3D 未举手 + 2D 举手 → armRaised=false（以 3D 为准）', r.flags.armRaised === false);
+  check('挥手也以 3D 为准 → waving=false（不再出现挥手不举手）', r.flags.waving === false);
+
+  // 3D 也举手时，挥手正常成立
+  const ae2 = new ActionEngine();
+  let t2 = 0; let r2 = null;
+  for (let i = 0; i < 8; i++) {
+    r2 = ae2.update(mkSig({
+      arm: {
+        any_raised: true, any_raised3d: true, raised_L: true, raised_R: true,
+        raised3d_L: true, raised3d_R: true, head_near_L: false, head_near_R: false,
+      },
+      armPose: { ...mkSig().armPose, elev_torso_L: 10, elev_torso_R: 10 },
+    }), t2 += 100);
+  }
+  check('3D 举手 + 挥手 → 两者都成立', r2.flags.armRaised === true && r2.flags.waving === true);
+
+  // 21.3 手势去抖：unknown 必须中断 streak
+  const st = new HandShapeStabilizer({ streak: 3, keepMs: 1000 });
+  st.update('open', 0); st.update('open', 100); st.update('open', 200);
+  st.update('victory', 300); st.update('victory', 400);
+  st.update('unknown', 500);
+  check('unknown 中断候选计数（非连续命中不切换）', st.update('victory', 600) === 'open');
+
+  // keepMs 内 unknown 保持原手势，超过则清空
+  const st2 = new HandShapeStabilizer({ streak: 3, keepMs: 250 });
+  st2.update('fist', 0); st2.update('fist', 100); st2.update('fist', 200);
+  check('keepMs 内 unknown 保持上一手势', st2.update('unknown', 400) === 'fist');
+  check('超 keepMs 的 unknown 清空', st2.update('unknown', 600) === 'unknown');
+
+  // 21.4 visMin 参数真的影响滤波门控
+  const lowVis = new SignalEngine({ signals: { visMin: 0.95 } });
+  const s = lowVis.update(person(withVis0(standKp, 0.5)), 1000);
+  check('visMin 提高后低可见点被当作不可见', Number.isNaN(s.leg_vertical) || Number.isNaN(s.uprightness),
+    `leg=${s.leg_vertical} up=${s.uprightness}`);
+}
+
+function withVis0(kp, v) {
+  return kp.map((p) => [p[0], p[1], v]);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

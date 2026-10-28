@@ -3,7 +3,8 @@
 // 这一层是"通用"的关键：动作判定只认这里的信号，不直接碰关键点。
 // 定义与阈值说明见 docs/signals.md（那份文档是唯一真相）。
 
-import { KPT, IDX } from './kpt.js';
+import { KPT, IDX, MP_INDEX } from './kpt.js';
+import { resolveParams } from './params.js';
 
 /** One Euro 滤波器：静止时不抖、快速动作不拖尾。 */
 export class OneEuro {
@@ -50,6 +51,18 @@ export function angleDeg(a, b, c) {
   const n1 = Math.hypot(v1x, v1y), n2 = Math.hypot(v2x, v2y);
   if (n1 < 1e-6 || n2 < 1e-6) return NaN;
   let cos = (v1x * v2x + v1y * v2y) / (n1 * n2);
+  cos = Math.max(-1, Math.min(1, cos));
+  return (Math.acos(cos) * 180) / Math.PI;
+}
+
+/** 三维两点夹角（度），用于 worldLandmarks。 */
+export function angleDeg3(a, b, c) {
+  if (!a || !b || !c) return NaN;
+  const v1 = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const v2 = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+  const n1 = Math.hypot(...v1), n2 = Math.hypot(...v2);
+  if (n1 < 1e-9 || n2 < 1e-9) return NaN;
+  let cos = (v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]) / (n1 * n2);
   cos = Math.max(-1, Math.min(1, cos));
   return (Math.acos(cos) * 180) / Math.PI;
 }
@@ -114,8 +127,9 @@ export class RepCounter {
 
 /** 关键点滤波器组：每个点两个一维滤波器（x/y）。 */
 class KpFilter {
-  constructor(opts) {
+  constructor(opts, visMin = 0.3) {
     this.opts = opts;
+    this.visMin = visMin;
     this.fx = {}; this.fy = {};
   }
 
@@ -123,7 +137,7 @@ class KpFilter {
     return kp.map(([x, y, v], i) => {
       const name = KPT[i];
       if (!this.fx[name]) { this.fx[name] = new OneEuro(this.opts); this.fy[name] = new OneEuro(this.opts); }
-      if (v < 0.3) {
+      if (v < this.visMin) {
         // 低置信度：保持上一次的滤波值（没有历史才用原始值）。
         // 之前直接返回原始坐标，等于把抖动原封不动喂给角度计算。
         const px = this.fx[name].xPrev;
@@ -158,14 +172,18 @@ class MedianWindow {
  * 信号引擎：吃 person 对象，产出 sig 对象（全部为标量或布尔，时间序列由调用方保存）。
  */
 export class SignalEngine {
-  constructor({ minCutoff = 1.0, beta = 0.05, angleCutoff = 1.5, angleBeta = 0.02 } = {}) {
-    this.kpFilter = new KpFilter({ minCutoff, beta });
-    this.angleOpts = { minCutoff: angleCutoff, beta: angleBeta };
+  constructor(params = {}) {
+    const p = resolveParams(params).signals;
+    this.params = p;
+    this.kpFilter = new KpFilter(p.smoothing, p.visMin);
+    this.angleOpts = { minCutoff: p.smoothing.angleCutoff, beta: p.smoothing.angleBeta };
     this.angleFilters = {};
-    this.scaleWin = new MedianWindow(5);
-    this.upFilter = new OneEuro({ minCutoff: 1.5, beta: 0.02 });
+    this.scaleWin = new MedianWindow(p.scaleMedianFrames);
+    this.upFilter = new OneEuro(p.smoothing.upright);
     this.wristHist = { L: [], R: [] };
-    this.minScore = 0.45;
+    this.minScore = p.minScore;
+    this.visMin = p.visMin;
+    this.minTorsoVis = p.minTorsoVis;
   }
 
   reset() {
@@ -187,13 +205,14 @@ export class SignalEngine {
    */
   update(person, ts) {
     const tSec = ts / 1000;
+    const C = this.params;
     const kp = this.kpFilter.run(person.kp, tSec);
     const P = (name) => kp[IDX[name]];
     const mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
 
     // 可见性门控：不可见的点算出来的几何量是垃圾，必须给 NaN（NaN 参与比较恒为 false）
     const V = (name) => P(name)[2] ?? 0;
-    const VIS_MIN = 0.3;
+    const VIS_MIN = this.visMin;
     const visTorso = Math.min(V('shoulder_L'), V('shoulder_R'), V('hip_L'), V('hip_R'));
     const visAnkle = Math.min(V('ankle_L'), V('ankle_R'));
     const visWristL = V('wrist_L');
@@ -253,8 +272,9 @@ export class SignalEngine {
     const elbowPick = elbowSel.v;
 
     // 举手：腕高于肩（按尺度归一，不按像素），腕不可见就不算
-    const raisedL = visWristL >= VIS_MIN && P('wrist_L')[1] < P('shoulder_L')[1] - 0.15 * scale;
-    const raisedR = visWristR >= VIS_MIN && P('wrist_R')[1] < P('shoulder_R')[1] - 0.15 * scale;
+    const raisedMargin = C.arm.raisedMargin;
+    const raisedL = visWristL >= VIS_MIN && P('wrist_L')[1] < P('shoulder_L')[1] - raisedMargin * scale;
+    const raisedR = visWristR >= VIS_MIN && P('wrist_R')[1] < P('shoulder_R')[1] - raisedMargin * scale;
 
     // 挥手：800ms 内腕部水平往返次数 + 幅度门限（都是尺度归一后的量）
     const waveL = this._oscillation('L', visWristL >= VIS_MIN ? P('wrist_L')[0] / scale : NaN, ts);
@@ -279,33 +299,98 @@ export class SignalEngine {
     const reachR = visWristR >= VIS_MIN ? d2(wristR, shR) / scale : NaN;
     const handsClose = (visWristL >= VIS_MIN && visWristR >= VIS_MIN) ? d2(wristL, wristR) / scale : NaN;
 
+    // —— 3D 信号（worldLandmarks，米制）：抗机位俯仰
+    // 2D 抬臂角把「俯拍时的前伸」和「真实抬臂」混在一起；3D 相对躯干就分得开。
+    const w3 = person.kp_world && person.kp_world.length >= 33 ? person.kp_world : null;
+    const W3 = (name) => (w3 ? w3[MP_INDEX[name]] : null);
+    const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const norm = (a) => Math.hypot(...a);
+    const unit = (a) => { const n = norm(a) || 1; return [a[0] / n, a[1] / n, a[2] / n]; };
+
+    let elevTorsoL = NaN, elevTorsoR = NaN;
+    if (w3) {
+      // 躯干轴：髋中点 → 肩中点。用世界坐标算，等于把摄像机姿态抵消掉
+      const shM = unit([(W3('shoulder_L')[0] + W3('shoulder_R')[0]) / 2,
+        (W3('shoulder_L')[1] + W3('shoulder_R')[1]) / 2,
+        (W3('shoulder_L')[2] + W3('shoulder_R')[2]) / 2]);
+      const hipM = [(W3('hip_L')[0] + W3('hip_R')[0]) / 2,
+        (W3('hip_L')[1] + W3('hip_R')[1]) / 2,
+        (W3('hip_L')[2] + W3('hip_R')[2]) / 2];
+      const torso = unit(sub(shM, hipM));           // 指向头侧
+      const elevTorso = (sh, wr) => {
+        const v = unit(sub(wr, sh));
+        // 0° = 臂沿躯干指向上，90° = 与躯干垂直（水平外展），180° = 沿躯干向下
+        const cos = dot(v, torso);
+        return (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI;
+      };
+      if (visWristL >= VIS_MIN) elevTorsoL = elevTorso(W3('shoulder_L'), W3('wrist_L'));
+      if (visWristR >= VIS_MIN) elevTorsoR = elevTorso(W3('shoulder_R'), W3('wrist_R'));
+    }
+
+    // 手在头部附近：腕到鼻尖够近，**且腕不低于肩太多**（走路时手臂前摆会经过脸前，只判距离会误报）
+    const nose = P('nose');
+    const reachHeadL = (visWristL >= VIS_MIN && (V('nose') ?? 0) >= VIS_MIN)
+      ? d2(wristL, nose) / scale : NaN;
+    const reachHeadR = (visWristR >= VIS_MIN && (V('nose') ?? 0) >= VIS_MIN)
+      ? d2(wristR, nose) / scale : NaN;
+    const headNearL = Number.isFinite(reachHeadL) && reachHeadL < C.arm.head.maxDist
+      && wristL[1] < shL[1] + C.arm.head.aboveShoulder * scale;   // 不能明显低于肩
+    const headNearR = Number.isFinite(reachHeadR) && reachHeadR < C.arm.head.maxDist
+      && wristR[1] < shR[1] + C.arm.head.aboveShoulder * scale;
+
+    // 3D 抬臂角判定举手：比 2D 稳，但只在 world 可用时生效
+    const raisedTorso = (v) => Number.isFinite(v) && v < C.arm.elevTorso.raised;
+
     // 抱臂：两腕的左右顺序相对肩膀翻转（用顺序而不是固定符号，人转身背对镜头也成立）
     const shOrder = Math.sign(shL[0] - shR[0]) || 1;
     const wrOrder = Math.sign(wristL[0] - wristR[0]) || 1;
     const wristsVisible = visWristL >= VIS_MIN && visWristR >= VIS_MIN;
     const crossed = wristsVisible
       && wrOrder !== shOrder
-      && Math.abs(wristL[1] - shoulderMid[1]) < 1.1 * scale
-      && Math.abs(wristR[1] - shoulderMid[1]) < 1.1 * scale;
-    // 叉腰：两腕各自贴近同侧髋
+      && Math.abs(wristL[1] - shoulderMid[1]) < C.arm.crossed.ySpan * scale
+      && Math.abs(wristR[1] - shoulderMid[1]) < C.arm.crossed.ySpan * scale;
+    // 叉腰：腕贴髋 **且肘外张**。
+    // 只判腕贴髋会把「手自然下垂」也算进来——站着时腕本来就在髋旁边（实测 0.19·scale）。
+    // 真叉腰时肘会明显离开身体中线，用肘到肩-髋连线的横向偏移区分。
+    const elbowOut = (sh, hip, el) => {
+      const vx = hip[0] - sh[0], vy = hip[1] - sh[1];
+      const n = Math.hypot(vx, vy) || 1;
+      // 点到直线的距离，再按 scale 归一
+      return Math.abs(((el[0] - sh[0]) * vy - (el[1] - sh[1]) * vx) / n) / scale;
+    };
+    /**
+     * 肘不可见时的三态：可见 → 必须外张；不可见 → 不拿漂移坐标投票，退回只看腕贴髋。
+     * 之前无脑用 P('elbow_*')：遮挡时 MediaPipe 给漂移坐标（甚至 (0,0)），
+     * 既会把真叉腰判成假（漏判），也会把自然下垂判成真（误报）。
+     */
+    const onHipsSide = (sh, hip, el, wr, elVis) => {
+      if (!(d2(wr, hip) < C.arm.onHips.maxDist * scale)) return false;
+      if (elVis < VIS_MIN) return true;     // 肘看不到 → 不因此否定
+      return elbowOut(sh, hip, el) > C.arm.onHips.elbowFlare;
+    };
     const onHips = wristsVisible
-      && d2(wristL, hipL) < 0.65 * scale && d2(wristR, hipR) < 0.65 * scale;
+      && onHipsSide(shL, hipL, P('elbow_L'), wristL, V('elbow_L'))
+      && onHipsSide(shR, hipR, P('elbow_R'), wristR, V('elbow_R'));
     // 张开双臂：两侧都接近水平且伸得够远
+    const ow = C.arm.openWide;
     const armsOpen = Number.isFinite(elevL) && Number.isFinite(elevR)
-      && elevL > 55 && elevL < 125 && elevR > 55 && elevR < 125
-      && reachL > 0.9 && reachR > 0.9;
+      && elevL > ow.minElev && elevL < ow.maxElev
+      && elevR > ow.minElev && elevR < ow.maxElev
+      && reachL > ow.minReach && reachR > ow.minReach;
     // 鼓掌门控：两腕在肩与髋之间（胸前），否则头顶合手也会被算
+    const ch = C.arm.chest;
     const chestHeight = wristsVisible
-      && wristL[1] > shoulderMid[1] - 0.2 * scale
-      && wristL[1] < hipMid[1] + 0.3 * scale
-      && wristR[1] > shoulderMid[1] - 0.2 * scale
-      && wristR[1] < hipMid[1] + 0.3 * scale;
+      && wristL[1] > shoulderMid[1] + ch.above * scale
+      && wristL[1] < hipMid[1] + ch.below * scale
+      && wristR[1] > shoulderMid[1] + ch.above * scale
+      && wristR[1] < hipMid[1] + ch.below * scale;
 
     const score = person.score ?? 0;
 
     return {
       ts,
-      ok: score >= this.minScore && visTorso >= 0.4,
+      ok: score >= this.minScore && visTorso >= this.minTorsoVis,
       score,
       kp,
       scale,
@@ -326,23 +411,35 @@ export class SignalEngine {
         raised_R: raisedR,
         both_raised: raisedL && raisedR,
         any_raised: raisedL || raisedR,
+        // 3D 版举手（只有 world 可用时有效，NaN 时下游自然不成立）
+        raised3d_L: raisedTorso(elevTorsoL),
+        raised3d_R: raisedTorso(elevTorsoR),
+        any_raised3d: raisedTorso(elevTorsoL) || raisedTorso(elevTorsoR),
+        head_near_L: headNearL,
+        head_near_R: headNearR,
       },
       armPose: {
         elev_L: elevL,
         elev_R: elevR,
+        elev_torso_L: elevTorsoL,
+        elev_torso_R: elevTorsoR,
         reach_L: reachL,
         reach_R: reachR,
+        reach_head_L: reachHeadL,
+        reach_head_R: reachHeadR,
         hands_close: handsClose,
         crossed,
         on_hips: onHips,
         open_wide: armsOpen,
         chest_height: chestHeight,
+        has_world: !!w3,
       },
       wave: { L: waveL.flips, R: waveR.flips, amp: Math.max(waveL.amp, waveR.amp) },
     };
   }
 
   _oscillation(side, xNorm, ts) {
+    const W = this.params.wave;
     const h = this.wristHist[side];
     if (!Number.isFinite(xNorm)) {
       // 腕不可见：清空窗口并报告"没在挥"，不要拿旧数据继续判
@@ -350,7 +447,7 @@ export class SignalEngine {
       return { flips: 0, amp: 0 };
     }
     h.push([ts, xNorm]);
-    while (h.length && ts - h[0][0] > 800) h.shift();
+    while (h.length && ts - h[0][0] > W.windowMs) h.shift();
 
     let flips = 0;
     let lastSign = 0;
@@ -361,7 +458,7 @@ export class SignalEngine {
       max = Math.max(max, h[i][1]);
       if (i === 0) continue;
       const dx = h[i][1] - h[i - 1][1];
-      if (Math.abs(dx) < 0.10) continue;        // 死区：滤掉关键点微抖
+      if (Math.abs(dx) < W.deadzone) continue;   // 死区：滤掉关键点微抖
       const s = Math.sign(dx);
       if (lastSign !== 0 && s !== lastSign) flips++;
       lastSign = s;

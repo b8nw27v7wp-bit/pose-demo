@@ -1,8 +1,10 @@
 // app.js — 组装层：输入源 → 感知（姿态 + 手部）→ 信号 → 动作 → 可视化/导出
 import { createEstimator, detectVideo, toPersons, closeEstimator } from './pose.js';
 import { createHandEstimator, detectHandsVideo, toHands, classifyHand, handsReady, closeHandEstimator } from './hands.js';
+import { HandShapeStabilizer, SHAPE_LABELS } from './handshape.js';
 import { SignalEngine } from './signals.js';
 import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS } from './actions.js';
+import { resolveParams, profileParams, profileName as profileNameOf } from './params.js';
 import { drawSkeleton, drawHand, clearCanvas } from './draw.js';
 
 const $ = (id) => document.getElementById(id);
@@ -13,14 +15,57 @@ const stage = $('stage');
 const placeholder = $('placeholder');
 const spark = $('spark');
 
-const MAX_LOG = 600;
+const MAX_LOG = 20000;   // 评估需要整段素材，截断会让 recall 失真；20k 帧 ≈ 11 分钟 @30fps
+// 溢出时按块丢弃（一次 splice 掉 10%），而不是每帧 shift()。
+// shift() 在 20000 元素上是每帧 O(n) 的整体复制（实测 57~69 µs/帧），
+// 从 600 提到 20000 时这个开销从"免费"变成了实打实的每帧成本。
+const LOG_TRIM = Math.round(MAX_LOG * 0.1);
 const SPARK_SPAN_MS = 5000;
 
 // 推理帧率上限：默认 15fps。摄像头 30fps + rAF 60Hz 会对同一帧反复推理，白烧 CPU/GPU。
 const inferInterval = () => 1000 / (Number($('fpsCapSel').value) || 15);
 
-const signalEngine = new SignalEngine({ minCutoff: 1.0, beta: 0.05 });
-const actionEngine = new ActionEngine();
+// profile：URL 参数 ?profile=/profiles/fitness.json，用于切场景时只换阈值不改代码
+const profileUrl = new URLSearchParams(location.search).get('profile');
+let activeParams = {};
+let profileName = 'default';
+let signalEngine = new SignalEngine(activeParams);
+let actionEngine = new ActionEngine(activeParams);
+
+// 手势稳定器：左右手各一个，互不影响。streak/keepMs 从 params 读，profile 才能调
+function makeShapeStable(params) {
+  const cfg = resolveParams(params).signals.gesture;
+  return {
+    L: new HandShapeStabilizer(cfg),
+    R: new HandShapeStabilizer(cfg),
+    U: new HandShapeStabilizer(cfg),
+  };
+}
+let shapeStable = makeShapeStable(activeParams);
+
+/** 换参数要重建引擎：滤波器和计数器持有状态，只改字段会让它们停在上一次的参数上 */
+function applyParams(params, name = 'default') {
+  activeParams = params || {};
+  profileName = name;
+  signalEngine = new SignalEngine(activeParams);
+  actionEngine = new ActionEngine(activeParams);
+  shapeStable = makeShapeStable(activeParams);
+  resetRuntime();
+}
+
+async function loadProfile(url) {
+  try {
+    const res = await fetch(url, { cache: 'no-cache' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const raw = await res.json();
+    applyParams(profileParams(raw), profileNameOf(raw, url));
+    // 不要覆盖状态栏的输入状态；profile 名显示在工具条
+    const tag = $('profileTag');
+    if (tag) { tag.textContent = profileName; tag.hidden = false; }
+  } catch (e) {
+    setStatus(`profile 加载失败：${e.message}`, 'err');
+  }
+}
 
 let estimatorReady = false;
 let handReady = false;
@@ -116,6 +161,8 @@ function resetRuntime() {
   sparkSamples = [];
   lastVideoTime = -1;
   lastInferTs = 0;
+  handFails = 0;
+  for (const k of Object.keys(shapeStable)) shapeStable[k].reset();
   renderReps({ squat: 0, pushup: 0, clap: 0 });
   updateUI();
 }
@@ -322,7 +369,16 @@ function loop() {
   if (show.hands && handReady) {
     try {
       const hr = detectHandsVideo(v, ts);
-      hands = toHands(hr, w, h).map((hd) => ({ ...hd, cls: classifyHand(hd.kp) }));
+      const raw = toHands(hr, w, h).map((hd) => {
+        const cls = classifyHand(hd.kp);
+        // 手势去抖：连续 N 帧命中才切换，否则「张开↔剪刀手」会来回闪
+        const stable = shapeStable[hd.handedness === 'Left' ? 'L'
+          : hd.handedness === 'Right' ? 'R' : 'U'].update(cls.shape, ts);
+        // 中文名只从 handshape.js 的 SHAPE_LABELS 来（之前 app.js 又抄了一份 SHAPE_ZH）
+        const label = SHAPE_LABELS[stable] || '—';
+        return { ...hd, cls: { ...cls, shape: stable, label, raw: cls.shape } };
+      });
+      hands = raw;
       for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
       handFails = 0;
     } catch (e) {
@@ -365,12 +421,19 @@ function countFps(ts) {
 function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
   frameLog.push({
     ts: Math.round(ts),
+    // 视频/摄像头画面的时间（秒）。ts 是 performance.now，录完对不上人眼看到的时间；
+    // 标注时按 video_time 写秒数最省事（见 docs/eval.md）。摄像头没有稳定的媒体时间，用 ts 折算。
+    video_time: mode === 'file' ? Math.round(videoEl.currentTime * 1000) / 1000 : null,
     person_count: personCount,
     persons: p ? [{
       track_id: p.track_id,
       bbox: p.bbox.map(r1),
       kp_format: p.kp_format,
       kp: p.kp.map(([x, y, v]) => [r1(x), r1(y), r2(v)]),
+      // 世界坐标（米制）：3D 抬臂角/举手判定依赖它。不导出的话，离线评估永远只能走 2D 分支，
+      // 评估结果就和页面实际执行的规则不是一回事（见 evaluate.mjs 文件头）。
+      kp_world: p.kp_world && p.kp_world.length
+        ? p.kp_world.map(([x, y, z]) => [r2(x), r2(y), r2(z)]) : null,
       scale: r2(p.scale),
       score: r2(p.score),
     }] : [],
@@ -382,6 +445,11 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
       leg_vertical: r2(sig.leg_vertical),
       elev_L: r1(sig.armPose.elev_L),
       elev_R: r1(sig.armPose.elev_R),
+      elev_torso_L: r1(sig.armPose.elev_torso_L),
+      elev_torso_R: r1(sig.armPose.elev_torso_R),
+      reach_head_L: r2(sig.armPose.reach_head_L),
+      reach_head_R: r2(sig.armPose.reach_head_R),
+      has_world: !!sig.armPose.has_world,
       hands_close: r2(sig.armPose.hands_close),
     } : null,
     actions: act ? {
@@ -393,32 +461,50 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
     hands: hands.map((hd) => ({
       handedness: hd.handedness,
       shape: hd.cls.shape,
+      shape_raw: hd.cls.raw,
       score: r2(hd.score),
+      orient: hd.orient,
+      spread: hd.spread,
       bbox: hd.bbox.map(r1),
       kp: hd.kp.map(([x, y]) => [r1(x), r1(y)]),
     })),
   });
-  if (frameLog.length > MAX_LOG) frameLog.shift();
+  // 溢出时一次丢一批，摊薄成本（每帧 shift 会变成 O(n)）
+  if (frameLog.length > MAX_LOG) frameLog.splice(0, LOG_TRIM);
 }
 
+/**
+ * 导出为 JSONL（一行一帧）。
+ * 不整份 JSON.stringify：20000 帧实测会产生 40MB 字符串、峰值堆 184MB、阻塞主线程约 300ms。
+ * 按块生成 Blob 分片，浏览器自己拼装，主线程只处理小块。
+ * 格式与 evaluate.mjs 的 JSONL 输入兼容（首行是 meta，后续每行一帧）。
+ */
 function exportJSON() {
   if (!frameLog.length) {
     setStatus('没有可导出的帧', 'busy');
     return;
   }
-  const payload = {
+  const meta = {
     exported_at: new Date().toISOString(),
     schema: 'frame.jsonl v0',
     kp_format: 'mediapipe33',
     hand_kp_format: 'mediapipe21',
+    profile: profileName,
+    params: activeParams,
     fps: r1(fps),
     frame_count: frameLog.length,
-    frames: frameLog,
   };
-  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+  const CHUNK = 500;
+  const parts = [`${JSON.stringify(meta)}\n`];
+  for (let i = 0; i < frameLog.length; i += CHUNK) {
+    let s = '';
+    for (let j = i; j < Math.min(i + CHUNK, frameLog.length); j++) s += `${JSON.stringify(frameLog[j])}\n`;
+    parts.push(s);
+  }
+  const blob = new Blob(parts, { type: 'application/x-ndjson' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `pose-frames-${Date.now()}.json`;
+  a.download = `pose-frames-${Date.now()}.jsonl`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
@@ -504,10 +590,12 @@ function buildGrids() {
 
 const ARM_FLAG = {
   arm_raised: 'armRaised',
+  both_up: 'bothHandsUp',
   wave: 'waving',
   crossed: 'crossed',
   hips: 'onHips',
   arms_open: 'armsOpen',
+  hand_head: 'handAtHead',
 };
 
 function updateUI() {
@@ -542,15 +630,22 @@ function updateUI() {
   $('handR').textContent = hr ? hr.cls.label : '—';
   $('handLCard').classList.toggle('on', !!hl);
   $('handRCard').classList.toggle('on', !!hr);
+  // 手掌侧对镜头时四指长度被压扁，手势不可靠 —— 明确提示，不要假装准
+  const edge = (h) => !!(h && h.orient && h.orient.facing === 'edge');
+  $('handLCard').classList.toggle('edge', edge(hl));
+  $('handRCard').classList.toggle('edge', edge(hr));
+  const orientText = (h) => (h ? `${h.orient.facing === 'front' ? '正面' : '侧对'}·张${h.spread}` : '—');
   $('handMeta').textContent = !show.hands ? '已关闭'
     : !handReady ? '模型未加载'
-    : (hands && hands.length) ? `${hands.length} 只手` : '未检出';
+    : (hands && hands.length) ? `${hands.length} 只手 · ${orientText(hl || hr)}` : '未检出';
 
   const fmt = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : '—');
   const rows = [
     ['膝角 °', sig ? r1(sig.knee_pick) : null],
     ['肘角 °', sig ? r1(sig.elbow_pick) : null],
     ['抬臂角 L/R', sig ? `${fmt(sig.armPose.elev_L, 0)} / ${fmt(sig.armPose.elev_R, 0)}` : null],
+    // 3D 相对躯干的抬臂角：俯拍时以这一行为准（有 world 才显示数值）
+    ['抬臂角3D L/R', sig ? `${fmt(sig.armPose.elev_torso_L, 0)} / ${fmt(sig.armPose.elev_torso_R, 0)}` : null],
     ['直立度', sig ? r2(sig.uprightness) : null],
     ['腿竖直比', sig ? r2(sig.leg_vertical) : null],
   ];
@@ -646,4 +741,5 @@ window.__pose = {
 
 // 懒加载：页面打开不建模型，点「摄像头」或「上传视频」时才加载（省内存，多开标签页也不炸）
 setStatus('待启动 · 点摄像头或上传视频', '');
+if (profileUrl) loadProfile(profileUrl);
 if (autoSrc) ensureEstimator();

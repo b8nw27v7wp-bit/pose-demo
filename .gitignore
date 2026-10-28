@@ -9,3 +9,9 @@ web/models/
 Thumbs.db
 __pycache__/
 *.pyc
+
+# 评估素材与导出（个人自拍视频/关键点，体积大且含本人影像，不进 git）
+# 保留 sample.* 合成样例，它由 make-sample.mjs 生成、可复现
+eval-data/*
+!eval-data/sample.frames.json
+!eval-data/sample.labels.json

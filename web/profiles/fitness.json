@@ -1,0 +1,14 @@
+{
+  "name": "fitness",
+  "note": "示例 profile：只写与默认值不同的键，其余走 params.js 的默认值。数值是量级参考，必须用实拍素材校准后替换（PLAN §12.3 B）。",
+  "params": {
+    "signals": {
+      "wave": { "minFlips": 3, "minAmp": 0.25 }
+    },
+    "actions": {
+      "reps": {
+        "squat": { "down": 100, "up": 150, "minCycleMs": 600 }
+      }
+    }
+  }
+}

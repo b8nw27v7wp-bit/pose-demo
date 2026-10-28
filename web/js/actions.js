@@ -1,48 +1,69 @@
 // actions.js — 动作字典
 // 每个动作 = 信号层原语（Hold / RepCounter）的组合。加动作只改这个文件（引擎侧改 YAML）。
-// 阈值是"量级参考"，必须用自己的校准数据替换（见 PLAN §6、docs/signals.md）。
+// 阈值全部来自 params.js（可由 profile 覆盖），不在这里写常数（见 PLAN §12.3 B）。
 
 import { Hold, RepCounter } from './signals.js';
+import { resolveParams } from './params.js';
 
-// 互斥的静态姿态。prio 大者优先；streak 要求连续命中帧数，避免姿态在两个标签间闪烁。
-const POSTURES = [
-  {
-    id: 'lying', name: '躺卧', prio: 40, minMs: 450, streak: 4,
-    cond: (s) => s.uprightness < 0.45 && s.leg_vertical < 0.8,
-  },
-  {
-    id: 'squat_static', name: '下蹲', prio: 30, minMs: 350, streak: 4,
-    cond: (s) => s.knee_pick < 110 && s.uprightness > 0.45,
-  },
-  {
-    id: 'sit', name: '坐', prio: 20, minMs: 450, streak: 5,
-    cond: (s) => s.knee_pick > 55 && s.knee_pick < 135 && s.uprightness > 0.5 && s.leg_vertical < 1.05,
-  },
-  {
-    id: 'stand', name: '站立', prio: 10, minMs: 350, streak: 4,
-    cond: (s) => s.uprightness > 0.8 && s.knee_pick > 150 && s.leg_vertical > 0.8,
-  },
-];
-
-// 深蹲门控：躯干仍接近竖直 + 踝明显在髋下方。
-// 少了这个门，从站到坐的过程中膝角也会穿过 100°，一次坐下会被记成一次深蹲。
-const SQUAT_GATE = (s) => s.leg_vertical > 0.85 && s.uprightness > 0.6;
-// 俯卧撑门控：身体接近水平，否则站着弯一下手臂也会被数。
-const PUSHUP_GATE = (s) => s.uprightness < 0.6;
+/**
+ * 互斥的静态姿态。prio 大者优先；streak 要求连续命中帧数，避免姿态在两个标签间闪烁。
+ * 判定条件从参数构造，所以改阈值不需要改这里的逻辑。
+ */
+export function buildPostures(actions) {
+  const { posture } = actions;
+  return [
+    {
+      id: 'lying', name: '躺卧', prio: 40,
+      minMs: posture.lying.minMs, streak: posture.lying.streak,
+      cond: (s) => s.uprightness < posture.lying.uprightnessLt
+        && s.leg_vertical < posture.lying.legVerticalLt,
+    },
+    {
+      id: 'squat_static', name: '下蹲', prio: 30,
+      minMs: posture.squat.minMs, streak: posture.squat.streak,
+      cond: (s) => s.knee_pick < posture.squat.kneeLt
+        && s.uprightness > posture.squat.uprightnessGt,
+    },
+    {
+      id: 'sit', name: '坐', prio: 20,
+      minMs: posture.sit.minMs, streak: posture.sit.streak,
+      cond: (s) => s.knee_pick > posture.sit.kneeGt
+        && s.knee_pick < posture.sit.kneeLt
+        && s.uprightness > posture.sit.uprightnessGt
+        && s.leg_vertical < posture.sit.legVerticalLt,
+    },
+    {
+      id: 'stand', name: '站立', prio: 10,
+      minMs: posture.stand.minMs, streak: posture.stand.streak,
+      cond: (s) => s.uprightness > posture.stand.uprightnessGt
+        && s.knee_pick > posture.stand.kneeGt
+        && s.leg_vertical > posture.stand.legVerticalGt,
+    },
+  ];
+}
 
 export class ActionEngine {
-  constructor() {
-    this.postureHolds = new Map(POSTURES.map((p) => [p.id, new Hold(p.minMs)]));
-    this.streaks = new Map(POSTURES.map((p) => [p.id, 0]));
-    this.armHold = new Hold(300);
-    this.waveHold = new Hold(150);
-    this.crossedHold = new Hold(400);
-    this.hipsHold = new Hold(400);
-    this.openHold = new Hold(400);
+  constructor(params = {}) {
+    const cfg = resolveParams(params);
+    this.cfg = cfg.actions;
+    this.waveCfg = cfg.signals.wave;
+    // 深蹲门控：躯干仍接近竖直 + 踝明显在髋下方。
+    // 少了这个门，从站到坐的过程中膝角也会穿过 100°，一次坐下会被记成一次深蹲。
+    // 俯卧撑门控：身体接近水平，否则站着弯一下手臂也会被数。
+    this.postures = buildPostures(this.cfg);
+    this.postureHolds = new Map(this.postures.map((p) => [p.id, new Hold(p.minMs)]));
+    this.streaks = new Map(this.postures.map((p) => [p.id, 0]));
+    this.armHold = new Hold(this.cfg.holds.arm);
+    this.waveHold = new Hold(this.cfg.holds.wave);
+    this.crossedHold = new Hold(this.cfg.holds.crossed);
+    this.hipsHold = new Hold(this.cfg.holds.hips);
+    this.openHold = new Hold(this.cfg.holds.open);
+    this.upHold = new Hold(this.cfg.holds.bothHandsUp);
+    this.headHold = new Hold(this.cfg.holds.handFace);
     this.reps = {
-      squat: new RepCounter({ down: 100, up: 150, minCycleMs: 600 }),
-      pushup: new RepCounter({ down: 90, up: 150, minCycleMs: 500 }),
-      clap: new RepCounter({ down: 0.45, up: 1.0, minCycleMs: 400, minHalfMs: 100 }),
+      squat: new RepCounter(this.cfg.reps.squat),
+      pushup: new RepCounter(this.cfg.reps.pushup),
+      clap: new RepCounter(this.cfg.reps.clap),
     };
     this.postureSince = null;
     this.last = null;
@@ -56,6 +77,8 @@ export class ActionEngine {
     this.crossedHold.reset();
     this.hipsHold.reset();
     this.openHold.reset();
+    this.upHold.reset();
+    this.headHold.reset();
     this.reps.squat.reset();
     this.reps.pushup.reset();
     this.reps.clap.reset();
@@ -78,6 +101,7 @@ export class ActionEngine {
         frozen: true,
         flags: prev?.flags ?? {
           armRaised: false, waving: false, crossed: false, onHips: false, armsOpen: false,
+          bothHandsUp: false, handAtHead: false,
         },
         reps: {
           squat: this.reps.squat.count,
@@ -95,7 +119,7 @@ export class ActionEngine {
 
     // —— 静态姿态：连续命中 + 最短持续，然后按优先级取一个
     const candidates = [];
-    for (const p of POSTURES) {
+    for (const p of this.postures) {
       const hit = p.cond(s);
       const streak = hit ? (this.streaks.get(p.id) || 0) + 1 : 0;
       this.streaks.set(p.id, streak);
@@ -112,23 +136,38 @@ export class ActionEngine {
     }
 
     // —— 举手 / 挥手
-    const armRaised = this.armHold.update(s.arm.any_raised, ts);
+    // 举手优先用 3D（相对躯干）判定：俯拍时 2D 抬臂角会把「前伸」误当「举起」。
+    // has_world 为假时退回 2D，行为与之前一致。
+    const ap = s.armPose || {};
+    const waveCfg = this.waveCfg;
+    const raisedNow = ap.has_world ? s.arm.any_raised3d : s.arm.any_raised;
+    const armRaised = this.armHold.update(raisedNow, ts);
+    // 挥手也走同一套举手判定：之前单独用 2D 的 any_raised，会导出
+    // armRaised=false 而 waving=true ——「挥手必然蕴含举手」这条不变量不能破。
     const waving = this.waveHold.update(
-      s.arm.any_raised && (s.wave.L >= 3 || s.wave.R >= 3) && s.wave.amp > 0.25,
+      raisedNow && (s.wave.L >= waveCfg.minFlips || s.wave.R >= waveCfg.minFlips)
+        && s.wave.amp > waveCfg.minAmp,
       ts,
     );
 
-    // —— 手臂姿态（抱臂 / 叉腰 / 张开双臂）
-    const ap = s.armPose || {};
+    // —— 手臂姿态（抱臂 / 叉腰 / 张开双臂 / 双手高举 / 手在头部附近）
     const crossed = this.crossedHold.update(!!ap.crossed, ts);
     const onHips = this.hipsHold.update(!!ap.on_hips, ts);
     const armsOpen = this.openHold.update(!!ap.open_wide, ts);
+    // 双手高举：两边都举起，才算「欢呼/投降」式，和单臂举手区分开
+    const bothRaisedNow = ap.has_world
+      ? (s.arm.raised3d_L && s.arm.raised3d_R)
+      : (s.arm.raised_L && s.arm.raised_R);
+    const bothHandsUp = this.upHold.update(bothRaisedNow, ts);
+    // 手在头部附近：扶额/摸头/敬礼一类，动作本身不重要，重要的是「手不在躯干平面」
+    const handAtHead = this.headHold.update(s.arm.head_near_L || s.arm.head_near_R, ts);
 
     // —— 计数类
-    const squatGate = SQUAT_GATE(s);
+    const squatGate = s.leg_vertical > this.cfg.gates.squat.legVerticalGt
+      && s.uprightness > this.cfg.gates.squat.uprightnessGt;
     const squatCount = squatGate ? this.reps.squat.update(s.knee_pick, ts) : (this.reps.squat.abort(), this.reps.squat.count);
 
-    const pushupGate = PUSHUP_GATE(s);
+    const pushupGate = s.uprightness < this.cfg.gates.pushup.uprightnessLt;
     const pushupCount = pushupGate ? this.reps.pushup.update(s.elbow_pick, ts) : (this.reps.pushup.abort(), this.reps.pushup.count);
 
     // 鼓掌：两腕距离的周期，且必须在胸前高度、且不是抱臂（抱臂时两腕也很近，会误入低值）
@@ -142,7 +181,9 @@ export class ActionEngine {
       postureId: posture ? posture.id : null,
       postureMs: posture ? ts - this.postureSince : 0,
       frozen: false,
-      flags: { armRaised, waving, crossed, onHips, armsOpen },
+      flags: {
+        armRaised, waving, crossed, onHips, armsOpen, bothHandsUp, handAtHead,
+      },
       reps: { squat: squatCount, pushup: pushupCount, clap: clapCount },
       gates: { squat: squatGate, pushup: pushupGate, clap: clapGate },
       repPhase: {
@@ -165,8 +206,10 @@ export const ACTION_CATALOG = [
 
 export const ARM_ACTIONS = [
   { id: 'arm_raised', name: '举手' },
+  { id: 'both_up', name: '双手高举' },
   { id: 'wave', name: '挥手' },
   { id: 'crossed', name: '抱臂' },
   { id: 'hips', name: '叉腰' },
   { id: 'arms_open', name: '张开双臂' },
+  { id: 'hand_head', name: '手在头部' },
 ];
