@@ -109,3 +109,18 @@ node web/test/logic-test.mjs        # 78 项：角度/滤波/滞回/计数门控
 - 真实深蹲/俯卧撑/挥手/躺卧的识别率与计数准确性（目前只过了合成信号单测）
 - 帧率：无头环境测得的数字不代表真机，请在自己机器上开 DevTools 看
 - 跨机位阈值漂移幅度
+
+## 许可
+
+本项目代码以 **MIT** 许可发布，全文见 `LICENSE`。
+
+Copyright (c) 2026 王宇 (b8nw27v7wp-bit)
+
+依赖组件的许可是各自的，商用前请自行复核：
+
+| 组件 | 许可 |
+|---|---|
+| MediaPipe Tasks Vision（`@mediapipe/tasks-vision`，含 PoseLandmarker / HandLandmarker 权重） | Apache-2.0 |
+| `data/` 下的测试图片与视频 | 由 COCO 数据集样本（经 Ultralytics assets 仓库）裁剪而来，仅用于本地功能验证，不随产品分发 |
+
+另外提醒：Ultralytics 自家的 YOLO 系列是 AGPL-3.0，本项目没有使用；若要换成 YOLO-pose，闭源商用需要买授权。

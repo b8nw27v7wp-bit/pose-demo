@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "description": "通用人体姿态识别：浏览器感知 Demo + 可配置动作识别引擎",
   "scripts": {
     "test": "node web/test/logic-test.mjs",
