@@ -5,7 +5,7 @@
 // 计数误差必须符合预期，并且既不能把错的算成对的（抓漏），也不能把对的算成错的（抓错）。
 // 它不验证真实场景精度——那需要实拍素材（PLAN §12.3 A）。
 
-import { replay, evaluateClip, toTimeline } from './evaluate.mjs';
+import { replay, evaluateClip, toTimeline, pairsFromDir, summarize } from './evaluate.mjs';
 import { DEFAULT_PARAMS, profileParams, profileName } from '../js/params.js';
 import { ARM_ACTIONS } from '../js/actions.js';
 import { writeFile, mkdtemp, rm } from 'node:fs/promises';
@@ -300,6 +300,90 @@ console.log('\n[9] 输入格式');
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+// —— 10. 目录配对：.jsonl 要认，manifest.json / 草稿 labels 不能当帧 ——
+console.log('\n[10] pairsFromDir');
+{
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'evalpair-'));
+  try {
+    for (const [name, body] of [
+      ['a.jsonl', '{"ts":0}\n'],
+      ['a.labels.json', '{"segments":[]}'],
+      ['b.frames.json', '{"frames":[]}'],
+      ['b.labels.json', '{"segments":[]}'],
+      ['c.jsonl', '{"ts":0}\n'],
+      ['manifest.json', '{"version":1,"clips":[]}'],
+      ['d.labels.draft.json', '{"segments":[]}'],
+    ]) await writeFile(path.join(dir, name), body);
+
+    const pairs = await pairsFromDir(dir);
+    const names = pairs.map((p) => path.basename(p.frames)).sort();
+    check('识别 .jsonl 帧', names.includes('a.jsonl'));
+    check('识别 *.frames.json 帧', names.includes('b.frames.json'));
+    check('manifest.json 不当帧', !names.includes('manifest.json'));
+    check('labels.draft 不当帧', !names.includes('d.labels.draft.json'));
+    check('同名 labels 正确配对', pairs.find((p) => p.frames.endsWith('a.jsonl'))?.labels
+      === path.join(dir, 'a.labels.json'));
+    check('没有同名 labels 也保留（由评估器报缺）', pairs.find((p) => p.frames.endsWith('c.jsonl'))?.labels === null);
+    check('总对数正确', names.length === 3, names.join(','));
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// —— 11. 负例语法：!动作 / expect:false ——
+console.log('\n[11] 负例语法');
+{
+  const standRecs = [];
+  for (let i = 0; i < 40; i++) standRecs.push(frame(i * 100, STAND));
+  const tlStand = replay(standRecs);
+
+  const bang = evaluateClip(standRecs, {
+    segments: [{ action: '!stand', start: 500, end: 3000 }],
+  }, tlStand);
+  check('!stand 在站立段 → 不通过', bang.segments[0].pass === false);
+
+  const expectFalse = evaluateClip(standRecs, {
+    segments: [{ action: 'stand', expect: false, start: 500, end: 3000 }],
+  }, tlStand);
+  check('expect:false 等价于 !stand', expectFalse.segments[0].pass === false);
+
+  const sumStand = summarize([bang]).find((r) => r.action === 'stand');
+  check('反例失败记 FP，不记 FN/TP',
+    sumStand.fp === 1 && sumStand.fn === 0 && sumStand.tp === 0, JSON.stringify(sumStand));
+  check('反例不进 recall 分母', sumStand.recall === null);
+  check('反例进 precision 分母', sumStand.precision === 0, `precision=${sumStand.precision}`);
+
+  // 纯下蹲段：stand 不成立，!stand 应通过（TN）
+  const squatRecs = [];
+  for (let i = 0; i < 40; i++) squatRecs.push(frame(i * 100, squatKp(1)));
+  const tlSquat = replay(squatRecs);
+  const negPass = evaluateClip(squatRecs, {
+    segments: [{ action: '!stand', start: 2000, end: 3500 }],
+  }, tlSquat);
+  check('!stand 在非站立段 → 通过', negPass.segments[0].pass === true);
+
+  // 计数反例：!squat 期望 0 次
+  const negRepOk = evaluateClip(standRecs, {
+    segments: [{ action: '!squat', start: 0, end: 3000 }],
+  }, tlStand);
+  check('!squat 0 次 → 通过', negRepOk.segments[0].pass === true);
+
+  const repRecs = [];
+  let t = 0;
+  for (let i = 0; i < 10; i++) repRecs.push(frame(t += 100, STAND));
+  for (let i = 0; i < 10; i++) repRecs.push(frame(t += 100, squatKp(1)));
+  for (let i = 0; i < 10; i++) repRecs.push(frame(t += 100, STAND));
+  const tlRep = replay(repRecs);
+  const negRepBad = evaluateClip(repRecs, {
+    segments: [{ action: '!squat', start: 0, end: t }],
+  }, tlRep);
+  check('!squat 出现 1 次 → 不通过', negRepBad.segments[0].pass === false
+    && negRepBad.segments[0].want === 0 && negRepBad.segments[0].got === 1,
+  JSON.stringify(negRepBad.segments[0]));
+  const sumRep = summarize([negRepBad]).find((r) => r.action === 'squat');
+  check('计数反例失败记 FP', sumRep.fp === 1 && sumRep.fn === 0, JSON.stringify(sumRep));
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

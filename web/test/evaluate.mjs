@@ -228,6 +228,8 @@ export const ARM_ID_TO_FLAG = {
 };
 const FLAG_IDS = ARM_ACTIONS.map((a) => ARM_ID_TO_FLAG[a.id]).filter(Boolean);
 
+/** 动作名归一：去空白（`!动作` 反例语法在归一之后才剥离） */
+const asActionName = (v) => (typeof v === 'string' ? v.trim() : '');
 /** 标注里的动作名可以是 ARM_ACTIONS 的 id，也可以是内部 flag 名，两者都接受 */
 const canonical = (action) => ARM_ID_TO_FLAG[action] || action;
 
@@ -235,7 +237,8 @@ const canonical = (action) => ARM_ID_TO_FLAG[action] || action;
  * 一段素材评估。labels.segments 每段声明：
  *   { action, start, end, count?, tol? }
  *   action 可以是姿态 id（stand/sit/squat_static/lying）、手臂 flag（armRaised/...）、
- *   rep 名（squat/pushup/clap），或 'none'（这段时间内不应有任何动作）。
+ *   rep 名（squat/pushup/clap）、'none'（不应有任何姿态或手臂动作），
+ *   或负例写法 '!动作' / { action, expect:false }（只要求该动作不成立）。
  */
 export function evaluateClip(frames, labels, timeline) {
   const segments = labels.segments || [];
@@ -278,7 +281,12 @@ export function evaluateClip(frames, labels, timeline) {
   const results = [];
   for (const seg of segments) {
     const range = resolveRange(seg, frames);
-    const action = seg.action;
+    const rawAction = asActionName(seg.action);
+    // 负例语法：`!动作` 等价于 `{action, expect:false}`。
+    // 与 none 的区别：none 要求「姿态和手臂都不得成立」，!动作 只要求这一个动作不成立。
+    const negated = rawAction.startsWith('!');
+    const action = canonical(negated ? rawAction.slice(1) : rawAction);
+    const expect = negated || seg.expect === false ? false : true;
 
     if (REP_IDS.includes(action)) {
       // 计数类：比较该时间段内的增量与标注次数
@@ -287,26 +295,30 @@ export function evaluateClip(frames, labels, timeline) {
       const got = inside.length
         ? (inside[inside.length - 1].act.reps[action] - (base ? base.act.reps[action] : 0))
         : 0;
-      const want = seg.count ?? 1;
+      // 反例段期望 0 次；默认 tol=0，否则「多 1 次」会被容差放过
+      const want = expect ? (seg.count ?? 1) : 0;
+      const tol = seg.tol ?? (expect ? 1 : 0);
       results.push({
-        type: 'rep', action, range, want, got,
-        pass: Math.abs(got - want) <= (seg.tol ?? 1),
+        type: 'rep', action, rawAction, expect, range, want, got, tol,
+        pass: Math.abs(got - want) <= tol,
       });
       continue;
     }
 
     const series = seriesOf(action);
     if (!series) {
-      results.push({ type: 'unknown', action, range, pass: false, error: '未知动作名' });
+      results.push({ type: 'unknown', action: rawAction, rawAction, range, pass: false, error: '未知动作名' });
       continue;
     }
     const ranges = activeRanges(series);
     const hit = ranges.some((r) => overlaps(r, range));
+    // none 的语义是「不许有任何动作」，所以它天然是反例段
+    const expectHit = action === 'none' ? false : expect;
     // none 段失败时记下误报的是哪个动作，汇总时才能把 FP 归到它头上
     const falseAlarms = (action === 'none' && hit) ? culprits(range) : null;
     results.push({
-      type: 'state', action, range, want: action !== 'none', got: hit,
-      pass: hit === (action !== 'none'), falseAlarms,
+      type: 'state', action, rawAction, expect: expectHit, range,
+      want: expectHit, got: hit, pass: hit === expectHit, falseAlarms,
     });
   }
 
@@ -320,7 +332,7 @@ export function evaluateClip(frames, labels, timeline) {
 
 // —— 汇总 ---------------------------------------------------------------
 
-function summarize(clipResults) {
+export function summarize(clipResults) {
   const byAction = new Map();
   const bump = (action) => {
     if (!byAction.has(action)) byAction.set(action, { tp: 0, fn: 0, fp: 0, repAbs: 0, repN: 0 });
@@ -329,7 +341,16 @@ function summarize(clipResults) {
   for (const c of clipResults) {
     for (const s of c.segments) {
       const b = bump(s.action);
+      if (s.type === 'unknown') {
+        b.fn++;   // 未知动作名：保留旧口径（算漏判），报告里能看到
+        continue;
+      }
       if (s.type === 'rep') {
+        if (s.expect === false) {
+          // 反例段：期望 0 次，不进入 recall 分母；出现了才算 FP
+          if (!s.pass) b.fp += 1;
+          continue;
+        }
         b.repAbs += Math.abs(s.got - s.want);
         b.repN += s.want;
         if (s.pass) b.tp++; else b.fn++;
@@ -343,6 +364,9 @@ function summarize(clipResults) {
             bump(a).fp++;
           }
         }
+      } else if (s.expect === false) {
+        // !动作 反例段：成立即 FP，不成立是 TN（不进 recall 分母）
+        if (!s.pass) b.fp += 1;
       } else {
         if (s.got) b.tp++; else b.fn++;
       }
@@ -438,7 +462,10 @@ function fitThresholds(labelsByClip, timelines, framesByClip) {
       let range;
       try { range = resolveRange(seg, frames); } catch { continue; }
       // 计数段的电平均值同样要统计：深蹲下阈就看这一段里膝角的低分位
-      const bucket = REP_IDS.includes(seg.action) ? `${seg.action}_baseline` : seg.action;
+      const raw = asActionName(seg.action);
+      const negated = raw.startsWith('!') || seg.expect === false;
+      const base = canonical(raw.startsWith('!') ? raw.slice(1) : raw);
+      const bucket = `${REP_IDS.includes(base) ? `${base}_baseline` : base}${negated ? '_negative' : ''}`;
       for (const r of timeline) {
         if (r.empty || !r.sig || r.ts < range[0] || r.ts > range[1]) continue;
         for (const [name, get] of Object.entries(SIGNALS)) push(`${bucket}/${name}`, get(r.sig));
@@ -484,7 +511,11 @@ function toMarkdown(report) {
     lines.push(`通过 ${c.segments.length - bad.length}/${c.segments.length}`);
     for (const s of bad) {
       const t = `[${(s.range[0] / 1000).toFixed(2)}–${(s.range[1] / 1000).toFixed(2)}s]`;
-      lines.push(`- ✗ ${s.action} ${t} ${s.type === 'rep' ? `期望 ${s.want} 次，得到 ${s.got}` : '未按标注出现'}`);
+      const why = s.type === 'rep'
+        ? `期望 ${s.want} 次，得到 ${s.got}`
+        : (s.expect === false ? '反例段却判成立' : '未按标注出现');
+      const label = s.expect === false ? `${s.action}（反例）` : s.action;
+      lines.push(`- ✗ ${label} ${t} ${why}`);
     }
     lines.push('');
   }
@@ -506,12 +537,17 @@ function toMarkdown(report) {
 
 // —— 主流程 -------------------------------------------------------------
 
-async function pairsFromDir(dir) {
+export async function pairsFromDir(dir) {
   const files = await readdir(dir);
-  const framesFiles = files.filter((f) => /\.(frames\.)?json$/i.test(f) && !/\.labels\.json$/i.test(f));
+  // 只认「导出帧」两种后缀：*.frames.json 与 *.jsonl。
+  // 不能把所有 .json 都当帧——同目录下的 manifest.json / 报告 JSON 会被误读；
+  // *.labels.draft.json 是 autolabel 的草稿，也不能当帧。
+  const isFrames = (f) => !/\.labels(\.draft)?\.(json|jsonl)$/i.test(f)
+    && (/\.frames\.(json|jsonl)$/i.test(f) || /\.jsonl$/i.test(f));
+  const framesFiles = files.filter(isFrames);
   const pairs = [];
   for (const f of framesFiles) {
-    const base = f.replace(/\.frames\.json$/i, '').replace(/\.json$/i, '');
+    const base = f.replace(/\.frames\.(json|jsonl)$/i, '').replace(/\.(json|jsonl)$/i, '');
     const labelName = files.find((l) => l === `${base}.labels.json`);
     if (labelName) pairs.push({ frames: path.join(dir, f), labels: path.join(dir, labelName) });
     else pairs.push({ frames: path.join(dir, f), labels: null });

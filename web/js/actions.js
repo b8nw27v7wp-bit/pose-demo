@@ -133,6 +133,7 @@ export class ActionEngine {
           grasp: this.graspCount,
         },
         gates: prev?.gates ?? { squat: false, pushup: false, clap: false },
+        countBlocked: prev?.countBlocked ?? { squat: false, pushup: false, clap: false },
         repPhase: {
           squat: this.reps.squat.phase,
           pushup: this.reps.pushup.phase,
@@ -215,18 +216,29 @@ export class ActionEngine {
     this.graspCount = step.count;
 
     // —— 计数类
+    // 短时遮挡外推期间冻结计数：外推坐标是猜的，拿来数必然出错。
+    // 按动作只冻结用到的那几个点，避免左手被挡就全都不数。
+    const ext = new Set(s.extrapolated || []);
+    const sideOf = (side) => (side === 'R' ? 'R' : 'L');
+    const squatBlocked = [`hip_${sideOf(s.knee_side)}`, `knee_${sideOf(s.knee_side)}`, `ankle_${sideOf(s.knee_side)}`]
+      .some((p) => ext.has(p));
+    const pushupBlocked = [`shoulder_${sideOf(s.elbow_side)}`, `elbow_${sideOf(s.elbow_side)}`, `wrist_${sideOf(s.elbow_side)}`]
+      .some((p) => ext.has(p));
+    const clapBlocked = ext.has('wrist_L') || ext.has('wrist_R');
+
     const squatGate = s.leg_vertical > this.cfg.gates.squat.legVerticalGt
       && s.uprightness > this.cfg.gates.squat.uprightnessGt;
-    const squatCount = squatGate ? this.reps.squat.update(s.knee_pick, ts) : (this.reps.squat.abort(), this.reps.squat.count);
+    const squatCount = squatBlocked ? this.reps.squat.count
+      : squatGate ? this.reps.squat.update(s.knee_pick, ts) : (this.reps.squat.abort(), this.reps.squat.count);
 
     const pushupGate = s.uprightness < this.cfg.gates.pushup.uprightnessLt;
-    const pushupCount = pushupGate ? this.reps.pushup.update(s.elbow_pick, ts) : (this.reps.pushup.abort(), this.reps.pushup.count);
+    const pushupCount = pushupBlocked ? this.reps.pushup.count
+      : pushupGate ? this.reps.pushup.update(s.elbow_pick, ts) : (this.reps.pushup.abort(), this.reps.pushup.count);
 
     // 鼓掌：两腕距离的周期，且必须在胸前高度、且不是抱臂（抱臂时两腕也很近，会误入低值）
     const clapGate = !!ap.chest_height && !ap.crossed;
-    const clapCount = clapGate
-      ? this.reps.clap.update(ap.hands_close, ts)
-      : (this.reps.clap.abort(), this.reps.clap.count);
+    const clapCount = clapBlocked ? this.reps.clap.count
+      : clapGate ? this.reps.clap.update(ap.hands_close, ts) : (this.reps.clap.abort(), this.reps.clap.count);
 
     const out = {
       posture: posture ? posture.name : null,
@@ -241,6 +253,7 @@ export class ActionEngine {
       },
       reps: { squat: squatCount, pushup: pushupCount, clap: clapCount, grasp: this.graspCount },
       gates: { squat: squatGate, pushup: pushupGate, clap: clapGate },
+      countBlocked: { squat: squatBlocked, pushup: pushupBlocked, clap: clapBlocked },
       repPhase: {
         squat: this.reps.squat.phase,
         pushup: this.reps.pushup.phase,

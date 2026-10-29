@@ -30,7 +30,9 @@ web/                    浏览器 Demo（纯静态，无构建链）
   js/pose.js            L1 姿态适配：MediaPipe Pose → 统一 frame 契约
   js/hands.js           L1 手部适配：MediaPipe Hand（21 点/手）
   js/handshape.js       手势分类（纯函数，可单测）
-  js/signals.js         L2 信号层：One Euro、角度、抬臂角、Hold、RepCounter
+  js/signals.js         L2 信号层：One Euro、2D/3D 角度、Hold、RepCounter、骨骼一致性、遮挡外推
+  js/stats.js           分布统计（分位 / 重合度，只给评估工具用）
+  js/hardcase.js        难例窗口切分与草稿 label（纯函数）
   js/actions.js         动作字典（原语组合）
   js/draw.js            骨架 / 手部绘制
   js/app.js             组装：输入源 → 感知 → 信号 → 动作 → UI/导出
@@ -39,11 +41,16 @@ web/                    浏览器 Demo（纯静态，无构建链）
   test/logic-test.mjs   信号层/动作层/手势分类的确定性单测
   test/evaluate.mjs     离线评估与阈值拟合（导出帧 → recall/precision）
   test/eval-test.mjs    评估器自身的单测
+  test/signal-compare.mjs  2D/3D 信号分布与跨机位重合度对比（R3 验收工具）
+  test/hardcase-test.mjs   难例窗口与草稿 label 的单测
+  test/autolabel.mjs       用当前规则生成正例草稿 labels（R2）
+  test/manifest-check.mjs  采集清单校验与覆盖度报告（R2）
+  test/frame-io.mjs        评估工具共用的帧/labels 读取
   test/make-sample.mjs  生成合成样例 + labels（评估链路自检用）
   test/headless-check.mjs  无头 Chrome 真加载页面，检查 JS 错误与状态
   vendor/               MediaPipe js + wasm（本地，离线可用）
   models/               pose_landmarker_full/lite、hand_landmarker
-docs/                   数据契约、信号定义、评估流程
+docs/                   数据契约、信号定义、采集协议、评估流程
 data/                   测试素材（单人/双人图与视频）
 eval-data/              评估素材与标注（自拍内容，已被 .gitignore 排除）
 serve.py                本地静态服务器
@@ -78,9 +85,12 @@ serve.py                本地静态服务器
 ## 验证
 
 ```bash
-npm test                            # 78 项逻辑单测 + 14 项评估器单测
-node web/test/logic-test.mjs        # 78 项：角度/滤波/滞回/计数门控/姿态互斥/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射
-node web/test/eval-test.mjs         # 21 项：评估器自身对不对（标对给分、标错扣分、计数差、未检出人体、profile 覆盖、三种时间写法、时间线）
+npm test                            # 153 逻辑 + 50 评估器 + 18 难例 + 15 自动标注 + 19 清单 = 255 项
+node web/test/logic-test.mjs        # 153 项：角度/滤波/滞回/计数门控/姿态互斥/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 退回/骨骼一致性/外推/自适应周期/统计
+node web/test/eval-test.mjs         # 50 项：评估器自身对不对（标对给分、标错扣分、计数差、未检出人体、profile 覆盖、三种时间写法、时间线、!动作 反例、目录配对）
+node web/test/hardcase-test.mjs     # 18 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口
+node web/test/autolabel-test.mjs    # 15 项：区间合并/丢弃、计数周期、草稿内容与自评全通过
+node web/test/manifest-test.mjs     # 19 项：清单字段与文件校验、覆盖度、计数与反例、清单骨架
 ```
 
 页面级（需要 serve.py 已启动）：
@@ -97,17 +107,25 @@ node web/test/headless-check.mjs    # 无头 Chrome 真加载页面：模型就�
 
 ## 量化动作准确率（重要）
 
-「动作判得准不准」必须用数据回答，不能靠感觉。完整流程见 `docs/eval.md`，最短路径：
+「动作判得准不准」必须用数据回答，不能靠感觉。采集协议见 `docs/data-collection.md`，
+评估口径见 `docs/eval.md`，最短路径：
 
 ```bash
 # 1. Demo 里录一段视频并点「导出」，得到 .jsonl（一行一帧），放到 eval-data/a.jsonl
+node web/test/autolabel.mjs --input eval-data/a.jsonl          # 生成 a.labels.draft.json（正例草稿）
+# 2. 对着时间线改边界，补 none / !动作 反例段，另存为 a.labels.json
 node web/test/evaluate.mjs --input eval-data/a.jsonl --timeline --every 5
-# 2. 写 eval-data/a.labels.json（用 startSec/endSec 写视频秒数）
-# 3. 打分
+# 3. 生成清单并填元数据，检查是否采够
+node web/test/manifest-check.mjs --init --dir eval-data
+node web/test/manifest-check.mjs --manifest eval-data/manifest.json
+# 4. 打分
 node web/test/evaluate.mjs --dir eval-data --report eval-data/report.md
-# 4. 拟合阈值（按标注动作段分组给分位）
+# 5. 拟合阈值（按标注动作段分组给分位）
 node web/test/evaluate.mjs --dir eval-data --fit --profile web/profiles/fitness.json
 ```
+
+`autolabel` 只生成正例；反例必须人工补，否则 precision 恒为 1（见 `docs/data-collection.md` §六）。
+清单校验的退出码：0 达标 / 2 覆盖不足 / 1 清单有错，可直接进 CI。
 
 导出帧带 `video_time`（视频播放秒数），所以标注直接写视频里看到的秒数，不用换算 `performance.now`。
 
@@ -116,6 +134,30 @@ node web/test/evaluate.mjs --dir eval-data --fit --profile web/profiles/fitness.
 ```bash
 node web/test/make-sample.mjs && node web/test/evaluate.mjs --dir eval-data
 ```
+
+### 2D / 3D 信号对比（R3）
+
+`worldLandmarks` 是模型估计值，**不一定比 2D 准**。要不要在某条信号上切 3D，必须用数据回答：
+
+```bash
+node web/test/signal-compare.mjs --a eval-data/front.frames.json --b eval-data/side.frames.json --action squat
+```
+
+输出每条信号的分布（n、均值±SD、P5/P50/P95）和**跨素材重合度**（1=完全重合），
+以及同一信号族 2D / 3D 的重合度差值。差值 > 0 表示 3D 换机位后更一致。
+默认判定只用 3D 角度与直立度；`leg_vertical` 与距离比值的 3D 版本已并行导出，
+等阈值重拟合后再通过 profile 打开（`signals.world.legVertical` / `signals.world.ratios`）。
+
+### 难例闭环（R6）
+
+页面上判错时，先在工具条的下拉里选“应该是什么”（或“不应出现”），再点 **判错了**：
+
+1. 继续录 2 秒（点击前 3 秒的帧本来就在缓存里）；
+2. 自动下载两个文件：`hardcase-<ts>.jsonl`（帧）和 `hardcase-<ts>.labels.json`（草稿 label）；
+3. 把这两个文件放进 `eval-data/`，先按 `docs/eval.md` 改一下草稿边界，再跑全量报告。
+
+只导出帧不导出视频：可离线复现、体积小、不保存人像。导出帧保留原始 `ts` / `video_time`，
+所以草稿 label 直接就是评估器认识的格式。
 
 ## 切换场景 / 调阈值
 
@@ -159,7 +201,8 @@ profile 只写与默认值的差异，未写的键沿用默认。导出的 JSON 
 - **骨架 / 关键点**：关键点关掉只剩连线，弱机或录制时更清爽
 - **镜像**：自拍习惯，关掉后左右与你本人一致（角度判定不受影响，角度是几何量）
 - **膝角曲线**：右下曲线是最近 5 秒的膝角信号 + 100°/150° 阈值线，**这是校准阈值用的**。
-  做几次深蹲，看曲线在多少度到底、多少度站直，再把 `actions.js` 里的 down/up 改成实测值。
+  做几次深蹲，看曲线在多少度到底、多少度站直，再把实测值写进 profile 的 `actions.reps.squat.down/up`
+  （`web/profiles/`，不要改源码）。
 
 ## 已验证 / 未验证
 
@@ -168,11 +211,13 @@ profile 只写与默认值的差异，未写的键沿用默认。导出的 JSON 
 - 图片模式：单张真人全身照 → 33 关键点，置信度 0.935，膝角 163.1°、直立度 1.000、腿竖直比 1.33
 - 视频模式：146 帧连续推理，姿态判定「站立」，无 JS 报错，帧记录符合 `docs/frame-schema.md`（`scale` 127.22px 与信号面板一致）
 - 推理限速生效：rAF 60Hz 下稳定在 ~28 FPS，不再对同一帧重复推理
-- 逻辑单测 111/111（阈值抖动不连发、过快周期不计数、坐下不算深蹲、站立弯肘不算俯卧撑、低置信冻结、挥手幅度门限、可见性门控、抱臂抗转身）
+- 逻辑单测 153/153（阈值抖动不连发、过快周期不计数、坐下不算深蹲、站立弯肘不算俯卧撑、低置信冻结、挥手幅度门限、可见性门控、抱臂抗转身）
 - 手部扩展：3D 抬臂角（含 world 与无 world 两条路径）、手在头部（含走路前摆反例）、手势去抖、手枪/摇滚、朝向与张开度
 - 手臂扩展：双手高举与单臂举手的区分、自然下垂不算叉腰、肘外张才算叉腰
 - 多人：IMAGE 模式 `poses=2` 在双人图上返回 2 个框；**VIDEO 模式恒为 1 人**（模型限制，已写进 `docs/signals.md`）
 - 参数层：默认值参数化后 78 项单测全绿，说明行为未变
+- R3 信号改造（2026-10-29）：3D 角度/直立度、2D 退回、骨骼长度一致性、角速度、遮挡外推、自适应周期均有单测；
+  新增 33 项（120 → 153），但**没有实拍素材验证过 3D 是否真的更好**（这正是 `signal-compare.mjs` + R2 要做的事）
 - profile 生效：无头 Chrome 加载 `?profile=...`，把站立门控膝角抬到 200° 后姿态变 null，恢复后为「站立」
 - 评估器：合成样例 4/4 段通过；故意标错时正确判失败（自测 21/21）
 - 导出帧带 `video_time`（实测视频 3 秒、帧上 0.93s，与 `ts` 确实是不同基准）

@@ -6,11 +6,17 @@
   "license": "MIT",
   "description": "通用人体姿态识别：浏览器感知 Demo + 可配置动作识别引擎",
   "scripts": {
-    "test": "node web/test/logic-test.mjs && node web/test/eval-test.mjs",
+    "test": "node web/test/logic-test.mjs && node web/test/eval-test.mjs && node web/test/hardcase-test.mjs && node web/test/autolabel-test.mjs && node web/test/manifest-test.mjs",
     "test:logic": "node web/test/logic-test.mjs",
     "test:eval": "node web/test/eval-test.mjs",
+    "test:hardcase": "node web/test/hardcase-test.mjs",
+    "test:autolabel": "node web/test/autolabel-test.mjs",
+    "test:manifest": "node web/test/manifest-test.mjs",
+    "autolabel": "node web/test/autolabel.mjs",
+    "manifest": "node web/test/manifest-check.mjs",
     "sample": "node web/test/make-sample.mjs",
     "eval": "node web/test/evaluate.mjs --dir eval-data",
+    "compare": "node web/test/signal-compare.mjs",
     "serve": "python serve.py"
   }
 }

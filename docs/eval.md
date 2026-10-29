@@ -5,18 +5,30 @@ PLAN §12.3 的 A（评估集）与 B（阈值拟合）落地在这份文档 + `
 
 ## 一轮完整流程
 
+采集协议（机位/光照/人数/反例）见 `docs/data-collection.md`，这里只列命令。
+
 ```bash
 # 1. 录素材（这一步只能人来做：摄像头前做动作，录屏或用 Demo 上传视频）
 #    Demo 里点「导出 JSON」得到 frames 文件
 
-# 2. 标注（见下）
-#    eval-data/a.frames.json  +  eval-data/a.labels.json
+# 2. 先出正例草稿，再人工补反例
+node web/test/autolabel.mjs --input eval-data/a.jsonl
+#    → eval-data/a.labels.draft.json
+node web/test/evaluate.mjs --input eval-data/a.jsonl --timeline --every 5
+#    对照时间线改边界，补 none / !动作 反例段，另存为 eval-data/a.labels.json
 
-# 3. 复算 + 打分
+# 3. 登记到清单并检查采够没有（0 达标 / 2 覆盖不足 / 1 清单有错）
+node web/test/manifest-check.mjs --init --dir eval-data
+node web/test/manifest-check.mjs --manifest eval-data/manifest.json
+
+# 4. 复算 + 打分
 node web/test/evaluate.mjs --dir eval-data --report eval-data/report.md
 
-# 4. 看图消费：按动作的 recall / precision / 计数误差，以及失败段
+# 5. 看图消费：按动作的 recall / precision / 计数误差，以及失败段
 ```
+
+`autolabel` 只生成正例（当前规则判出来的姿态/手臂/计数），**不会生成 `none`**；
+只跑它不补反例，precision 永远是 1，等于没测。
 
 不带 `--dir` 也可以单段跑：
 
@@ -52,8 +64,9 @@ node web/test/evaluate.mjs --dir eval-data
 | `start` / `end` | 毫秒，与 frames 的 `ts` 同基准（`performance.now`），非必要别用 |
 | `startFrame` / `endFrame` | 帧序号（0 起，frames 数组下标） |
 | `action` | 见下表 |
-| `count` | 仅计数类：这段时间内**期望**完成几次 |
-| `tol` | 仅计数类：允许误差，默认 1 |
+| `expect` | 可选，`false` 表示反例（与 `!动作` 等价） |
+| `count` | 仅计数类：这段时间内**期望**完成几次；`!计数` 反例期望 0 次 |
+| `tol` | 仅计数类：允许误差，默认 1；反例默认 0 |
 
 三种时间写法按 `startSec` → `start` → `startFrame` 的优先级取。
 
@@ -64,12 +77,43 @@ node web/test/evaluate.mjs --dir eval-data
 | 姿态 | `stand` / `sit` / `squat_static` / `lying` |
 | 手臂 | `armRaised` / `bothHandsUp` / `waving` / `crossed` / `onHips` / `armsOpen` / `handAtHead` / `reaching` / `carrying` / `pointing` / `armFront` / `armSide` |
 | 计数 | `squat` / `pushup` / `clap` / `grasp` |
+| 反例 · 严格 | `none` —— 这段时间内**不应**出现任何姿态或手臂动作（用来量误报） |
+| 反例 · 单动作 | `!动作`（如 `!onHips`）或 `{ "action": "onHips", "expect": false }` —— 只要求该动作不成立，其他动作不限 |
 
 动作名也接受 `ARM_ACTIONS` 里的 id（`arm_raised` / `reach` / `carry` / `point` …），
 两种写法等价，评估器内部会归一。
-| 反例 | `none` —— 这段时间内**不应**出现任何姿态或手臂动作（用来量误报） |
 
-`none` 是 precision 的唯一来源。只标正例，报告里的 precision 永远是 1，没有意义。
+反例是 precision 的来源。只标正例，报告里的 precision 永远是 1，没有意义。
+
+- `none` 失败时，报告会把 FP 归到**实际误报的那个动作**（能归因才看得懂）；
+- `!动作` 失败时记为该动作的 FP，不进入 recall 分母；
+- `noArm`（姿态不限、不许有手臂动作）目前只被采集清单校验器识别，评估器统计在 R1 合并后生效。
+
+## 难例回流（页面「判错了」按钮）
+
+判错了不要只记在心里，当场导出：
+
+1. 工具条左侧选“应该是”（姿态/手臂/计数，或“不应出现”）；
+2. 点 **判错了**，等采样窗口结束（点击前 3 秒 + 之后 2 秒）；
+3. 得到 `hardcase-<ts>.jsonl` 与 `hardcase-<ts>.labels.json`；
+4. 把两个文件放进 `eval-data/`，对着 `--timeline` 检查草稿 label 的边界与动作，
+   **计数类要把 `count` 改成实际期望次数**（草稿默认是 1）；
+5. 跑一次全量报告，看这个难例属于漏判、误报还是串判。
+
+导出的是帧不是视频：`docs/frame-schema.md` 的同一套契约，`evaluate.mjs` 直接能读。
+`labels.note` 里记着点击时的判定结果，`meta.hardcase.detected` 里是完整快照，排查时先看这两处。
+
+## 采集清单（manifest）
+
+`eval-data/manifest.json` 记录每段素材的 `camera / subject / lighting / model / fps`，
+覆盖度（每动作正例数、反例数、人物与机位数）由 labels 计算：
+
+```bash
+node web/test/manifest-check.mjs --manifest eval-data/manifest.json
+node web/test/manifest-check.mjs --init --dir eval-data   # 扫帧文件生成待填骨架
+```
+
+字段与完成标准见 `docs/data-collection.md` §一/§八。退出码 0/2/1，可直接进 CI。
 
 ## 指标口径
 

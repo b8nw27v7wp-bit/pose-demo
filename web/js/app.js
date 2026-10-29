@@ -5,6 +5,7 @@ import { HandShapeStabilizer, SHAPE_LABELS } from './handshape.js';
 import { SignalEngine } from './signals.js';
 import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS } from './actions.js';
 import { resolveParams, profileParams, profileName as profileNameOf } from './params.js';
+import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS } from './hardcase.js';
 import { drawSkeleton, drawHand, clearCanvas } from './draw.js';
 
 const $ = (id) => document.getElementById(id);
@@ -90,6 +91,7 @@ const autoSrc = new URLSearchParams(location.search).get('src');
 
 const r1 = (v) => (Number.isFinite(v) ? Math.round(v * 10) / 10 : null);
 const r2 = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : null);
+const r3 = (v) => (Number.isFinite(v) ? Math.round(v * 1000) / 1000 : null);
 
 function setStatus(text, kind = '') {
   const el = $('status');
@@ -155,6 +157,7 @@ async function initHands(delegate) {
 }
 
 function resetRuntime() {
+  cancelHardcase();
   signalEngine.reset();
   actionEngine.reset();
   frameLog = [];
@@ -464,6 +467,22 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
       extend_R: !!sig.armPose.extend_R,
       azimuth_L: r1(sig.armPose.azimuth_L),
       azimuth_R: r1(sig.armPose.azimuth_R),
+      // —— R3：2D/3D 双份信号。离线对比「哪套在正/侧面更可分」必须两边都有，
+      // 只导判定用的那一份，事后就没法回答「3D 到底有没有更好」。
+      knee_2d: r1(sig.knee_pick_2d),
+      knee_3d: r1(sig.knee_pick_3d),
+      elbow_2d: r1(sig.elbow_pick_2d),
+      elbow_3d: r1(sig.elbow_pick_3d),
+      uprightness_2d: r2(sig.uprightness_2d),
+      uprightness_3d: r2(sig.uprightness_3d),
+      leg_vertical_2d: r2(sig.leg_vertical_2d),
+      leg_vertical_3d: r2(sig.leg_vertical_3d),
+      knee_vel: r1(sig.knee_vel),
+      elbow_vel: r1(sig.elbow_vel),
+      scale_world: r3(sig.scale_world),
+      angle_source: sig.angle_source,
+      extrapolated: sig.extrapolated,
+      bones_ok: sig.world.bones,
     } : null,
     actions: act ? {
       posture: act.postureId,
@@ -493,12 +512,9 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
  * 按块生成 Blob 分片，浏览器自己拼装，主线程只处理小块。
  * 格式与 evaluate.mjs 的 JSONL 输入兼容（首行是 meta，后续每行一帧）。
  */
-function exportJSON() {
-  if (!frameLog.length) {
-    setStatus('没有可导出的帧', 'busy');
-    return;
-  }
-  const meta = {
+/** 常规导出与难例导出共用的 meta 基底 */
+function baseExportMeta() {
+  return {
     exported_at: new Date().toISOString(),
     schema: 'frame.jsonl v0',
     kp_format: 'mediapipe33',
@@ -506,21 +522,126 @@ function exportJSON() {
     profile: profileName,
     params: activeParams,
     fps: r1(fps),
-    frame_count: frameLog.length,
   };
-  const CHUNK = 500;
-  const parts = [`${JSON.stringify(meta)}\n`];
-  for (let i = 0; i < frameLog.length; i += CHUNK) {
-    let s = '';
-    for (let j = i; j < Math.min(i + CHUNK, frameLog.length); j++) s += `${JSON.stringify(frameLog[j])}\n`;
-    parts.push(s);
-  }
-  const blob = new Blob(parts, { type: 'application/x-ndjson' });
+}
+
+function downloadBlob(filename, blob) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `pose-frames-${Date.now()}.jsonl`;
+  a.download = filename;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+/** 分块生成 JSONL：20000 帧整份 stringify 会造成 40MB 字符串与主线程卡顿 */
+function downloadJsonl(filename, meta, frames) {
+  const CHUNK = 500;
+  const parts = [`${JSON.stringify(meta)}\n`];
+  for (let i = 0; i < frames.length; i += CHUNK) {
+    let s = '';
+    for (let j = i; j < Math.min(i + CHUNK, frames.length); j++) s += `${JSON.stringify(frames[j])}\n`;
+    parts.push(s);
+  }
+  downloadBlob(filename, new Blob(parts, { type: 'application/x-ndjson' }));
+}
+
+function downloadJson(filename, obj) {
+  downloadBlob(filename, new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' }));
+}
+
+function exportJSON() {
+  if (!frameLog.length) {
+    setStatus('没有可导出的帧', 'busy');
+    return;
+  }
+  downloadJsonl(`pose-frames-${Date.now()}.jsonl`,
+    { ...baseExportMeta(), frame_count: frameLog.length }, frameLog);
+}
+
+// —— 难例闭环（R6）--------------------------------------------------------
+// 点「判错了」→ 保留点击前 3s + 之后 2s 的帧，导出 JSONL + 草稿 label。
+// 只导出帧不导出视频：可离线复现、体积小、不保存人像（PLAN §13.3 R6）。
+
+let hardcasePending = null;
+
+function initHardcaseSelect() {
+  const sel = $('hardcaseSel');
+  if (!sel || sel.options.length) return;
+  const groups = new Map();
+  for (const a of HARDCASE_ACTIONS) {
+    if (!groups.has(a.group)) {
+      const og = document.createElement('optgroup');
+      og.label = a.group;
+      sel.appendChild(og);
+      groups.set(a.group, og);
+    }
+    const opt = document.createElement('option');
+    opt.value = a.value;
+    opt.textContent = a.label;
+    groups.get(a.group).appendChild(opt);
+  }
+  sel.value = 'none';
+}
+
+function resetHardcaseButton() {
+  const btn = $('btnHardcase');
+  if (btn) { btn.disabled = false; btn.textContent = '判错了'; }
+}
+
+function startHardcase() {
+  if (hardcasePending) {
+    setStatus('难例采样中，请稍候…', 'busy');
+    return;
+  }
+  if (!frameLog.length) {
+    setStatus('没有可导出的帧', 'busy');
+    return;
+  }
+  const sel = $('hardcaseSel');
+  const action = sel && sel.value ? sel.value : 'none';
+  const last = frameLog[frameLog.length - 1];
+  const detected = last && last.actions ? {
+    posture: last.actions.posture,
+    flags: last.actions.flags,
+    reps: last.actions.reps,
+  } : null;
+  const clickTs = performance.now();
+  hardcasePending = {
+    clickTs,
+    action,
+    detected,
+    timer: setTimeout(finishHardcase, HARDCASE_AFTER_MS),
+  };
+  const btn = $('btnHardcase');
+  if (btn) { btn.disabled = true; btn.textContent = '采样中…'; }
+  setStatus(`难例采样中（还需 ${(HARDCASE_AFTER_MS / 1000).toFixed(0)}s）…`, 'busy');
+}
+
+function finishHardcase() {
+  const p = hardcasePending;
+  if (!p) return;
+  hardcasePending = null;
+  resetHardcaseButton();
+  const { frames, labels, meta } = buildHardcase(frameLog, p.clickTs, {
+    action: p.action,
+    detected: p.detected,
+    baseMeta: baseExportMeta(),
+  });
+  if (!frames.length) {
+    setStatus('难例窗口内没有帧', 'busy');
+    return;
+  }
+  const base = `hardcase-${Date.now()}`;
+  downloadJsonl(`${base}.jsonl`, meta, frames);
+  downloadJson(`${base}.labels.json`, labels);
+  setStatus(`已导出难例 ${frames.length} 帧 · 期望「${p.action}」`, 'ok');
+}
+
+function cancelHardcase() {
+  if (!hardcasePending) return;
+  clearTimeout(hardcasePending.timer);
+  hardcasePending = null;
+  resetHardcaseButton();
 }
 
 // —— 角度曲线（校准阈值用）---------------------------------------------
@@ -721,6 +842,8 @@ $('btnReset').addEventListener('click', () => {
   renderReps({ squat: 0, pushup: 0, clap: 0, grasp: 0 });
 });
 $('btnExport').addEventListener('click', exportJSON);
+$('btnHardcase').addEventListener('click', startHardcase);
+initHardcaseSelect();
 window.addEventListener('beforeunload', () => { stopStream(); closeEstimator(); closeHandEstimator(); });
 
 // 页面切到后台就停推理，别在看不见的时候还在烧 GPU
@@ -757,6 +880,22 @@ window.__pose = {
   initEstimator,
   startCamera,
   useVideoSource,
+  // 难例闭环：返回摘要而不是整份帧，避免 CDP 传输大对象
+  hardcaseInfo(action = 'none') {
+    const last = frameLog[frameLog.length - 1];
+    const detected = last && last.actions ? {
+      posture: last.actions.posture,
+      flags: last.actions.flags,
+      reps: last.actions.reps,
+    } : null;
+    const r = buildHardcase(frameLog, performance.now(), { action, detected });
+    return {
+      frames: r.frames.length,
+      frameCount: r.meta.frame_count,
+      segments: r.labels.segments,
+      hardcase: r.meta.hardcase,
+    };
+  },
 };
 
 // 懒加载：页面打开不建模型，点「摄像头」或「上传视频」时才加载（省内存，多开标签页也不炸）

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "clips": [
+    {
+      "clip": "sample.frames.json",
+      "labels": "sample.labels.json",
+      "video": null,
+      "camera": "front",
+      "subject": "sample",
+      "lighting": "front",
+      "model": "full",
+      "fps": 15,
+      "note": "合成样例（非实拍），只用来验证清单与覆盖度工具能跑通。实拍时复制本文件为 manifest.json 再逐条填写。"
+    }
+  ]
+}
