@@ -43,7 +43,7 @@ web/                    浏览器 Demo（纯静态，无构建链）
   test/headless-check.mjs  无头 Chrome 真加载页面，检查 JS 错误与状态
   vendor/               MediaPipe js + wasm（本地，离线可用）
   models/               pose_landmarker_full/lite、hand_landmarker
-docs/                   数据契约、信号定义、评估流程
+docs/                   数据契约、信号定义、评估流程、插图提示词
 data/                   测试素材（单人/双人图与视频）
 eval-data/              评估素材与标注（自拍内容，已被 .gitignore 排除）
 serve.py                本地静态服务器
@@ -73,9 +73,9 @@ serve.py                本地静态服务器
 ## 验证
 
 ```bash
-npm test                            # 78 项逻辑单测 + 14 项评估器单测
-node web/test/logic-test.mjs        # 78 项：角度/滤波/滞回/计数门控/姿态互斥/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射
-node web/test/eval-test.mjs         # 21 项：评估器自身对不对（标对给分、标错扣分、计数差、未检出人体、profile 覆盖、三种时间写法、时间线）
+npm test                            # 120 项逻辑单测 + 141 项评估器单测
+node web/test/logic-test.mjs        # 120 项：角度/滤波/滞回/计数门控/姿态互斥/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射
+node web/test/eval-test.mjs         # 141 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta）
 ```
 
 页面级（需要 serve.py 已启动）：
@@ -96,15 +96,31 @@ node web/test/headless-check.mjs    # 无头 Chrome 真加载页面：模型就�
 
 ```bash
 # 1. Demo 里录一段视频并点「导出」，得到 .jsonl（一行一帧），放到 eval-data/a.jsonl
+# 2. 生成标注草稿（只含正例，反例仍需人工补）
+node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data/a.labels.draft.json
+# 3. 改草稿成正式 labels（用 startSec/endSec 写视频秒数；反例写成 "!onHips" / "noArm"）
 node web/test/evaluate.mjs --input eval-data/a.jsonl --timeline --every 5
-# 2. 写 eval-data/a.labels.json（用 startSec/endSec 写视频秒数）
-# 3. 打分
+# 4. 打分
 node web/test/evaluate.mjs --dir eval-data --report eval-data/report.md
-# 4. 拟合阈值（按标注动作段分组给分位）
+# 5. 拟合阈值（按标注动作段分组给分位）
 node web/test/evaluate.mjs --dir eval-data --fit --profile web/profiles/fitness.json
+# 6. 门槛（可选，未达标退出码 2，可直接进 CI）
+node web/test/evaluate.mjs --dir eval-data --min-recall 0.9 --min-precision 0.85 --max-count-err 1
+# 7. 两套 profile 对比 / 单参数灵敏度
+node web/test/evaluate.mjs --dir eval-data --compare web/profiles/a.json web/profiles/b.json
+node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.squat.down
 ```
 
+报告按顺序包含：每动作 recall/precision（带 **Wilson 95% 区间和样本量 n**）、门槛、
+**姿态混淆矩阵**、**手臂共现矩阵**、**按机位/受试分组与跨组退化**、**事件时延与抖动**、
+失败区间、灵敏度扫描、阈值分位。只有一行数字的报告没有用——先看 n，再看比例。
+
+- `--compare` 是信息性对比（Δ = B − A），会列出判定发生变化的段，不设退出码门槛。
+- `--sweep` 会把参数扰动 ±10%/±20% 后完整重放，代价约为 5 倍评估时间。
+- `--baseline <旧报告.json>` 可以卡「比上次不准就失败」，`--max-drop` 默认 0.05。
+
 导出帧带 `video_time`（视频播放秒数），所以标注直接写视频里看到的秒数，不用换算 `performance.now`。
+报告里的失败段会带起止秒、帧号、关键信号的 min/中位/max，以及漏判时"实际判成了什么"。
 
 没有实拍素材时，可以用合成样例先把链路跑通（**合成数据不能用来定阈值**）：
 
@@ -122,8 +138,12 @@ node web/test/make-sample.mjs && node web/test/evaluate.mjs --dir eval-data
 # 评估：node web/test/evaluate.mjs --dir eval-data --profile web/profiles/fitness.json
 ```
 
-profile 只写与默认值的差异，未写的键沿用默认。导出的 JSON 会带 `profile` 和 `params`，
-所以任何一份数据都能查到它是在哪套阈值下产生的。
+profile 只写与默认值的差异，未写的键沿用默认。导出的 JSON 会带 `profile`、`params`、
+`params_hash`、`model`、`delegate`，所以任何一份数据都能查到它是在哪套阈值、哪一档模型下产生的。
+
+profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型档位。当前模型与声明不一致时，
+工具条上的 profile 标签会标黄；评估时如果数据的 `model` 与 profile 的 `model` 不一致，
+报告头部会给出警告 —— lite 和 full 的关键点噪声不同，两套阈值不能混用。
 
 ## 加一个动作
 
@@ -163,13 +183,13 @@ profile 只写与默认值的差异，未写的键沿用默认。导出的 JSON 
 - 图片模式：单张真人全身照 → 33 关键点，置信度 0.935，膝角 163.1°、直立度 1.000、腿竖直比 1.33
 - 视频模式：146 帧连续推理，姿态判定「站立」，无 JS 报错，帧记录符合 `docs/frame-schema.md`（`scale` 127.22px 与信号面板一致）
 - 推理限速生效：rAF 60Hz 下稳定在 ~28 FPS，不再对同一帧重复推理
-- 逻辑单测 111/111（阈值抖动不连发、过快周期不计数、坐下不算深蹲、站立弯肘不算俯卧撑、低置信冻结、挥手幅度门限、可见性门控、抱臂抗转身）
+- 逻辑单测 120/120（阈值抖动不连发、过快周期不计数、坐下不算深蹲、站立弯肘不算俯卧撑、低置信冻结、挥手幅度门限、可见性门控、抱臂抗转身）
 - 手部扩展：3D 抬臂角（含 world 与无 world 两条路径）、手在头部（含走路前摆反例）、手势去抖、手枪/摇滚、朝向与张开度
 - 手臂扩展：双手高举与单臂举手的区分、自然下垂不算叉腰、肘外张才算叉腰
 - 多人：IMAGE 模式 `poses=2` 在双人图上返回 2 个框；**VIDEO 模式恒为 1 人**（模型限制，已写进 `docs/signals.md`）
-- 参数层：默认值参数化后 78 项单测全绿，说明行为未变
+- 参数层：默认值参数化后单测全绿（当时 78 项，现在 120 项），说明行为未变
 - profile 生效：无头 Chrome 加载 `?profile=...`，把站立门控膝角抬到 200° 后姿态变 null，恢复后为「站立」
-- 评估器：合成样例 4/4 段通过；故意标错时正确判失败（自测 21/21）
+- 评估器：合成样例 4/4 段通过；故意标错时正确判失败；反例语法（`!动作` / `noArm`）、计数误报归因、失败区间、自动标注、混淆矩阵、分组退化、Wilson 区间、门槛、灵敏度扫描、A/B 对比、时延与抖动均有单测（自测 141/141）
 - 导出帧带 `video_time`（实测视频 3 秒、帧上 0.93s，与 `ts` 确实是不同基准）
 - 布局：1440×900 下 `scrollHeight=900`、无滚动、无卡片截断，profile 标签正常
 
@@ -180,6 +200,11 @@ profile 只写与默认值的差异，未写的键沿用默认。导出的 JSON 
   **没有任何实拍素材跑过** —— 这正是 `docs/eval.md` 要做的事，也是当前最大的空白
 - 帧率：无头环境测得的数字不代表真机，请在自己机器上开 DevTools 看
 - 跨机位阈值漂移幅度
+
+## 插图
+
+README 头图、汇报封面的生成提示词（含负面词、配色与后期清单）见
+[docs/illustration-prompt.md](docs/illustration-prompt.md)。
 
 ## 许可
 

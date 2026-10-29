@@ -4,7 +4,7 @@ import { createHandEstimator, detectHandsVideo, toHands, classifyHand, handsRead
 import { HandShapeStabilizer, SHAPE_LABELS } from './handshape.js';
 import { SignalEngine } from './signals.js';
 import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS } from './actions.js';
-import { resolveParams, profileParams, profileName as profileNameOf } from './params.js';
+import { resolveParams, profileParams, profileName as profileNameOf, paramsHash } from './params.js';
 import { drawSkeleton, drawHand, clearCanvas } from './draw.js';
 
 const $ = (id) => document.getElementById(id);
@@ -29,6 +29,12 @@ const inferInterval = () => 1000 / (Number($('fpsCapSel').value) || 15);
 const profileUrl = new URLSearchParams(location.search).get('profile');
 let activeParams = {};
 let profileName = 'default';
+// profile 可以声明它是在哪个模型档位下校准的（lite/full）。阈值与档位是绑定的：
+// full 的关键点更稳，用 full 拟合的阈值拿到 lite 上可能就漏计（PLAN §13 R0）。
+let profileModel = null;
+// 实际跑起来的模型/后端：导出时写进 meta，否则事后无法判断数据出自哪一档
+let activeModel = null;
+let activeDelegate = null;
 let signalEngine = new SignalEngine(activeParams);
 let actionEngine = new ActionEngine(activeParams);
 
@@ -58,13 +64,29 @@ async function loadProfile(url) {
     const res = await fetch(url, { cache: 'no-cache' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const raw = await res.json();
+    profileModel = typeof raw.model === 'string' && raw.model ? raw.model : null;
     applyParams(profileParams(raw), profileNameOf(raw, url));
     // 不要覆盖状态栏的输入状态；profile 名显示在工具条
-    const tag = $('profileTag');
-    if (tag) { tag.textContent = profileName; tag.hidden = false; }
+    updateProfileTag();
   } catch (e) {
     setStatus(`profile 加载失败：${e.message}`, 'err');
   }
+}
+
+/**
+ * 工具条上的 profile 标签：名字 + 声明的模型档位。
+ * 档位不一致时标黄并给 title 说明 —— 不是错误（阈值仍能跑），但报告不能拿它当同一套阈值。
+ */
+function updateProfileTag() {
+  const tag = $('profileTag');
+  if (!tag) return;
+  const mismatch = !!(profileModel && activeModel && profileModel !== activeModel);
+  tag.textContent = profileModel ? `${profileName} · ${profileModel}` : profileName;
+  tag.hidden = false;
+  tag.classList.toggle('warn', mismatch);
+  tag.title = mismatch
+    ? `profile 声明 model=${profileModel}，当前 ${activeModel}；阈值是按另一个档位校准的`
+    : profileModel ? `阈值按 model=${profileModel} 校准` : '';
 }
 
 let estimatorReady = false;
@@ -126,7 +148,14 @@ async function initEstimator() {
     try {
       await createEstimator({ model, delegate, runningMode: 'VIDEO', numPoses });
       estimatorReady = true;
-      setStatus(`就绪 · ${model}/${delegate}`, 'ok');
+      activeModel = model;
+      activeDelegate = delegate;
+      const mismatch = !!(profileModel && profileModel !== model);
+      setStatus(
+        `就绪 · ${model}/${delegate}${mismatch ? ` · ⚠ profile 需 ${profileModel}` : ''}`,
+        mismatch ? 'busy' : 'ok',
+      );
+      updateProfileTag();
       resetRuntime();
       await initHands(delegate);
       if (autoSrc && !autoLoaded) {
@@ -489,9 +518,18 @@ function exportJSON() {
     schema: 'frame.jsonl v0',
     kp_format: 'mediapipe33',
     hand_kp_format: 'mediapipe21',
-    profile: profileName,
-    params: activeParams,
+    // 模型档位与后端：lite 和 full 的关键点噪声不同，阈值不能混用（PLAN §13 R0）。
+    // 事后想回答"这份数据是哪套模型跑出来的"，只能靠这两行。
+    model: activeModel,
+    delegate: activeDelegate,
+    hand_model: handReady ? 'hand_landmarker' : null,
+    infer_fps: Number($('fpsCapSel').value) || null,
     fps: r1(fps),
+    profile: profileName,
+    profile_model: profileModel,
+    // 参数指纹：比较两份数据是否同一套阈值，不需要 diff 整份 params
+    params_hash: paramsHash(activeParams),
+    params: activeParams,
     frame_count: frameLog.length,
   };
   const CHUNK = 500;

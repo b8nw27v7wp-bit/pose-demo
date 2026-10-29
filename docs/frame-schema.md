@@ -73,14 +73,35 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
 
 ```
 第一行：{"exported_at":"...","schema":"frame.jsonl v0","kp_format":"mediapipe33",
-        "profile":"fitness","params":{...},"fps":15.3,"frame_count":562}
+        "model":"lite","delegate":"GPU","hand_model":"hand_landmarker","infer_fps":15,
+        "profile":"fitness","profile_model":"lite","params_hash":"fnv1a:1a2b3c4d",
+        "params":{...},"fps":14.4,"frame_count":562}
 后续每行：一条帧记录（上面那种结构）
 ```
+
+### meta 字段（首行，只增不改）
+
+| 字段 | 含义 | 为什么必须记 |
+|---|---|---|
+| `schema` | 契约版本，当前 `frame.jsonl v0` | 解析器据此分支；只加可选字段不升版本 |
+| `model` | 姿态模型档位 `lite` / `full` | 两档关键点噪声不同，阈值不能混用 |
+| `delegate` | `GPU` / `CPU` | 同一档位在不同后端下结果也可能有细微差异 |
+| `hand_model` | 手部模型文件名；未加载为 `null` | 手势结论要能追溯到手部模型 |
+| `infer_fps` | 推理帧率上限（10/15/30） | 15 fps 下最短持续时间的量化粒度与 30 fps 不同 |
+| `profile` / `profile_model` | profile 名 / 它声明校准所用的模型档位 | 判断阈值是否被用在错误的档位上 |
+| `params_hash` | 生效参数的 FNV-1a 指纹 | 比较两份数据是否同一套阈值，不用 diff 整份 params |
+| `params` | profile 的差分覆盖项（不是全量） | 事后能还原改了哪些键 |
+| `fps` / `frame_count` | 实测帧率 / 帧数 | 数据完整性检查 |
+
+`params_hash` 由 `params.js` 的 `paramsHash()` 生成：先 `resolveParams()` 合并默认值，再按键排序序列化后哈希。
+**同样的参数写成不同的键顺序，指纹必须相同**；数值变一个，指纹就变。
 
 为什么是 JSONL 而不是一个大 JSON 对象：20000 帧的整份 `JSON.stringify` 实测产生 40MB 字符串、
 峰值堆 184MB、阻塞主线程约 300ms。按行导出后浏览器分块拼 Blob，主线程只处理 500 行一块。
 
-`evaluate.mjs` 直接读这个格式（首行 meta 会被跳过），也兼容旧版 `{frames:[...]}` 与裸数组。
+`evaluate.mjs` 直接读这个格式：首行 meta 会被收进 `frames.meta`（不参与信号复算），
+报告里回显 `model`/`delegate`，并在 `profile_model` 与数据实际模型不一致时警告。
+也兼容旧版 `{frames:[...]}` 与裸数组。
 
 引擎侧落盘格式相同，一行一条（JSONL），便于 `jq` 与逐帧回放。
 
