@@ -4,10 +4,11 @@
 // 说明：这里验证的是**判定逻辑**（角度、滤波、滞回、计数门控、姿态互斥、置信冻结），
 // 用人工构造的骨架/信号序列，不代表真实场景精度。真实精度必须用实拍素材校准。
 
-import { angleDeg, angleDeg3, OneEuro, Hold, RepCounter, SignalEngine } from '../js/signals.js';
+import { angleDeg, angleDeg3, OneEuro, Hold, RepCounter, SignalEngine, KpFilter, BoneLengthGuard } from '../js/signals.js';
 import { ActionEngine } from '../js/actions.js';
 import { classifyHand, HandShapeStabilizer } from '../js/handshape.js';
 import { toHands, handOrientation, spreadRatio } from '../js/handformat.js';
+import { summarize, quantile, overlapCoefficient } from '../js/stats.js';
 
 let pass = 0;
 let fail = 0;
@@ -756,6 +757,179 @@ console.log('\n[21] 回归（审查修复）');
 
 function withVis0(kp, v) {
   return kp.map((p) => [p[0], p[1], v]);
+}
+
+// —— 22. R3：3D 信号（角度 / 直立度 / 腿竖直 / 比值）与 2D 退回 ——
+console.log('\n[22] R3 3D 信号');
+{
+  // world 站姿（米制，y 向下为正）：
+  // 髋 y=0、肩 y=-0.48、膝 y=0.45、踝 y=0.86
+  const mkWorld = (over = {}) => {
+    const w = new Array(33).fill(null).map(() => [0, 0, 0]);
+    const set = (i, x, y, z) => { w[i] = [x, y, z]; };
+    set(23, -0.10, 0, 0); set(24, 0.10, 0, 0);
+    set(11, -0.18, -0.48, 0); set(12, 0.18, -0.48, 0);
+    set(0, 0, -0.62, 0);
+    set(13, -0.20, -0.05, 0); set(15, -0.20, 0.35, 0);
+    set(14, 0.20, -0.05, 0); set(16, 0.20, 0.35, 0);
+    set(25, -0.10, 0.45, 0); set(27, -0.10, 0.86, 0);
+    set(26, 0.10, 0.45, 0); set(28, 0.10, 0.86, 0);
+    for (const [k, v] of Object.entries(over)) set(Number(k), v[0], v[1], v[2]);
+    return w;
+  };
+  // 2D 弯膝（膝角≈98°），world 里是伸直的（≈180°）——两者必须能区分
+  const bendKp = standKp.map((p) => [...p]);
+  bendKp[9] = [160, 300, 1];
+
+  const seW = new SignalEngine();
+  const sW = seW.update({ ...person(bendKp), kp_world: mkWorld() }, 1000);
+  check('有 world → 膝角用 3D（≈180°）', near(sW.knee_pick, 180, 2), `knee=${sW.knee_pick?.toFixed(1)}`);
+  check('2D 对照仍是弯膝（≈98°）', near(sW.knee_pick_2d, 98, 6), `2d=${sW.knee_pick_2d?.toFixed(1)}`);
+  check('angle_source 标出用了 3d', sW.angle_source.knee_L === '3d', sW.angle_source.knee_L);
+  check('sources 三份都导出', Number.isFinite(sW.knee_pick_3d) && Number.isFinite(sW.scale_world));
+
+  const se2 = new SignalEngine();
+  const s2 = se2.update(person(bendKp), 1000);
+  check('无 world → 退回 2D', near(s2.knee_pick, 98, 6) && s2.angle_source.knee_L === '2d',
+    `knee=${s2.knee_pick?.toFixed(1)} src=${s2.angle_source.knee_L}`);
+
+  // 世界坐标里躯干水平（肩与髋同高、沿 z 前伸），2D 却是站姿 → 3D 应判 0
+  const sLie = new SignalEngine().update({
+    ...person(standKp),
+    kp_world: mkWorld({ 11: [-0.18, 0, -0.48], 12: [0.18, 0, -0.48] }),
+  }, 1000);
+  check('躯干世界水平 → 直立度 0', near(sLie.uprightness, 0, 0.05), `up=${sLie.uprightness?.toFixed(3)}`);
+  check('2D 对照仍是直立 ≈1', near(sLie.uprightness_2d, 1, 0.05));
+
+  // leg_vertical：3D 量纲与 2D 不同，默认不切换，profile 可开
+  const sLeg = new SignalEngine().update({ ...person(standKp), kp_world: mkWorld() }, 1000);
+  check('默认 leg_vertical 仍用 2D', near(sLeg.leg_vertical, sLeg.leg_vertical_2d, 1e-6),
+    `chosen=${sLeg.leg_vertical?.toFixed(2)} 2d=${sLeg.leg_vertical_2d?.toFixed(2)}`);
+  check('3D 腿竖直比已导出（≈1.79）', near(sLeg.leg_vertical_3d, 1.79, 0.05), `${sLeg.leg_vertical_3d?.toFixed(2)}`);
+  const sLegOn = new SignalEngine({ signals: { world: { legVertical: true } } })
+    .update({ ...person(standKp), kp_world: mkWorld() }, 1000);
+  check('profile 开 legVertical → 用 3D', near(sLegOn.leg_vertical, 1.79, 0.05),
+    `${sLegOn.leg_vertical?.toFixed(2)}`);
+
+  // 距离比值默认 2D，3D 版本并行导出（R4 用来决定是否切换）
+  const sR = new SignalEngine().update({ ...person(standKp), kp_world: mkWorld() }, 1000);
+  check('默认 reach 用 2D 比值', sR.armPose.reach_L === sR.armPose.reach_2d_L);
+  check('3D 比值已导出', near(sR.armPose.reach_3d_L, 1.73, 0.1), `${sR.armPose.reach_3d_L?.toFixed(2)}`);
+
+  // 开了 ratios 但没有 world：必须退回 2D，而不是全判 false/NaN
+  const sNoW = new SignalEngine({ signals: { world: { ratios: true } } })
+    .update(person(standKp), 1000);
+  check('ratios=true 且无 world → 仍退回 2D', sNoW.armPose.reach_L === sNoW.armPose.reach_2d_L
+    && Number.isFinite(sNoW.armPose.reach_L));
+}
+
+// —— 23. R3：骨骼长度一致性 ——
+console.log('\n[23] 骨骼长度一致性');
+{
+  const mkWorld = (over = {}) => {
+    const w = new Array(33).fill(null).map(() => [0, 0, 0]);
+    const set = (i, x, y, z) => { w[i] = [x, y, z]; };
+    set(23, -0.10, 0, 0); set(24, 0.10, 0, 0);
+    set(11, -0.18, -0.48, 0); set(12, 0.18, -0.48, 0);
+    set(0, 0, -0.62, 0);
+    set(13, -0.20, -0.05, 0); set(15, -0.20, 0.35, 0);
+    set(14, 0.20, -0.05, 0); set(16, 0.20, 0.35, 0);
+    set(25, -0.10, 0.45, 0); set(27, -0.10, 0.86, 0);
+    set(26, 0.10, 0.45, 0); set(28, 0.10, 0.86, 0);
+    for (const [k, v] of Object.entries(over)) set(Number(k), v[0], v[1], v[2]);
+    return w;
+  };
+  const se = new SignalEngine();
+  let s = null;
+  for (let i = 0; i < 12; i++) {
+    s = se.update({ ...person(standKp), kp_world: mkWorld() }, 1000 + i * 33);
+  }
+  check('样本够 → 骨骼进入 armed', s.world.bone_armed.foreArm_L === true && s.world.bones.foreArm_L === true);
+
+  // 左腕世界坐标漂到脚踝位置（visibility 仍是 1）→ 前臂长度偏离中位数 >20%
+  s = se.update({ ...person(standKp), kp_world: mkWorld({ 15: [-0.2, 0.9, 0] }) }, 1400);
+  check('腕点漂移 → 前臂不可靠', s.world.bones.foreArm_L === false);
+  check('该侧肘角给 NaN（不退回 2D）', Number.isNaN(s.angles.elbow_L));
+  check('该侧手臂信号给 NaN', Number.isNaN(s.armPose.elev_L) && Number.isNaN(s.armPose.reach_L));
+  check('另一侧不受影响', Number.isFinite(s.angles.elbow_R) && Number.isFinite(s.armPose.reach_R));
+}
+
+// —— 24. R3：遮挡外推 / 角速度 / 自适应周期 ——
+console.log('\n[24] 遮挡外推与周期');
+{
+  // 24.1 短时遮挡：常速度外推并标记，超过窗口退回保持
+  const kf = new KpFilter({ minCutoff: 1, beta: 0.05 }, 0.3, 300);
+  const at = (x, v) => {
+    const k = standKp.map((p) => [...p]);
+    k[5] = [x, 200, v];
+    return k;
+  };
+  kf.run(at(80, 1), 0);
+  kf.run(at(90, 1), 0.1);
+  const last = kf.run(at(100, 1), 0.2);
+  const ex = kf.run(at(100, 0), 0.3);
+  check('短时遮挡 → 标记 extrapolated', ex.extrapolated.includes('wrist_L'));
+  check('外推沿用最后速度方向', ex.kp[5][0] > last.kp[5][0],
+    `${last.kp[5][0].toFixed(1)} → ${ex.kp[5][0].toFixed(1)}`);
+  const stale = kf.run(at(100, 0), 0.7);   // 距最后好帧 500ms > 300ms
+  check('超过 maxExtrapMs → 不再外推', !stale.extrapolated.includes('wrist_L'));
+
+  // 24.2 角速度：膝角 180° → 98°，100ms 内，速度必须为负
+  const se = new SignalEngine({ signals: { world: { enabled: false } } });
+  const bend = standKp.map((p) => [...p]);
+  bend[9] = [160, 300, 1];
+  se.update(person(standKp), 0);
+  const sv = se.update(person(bend), 100);
+  check('膝角速度符号为负', sv.knee_vel < 0, `${sv.knee_vel?.toFixed(0)} deg/s`);
+  check('速度量级合理（>50°/s）', Math.abs(sv.knee_vel) > 50);
+
+  // 24.3 自适应周期
+  const rc = new RepCounter({
+    down: 100, up: 150, minCycleMs: 600, minHalfMs: 120,
+    adaptiveMs: true, adaptiveWindow: 5, adaptiveMinRatio: 0.5,
+  });
+  rc.update(90, 0); rc.update(170, 300);      // 冷启动门槛 600×0.5=300 → 计 1
+  rc.update(90, 600); rc.update(170, 900);    // 计 2，历史 [300,300]
+  rc.update(90, 1200); rc.update(170, 1450);  // 250ms ≥ max(120,150) → 计 3
+  check('有历史后按中位数放行更快的半程', rc.count === 3, `count=${rc.count}, med=${rc.medianHalfMs}`);
+  rc.update(90, 3000); rc.update(170, 3140);  // 140ms：≥120 但 <150 → 抖动
+  check('比历史节奏明显过快 → 不计数', rc.count === 3, `count=${rc.count}`);
+
+  const slow = new RepCounter({
+    down: 100, up: 150, minCycleMs: 600, minHalfMs: 120,
+    adaptiveMs: true, adaptiveWindow: 5, adaptiveMinRatio: 0.5,
+  });
+  slow.update(90, 0); slow.update(170, 1000);   // 历史 [1000]
+  slow.update(90, 1500); slow.update(170, 1900); // 400ms < 1000×0.5
+  check('比历史节奏快一倍以上 → 拒绝', slow.count === 1, `count=${slow.count}`);
+
+  // 24.4 外推期间冻结计数（不是暂停相位，更不是 abort）
+  const seSig = new SignalEngine();
+  const base = seSig.update(person(standKp), 0);
+  const mk = (knee, ext, t) => ({
+    ...base, ts: t, knee_pick: knee, knee_side: 'L',
+    leg_vertical: 1.5, uprightness: 0.9, extrapolated: ext,
+  });
+  const ae = new ActionEngine();
+  ae.update(mk(90, [], 0), 0);
+  const r1 = ae.update(mk(170, [], 1500), 1500);
+  check('无外推 → 正常计 1', r1.reps.squat === 1, `squat=${r1.reps.squat}`);
+  const ae2 = new ActionEngine();
+  ae2.update(mk(90, [], 0), 0);
+  const r2 = ae2.update(mk(170, ['ankle_L', 'knee_L', 'hip_L'], 1500), 1500);
+  check('外推期间不计数', r2.reps.squat === 0 && r2.countBlocked.squat === true,
+    `squat=${r2.reps.squat} blocked=${r2.countBlocked.squat}`);
+}
+
+// —— 25. 分布统计（R3 正/侧面重合度的口径）——
+console.log('\n[25] 分布统计');
+{
+  check('quantile 线性插值', near(quantile([1, 2, 3, 4], 0.5), 2.5, 1e-9));
+  check('quantile 空数组 → NaN', Number.isNaN(quantile([], 0.5)));
+  check('同一分布重合度 = 1', near(overlapCoefficient([1, 2, 3], [1, 2, 3]), 1, 1e-9));
+  check('完全分离分布重合度 ≈ 0', overlapCoefficient([0, 1], [100, 101]) < 0.2);
+  const st = summarize([1, 2, 3, 4]);
+  check('summarize n / 均值 / 分位', st.n === 4 && near(st.mean, 2.5, 1e-9) && near(st.p50, 2.5, 1e-9));
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

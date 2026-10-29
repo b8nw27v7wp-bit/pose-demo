@@ -17,6 +17,24 @@ export const DEFAULT_PARAMS = {
     visMin: 0.3,          // 单点可见性低于此值 → 依赖它的信号给 NaN
     minScore: 0.45,       // 人体平均置信度低于此值 → ok=false，动作层冻结
     minTorsoVis: 0.4,     // 肩/髋四点最低可见性
+    // —— 3D（worldLandmarks）——
+    // 默认只开「语义与 2D 直接可比」的两类：关节角、直立度。
+    // legVertical / ratios 的量纲相对 2D 有系统性偏移（3D 腿长/躯干 ≈2.0，2D 约 1.3），
+    // 先保持 2D 判定、把它们以 *_3d 信号导出，等 R4 用数据重拟合阈值后再切（见 docs/signals.md §一·五）。
+    world: {
+      enabled: true,          // 总开关；false 时所有信号退回 2D
+      angles: true,           // knee_L/R、elbow_L/R、hip_L/R 有 world 时用 3D 夹角
+      uprightness: true,      // 躯干向量与重力轴的点积（抗相机倾斜）
+      legVertical: false,     // 3D 腿竖直比（量纲与 2D 不同，R4 再开）
+      ratios: false,          // reach / hands_close / head / onHips 的距离比值改用世界距离
+      // 骨骼长度一致性：每条肢体在 world 下的长度做个体中位数，当前帧偏离 > tolerance 判不可靠。
+      // 比 visibility 更能抓住「手在背后、腕点漂到别处」。
+      boneCheck: { enabled: true, windowFrames: 60, minSamples: 10, tolerance: 0.2 },
+    },
+    // 一阶差分：角速度（度/秒）
+    velocity: { minCutoff: 3.0, beta: 0.05, minDtMs: 8, maxDtMs: 500 },
+    // 短时遮挡外推：可见性掉下去但不超过这个时长时，按最后速度外推并标记 extrapolated
+    occlusion: { maxExtrapMs: 300 },
     wave: {
       windowMs: 800,      // 挥手判定回看窗口
       deadzone: 0.10,     // 相邻帧水平位移小于此值（单位 scale）不计翻转
@@ -52,10 +70,14 @@ export const DEFAULT_PARAMS = {
       arm: 300, wave: 150, crossed: 400, hips: 400, open: 400,
       handFace: 350, handChest: 350, bothHandsUp: 350,
     },
+    // adaptiveMs：有历史后，用「半程时长中位数 × adaptiveMinRatio」替代固定 minCycleMs。
+    // 挥手/快速深蹲不再被固定周期判成抖动，慢动作也不会因此漏计（见 docs/signals.md §二）。
+    // 没有历史时门槛放宽到 minCycleMs × adaptiveBootstrapRatio，否则真实的快节奏
+    // （鼓掌半程约 200ms）第一次就被拒，永远攒不出历史。
     reps: {
-      squat: { down: 100, up: 150, minCycleMs: 600, minHalfMs: 120 },
-      pushup: { down: 90, up: 150, minCycleMs: 500, minHalfMs: 120 },
-      clap: { down: 0.45, up: 1.0, minCycleMs: 400, minHalfMs: 100 },
+      squat: { down: 100, up: 150, minCycleMs: 600, minHalfMs: 120, adaptiveMs: true, adaptiveWindow: 5, adaptiveMinRatio: 0.5, adaptiveBootstrapRatio: 0.5 },
+      pushup: { down: 90, up: 150, minCycleMs: 500, minHalfMs: 120, adaptiveMs: true, adaptiveWindow: 5, adaptiveMinRatio: 0.5, adaptiveBootstrapRatio: 0.5 },
+      clap: { down: 0.45, up: 1.0, minCycleMs: 400, minHalfMs: 100, adaptiveMs: true, adaptiveWindow: 5, adaptiveMinRatio: 0.5, adaptiveBootstrapRatio: 0.5 },
     },
     gates: {
       squat: { legVerticalGt: 0.85, uprightnessGt: 0.6 },

@@ -14,15 +14,26 @@
       "bbox": [20.2, 333, 101.9, 737],   // 像素 [x1,y1,x2,y2]
       "kp_format": "mediapipe33",   // 声明式：见下方格式表
       "kp": [[65.1, 342.2, 1], ...],// 13 个点，顺序见 kpt.js 的 KPT，像素坐标 + 置信度
+      "kp_world": [[0.02, -0.48, 0.1], ...], // 可选：MediaPipe worldLandmarks，33 点米制 3D
       "scale": 127.22,              // 尺度锚点，像素：肩中点↔髋中点距离（躯干长）
       "score": 0.94                 // 该人的平均关键点置信度
     }
   ],
   "signals": {                      // 信号层输出（可重算，落盘便于回放与调试）
-    "knee_avg": 162.9,
-    "elbow_avg": 114.1,
+    "knee": 162.9,                  // 判定实际使用的膝角（有 world 时可能是 3D）
+    "knee_2d": 162.9,               // 2D 对照（R3 起与 3D 并行导出）
+    "knee_3d": 175.1,
     "uprightness": 1,               // 躯干直立度 cos，站立≈1，躺平≈0
-    "leg_vertical": 1.29            // 踝中点在髋中点下方的距离 / scale
+    "uprightness_2d": 1,
+    "uprightness_3d": 0.99,
+    "leg_vertical": 1.29,           // 踝中点在髋中点下方的距离 / scale
+    "leg_vertical_2d": 1.29,
+    "leg_vertical_3d": 1.91,        // 注意：3D 用 scale_world，量纲与 2D 不同
+    "scale_world": 0.48,            // 世界躯干长（米）
+    "knee_vel": -12.4,              // 角速度（度/秒）
+    "angle_source": { "knee_L": "3d", "knee_R": "3d", "elbow_L": "2d", "...": "..." },
+    "extrapolated": [],             // 本帧按最后速度外推的点
+    "bones_ok": { "foreArm_L": true, "thigh_R": false, "...": true }
   },
   "actions": {                      // 规则层输出
     "posture": "stand",
@@ -44,8 +55,11 @@
 ## 三条硬规矩
 
 1. **感知层不产出语义**。adapter 不知道「深蹲」是什么，只输出坐标。
-2. **距离必须带尺度锚点**。任何跨机位可移植的距离都要写成 `距离 / scale`，禁止直接用像素阈值。
+2. **距离必须带尺度锚点**。2D 距离写成 `距离 / scale`，3D 距离写成 `距离 / scale_world`，
+   禁止直接用像素阈值，也禁止把两种 scale 混用。
 3. **kp_format 声明式**。转换表在 `kpt.js`，新增模型只需加一个映射，不写分支判断。
+4. **3D 是可选的**。有 `kp_world` 时信号层可走 3D，没有就退回 2D（`docs/signals.md` §一·五）；
+   下游不允许假设 world 一定存在。
 
 ## 坐标与单位
 
@@ -53,7 +67,9 @@
 |---|---|---|
 | `kp[][0..1]` | 像素 | 相对原始视频分辨率（不是 CSS 尺寸），原点左上 |
 | `kp[][2]` | 0~1 | 置信度；< 0.3 的点不参与滤波与角度计算 |
-| `scale` | 像素 | 躯干长；这是**唯一**允许出现在距离阈值里的除数 |
+| `kp_world[][0..2]` | 米 | MediaPipe worldLandmarks：原点髋中心，**y 向下为正** |
+| `scale` | 像素 | 躯干长；2D 距离阈值的除数（保持像素以兼容既有数据） |
+| `scale_world` | 米 | 世界躯干长；3D 距离/比值的除数 |
 | `ts` | 毫秒 | 单调递增；同一帧内所有字段共用 |
 
 ## kp_format 对照
@@ -76,6 +92,21 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
         "profile":"fitness","params":{...},"fps":15.3,"frame_count":562}
 后续每行：一条帧记录（上面那种结构）
 ```
+
+难例导出（页面「判错了」）用同一格式，meta 额外带：
+
+```jsonc
+"hardcase": {
+  "click_ts": 123456.7,       // performance.now，与帧 ts 同基准
+  "before_ms": 3000,          // 窗口 = 点击前 3s + 之后 2s
+  "after_ms": 2000,
+  "action": "squat",          // 草稿 label 的期望动作；none = 不应出现
+  "detected": { "posture": "stand", "flags": {...}, "reps": {...} }  // 点击时的判定快照
+}
+```
+
+配套的 `hardcase-*.labels.json` 与普通 labels 相同（`startSec/endSec` 或 `start/end`），
+可直接被 `evaluate.mjs` 读取。
 
 为什么是 JSONL 而不是一个大 JSON 对象：20000 帧的整份 `JSON.stringify` 实测产生 40MB 字符串、
 峰值堆 184MB、阻塞主线程约 300ms。按行导出后浏览器分块拼 Blob，主线程只处理 500 行一块。

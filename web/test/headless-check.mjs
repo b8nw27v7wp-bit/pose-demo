@@ -145,12 +145,16 @@ async function main() {
       }
     });
 
+    // 固定 1440×900：布局（尤其工具栏新增控件）必须在这个尺寸下不产生滚动
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 1440, height: 900, deviceScaleFactor: 1, mobile: false,
+    });
     await cdp.send('Page.navigate', { url });
     await cdp.waitFor('Page.loadEventFired', 15000);
 
-    // 等模型加载 + 跑几帧
+    // 等模型加载 + 跑几帧（>20 帧才跨过骨骼一致性的 minSamples=10，才能验证 3D 不会被误判掉）
     for (let i = 0; i < 60; i++) {
-      const ready = await cdp.eval('!!(window.__pose && window.__pose.state.frames > 5)');
+      const ready = await cdp.eval('!!(window.__pose && window.__pose.state.frames > 20)');
       if (ready) break;
       await sleep(500);
     }
@@ -166,6 +170,54 @@ async function main() {
         posture: f && f.actions && f.actions.posture,
         kpCount: f && f.persons[0] ? f.persons[0].kp.length : 0,
         scale: f && f.persons[0] ? f.persons[0].scale : null,
+        // R3：确认页面真的走了 3D 分支，而不是悄悄退回 2D
+        hasWorld: f && f.signals ? f.signals.has_world : null,
+        knee: f && f.signals ? f.signals.knee : null,
+        knee2d: f && f.signals ? f.signals.knee_2d : null,
+        knee3d: f && f.signals ? f.signals.knee_3d : null,
+        scaleWorld: f && f.signals ? f.signals.scale_world : null,
+        angleSource: f && f.signals ? f.signals.angle_source : null,
+        extrapolated: f && f.signals ? f.signals.extrapolated : null,
+        bonesOk: f && f.signals ? f.signals.bones_ok : null,
+      };
+    })()`);
+
+    // R6：控件接好没有 + 难例窗口能切出帧和草稿 label
+    const hardcase = await cdp.eval(`(() => {
+      const sel = document.getElementById('hardcaseSel');
+      const btn = document.getElementById('btnHardcase');
+      const info = window.__pose && window.__pose.hardcaseInfo
+        ? window.__pose.hardcaseInfo('squat') : null;
+      return {
+        hasSelect: !!sel, options: sel ? sel.options.length : 0, value: sel ? sel.value : null,
+        hasButton: !!btn, frames: info && info.frames,
+        segment: info && info.segments && info.segments[0],
+        action: info && info.hardcase && info.hardcase.action,
+      };
+    })()`);
+
+    // 布局：1440×900 下不能出现整页滚动（PLAN §7.2 的约束）
+    const layout = await cdp.eval(`(() => ({
+      scrollHeight: document.documentElement.scrollHeight,
+      viewport: innerHeight,
+    }))()`);
+
+    // R6 端到端：真点一次「判错了」，等 2s 采样窗口结束，按钮要复位、状态要报告导出
+    try { await cdp.send('Page.setDownloadBehavior', { behavior: 'deny' }); } catch { /* 旧版本 CDP 可能不支持 */ }
+    const clickStart = await cdp.eval(`(() => {
+      const sel = document.getElementById('hardcaseSel');
+      const btn = document.getElementById('btnHardcase');
+      sel.value = 'squat';
+      btn.click();
+      return { disabled: btn.disabled, text: btn.textContent };
+    })()`);
+    await sleep(2500);
+    const clickEnd = await cdp.eval(`(() => {
+      const btn = document.getElementById('btnHardcase');
+      return {
+        disabled: btn.disabled,
+        text: btn.textContent,
+        status: (document.getElementById('status') || {}).textContent || '',
       };
     })()`);
 
@@ -175,11 +227,19 @@ async function main() {
     })()`);
 
     console.log('页面状态：', JSON.stringify(state, null, 2));
+    console.log('难例控件：', JSON.stringify(hardcase));
+    console.log('难例点击：', JSON.stringify({ clickStart, clickEnd }));
+    console.log('布局：', JSON.stringify(layout));
     console.log('状态栏：', profileEcho);
     console.log('JS 错误：', errors.length ? errors : '无');
 
     const ok = state.hasApi && state.estimatorReady && state.frames > 5
-      && state.kpCount === 13 && errors.length === 0;
+      && state.kpCount === 13 && errors.length === 0
+      && hardcase.options >= 10 && hardcase.hasButton && hardcase.frames > 0
+      && hardcase.segment && hardcase.action === 'squat'
+      && clickStart.disabled === true && clickEnd.disabled === false
+      && clickEnd.text === '判错了' && /已导出难例/.test(clickEnd.status)
+      && layout.scrollHeight <= layout.viewport + 1;
     console.log(ok ? '\n结果：通过' : '\n结果：失败');
     code = ok ? 0 : 1;
     ws.close();

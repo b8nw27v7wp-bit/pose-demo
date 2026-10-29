@@ -12,6 +12,9 @@ __pycache__/
 
 # 评估素材与导出（个人自拍视频/关键点，体积大且含本人影像，不进 git）
 # 保留 sample.* 合成样例，它由 make-sample.mjs 生成、可复现
+# manifest 只有元数据（机位/人物编号/光照/模型），不含影像，进 git 便于追踪采集进度
 eval-data/*
 !eval-data/sample.frames.json
 !eval-data/sample.labels.json
+!eval-data/manifest.json
+!eval-data/manifest.example.json
