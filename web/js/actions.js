@@ -2,7 +2,7 @@
 // 每个动作 = 信号层原语（Hold / RepCounter）的组合。加动作只改这个文件（引擎侧改 YAML）。
 // 阈值全部来自 params.js（可由 profile 覆盖），不在这里写常数（见 PLAN §12.3 B）。
 
-import { Hold, RepCounter } from './signals.js';
+import { Hold, RepCounter, PhaseSequence } from './signals.js';
 import { resolveParams } from './params.js';
 
 /**
@@ -47,6 +47,9 @@ export class ActionEngine {
     const cfg = resolveParams(params);
     this.cfg = cfg.actions;
     this.waveCfg = cfg.signals.wave;
+    this.graspCfg = cfg.signals.grasp;
+    this.closedShapes = new Set(cfg.signals.hand.closedShapes);
+    this.carryCfg = cfg.signals.arm.carry;
     // 深蹲门控：躯干仍接近竖直 + 踝明显在髋下方。
     // 少了这个门，从站到坐的过程中膝角也会穿过 100°，一次坐下会被记成一次深蹲。
     // 俯卧撑门控：身体接近水平，否则站着弯一下手臂也会被数。
@@ -60,6 +63,17 @@ export class ActionEngine {
     this.openHold = new Hold(this.cfg.holds.open);
     this.upHold = new Hold(this.cfg.holds.bothHandsUp);
     this.headHold = new Hold(this.cfg.holds.handFace);
+    this.reachHold = new Hold(this.cfg.holds.reach);
+    this.carryHold = new Hold(this.cfg.holds.carry);
+    this.pointHold = new Hold(this.cfg.holds.point);
+    // 拿取 = 伸手 → 合手 → 收回/抬起。手部状态由调用方逐帧传入（见 update 的 hands 参数）
+    this.graspSeq = new PhaseSequence(['reach', 'grasp'], {
+      minPhaseMs: this.graspCfg.minPhaseMs,
+      maxPhaseMs: this.graspCfg.reachToGraspMs,
+      completeAt: 'grasp',
+    });
+    this.graspCount = 0;
+    this.graspPhase = 'idle';
     this.reps = {
       squat: new RepCounter(this.cfg.reps.squat),
       pushup: new RepCounter(this.cfg.reps.pushup),
@@ -79,6 +93,12 @@ export class ActionEngine {
     this.openHold.reset();
     this.upHold.reset();
     this.headHold.reset();
+    this.reachHold.reset();
+    this.carryHold.reset();
+    this.pointHold.reset();
+    this.graspSeq.reset();
+    this.graspCount = 0;
+    this.graspPhase = 'idle';
     this.reps.squat.reset();
     this.reps.pushup.reset();
     this.reps.clap.reset();
@@ -89,8 +109,10 @@ export class ActionEngine {
   /**
    * @param {object} s SignalEngine.update() 产出的信号
    * @param {number} ts 毫秒
+   * @param {{L?:string|null, R?:string|null}} [hands] 每只手当前的稳定手势（形如 'fist'/'ok'），
+   *   缺失表示该手未检出。拿取判定需要手的开合状态，姿态层给不了这个信息。
    */
-  update(s, ts) {
+  update(s, ts, hands = null) {
     // 置信度不足：冻结状态，不推进计数，也不清空姿态（否则会闪）
     if (!s.ok) {
       const prev = this.last;
@@ -101,18 +123,21 @@ export class ActionEngine {
         frozen: true,
         flags: prev?.flags ?? {
           armRaised: false, waving: false, crossed: false, onHips: false, armsOpen: false,
-          bothHandsUp: false, handAtHead: false,
+          bothHandsUp: false, handAtHead: false, reaching: false, carrying: false,
+          pointing: false, armFront: false, armSide: false,
         },
         reps: {
           squat: this.reps.squat.count,
           pushup: this.reps.pushup.count,
           clap: this.reps.clap.count,
+          grasp: this.graspCount,
         },
         gates: prev?.gates ?? { squat: false, pushup: false, clap: false },
         repPhase: {
           squat: this.reps.squat.phase,
           pushup: this.reps.pushup.phase,
           clap: this.reps.clap.phase,
+          grasp: this.graspPhase,
         },
       };
     }
@@ -162,6 +187,33 @@ export class ActionEngine {
     // 手在头部附近：扶额/摸头/敬礼一类，动作本身不重要，重要的是「手不在躯干平面」
     const handAtHead = this.headHold.update(s.arm.head_near_L || s.arm.head_near_R, ts);
 
+    // —— 伸手 / 指向 / 持物 / 拿取
+    // 这些判定需要「手是张开还是握紧」，而姿态层只有腕的位置。
+    // hands 由调用方逐帧传入（手部模型的结果），缺失时这些动作一律不成立——
+    // 宁可漏判，也不要把「手没被检出」当成「手是空的」。
+    const closedL = !!hands && this.closedShapes.has(hands.L);
+    const closedR = !!hands && this.closedShapes.has(hands.R);
+    const anyClosed = closedL || closedR;
+    const anyOpen = !!hands && ((hands.L != null && !closedL) || (hands.R != null && !closedR));
+    const extended = ap.extend_L || ap.extend_R;
+
+    // 伸手：臂伸出且手是张开的（握着拳不算伸手，那是持物/拿取）
+    const reaching = this.reachHold.update(extended && anyOpen, ts);
+    // 持物：手闭合且臂没有明显伸出（端着/拿着东西的自然姿势）
+    const carrying = this.carryHold.update(anyClosed
+      && (ap.reach_L ?? 0) < this.carryCfg.maxReach
+      && (ap.reach_R ?? 0) < this.carryCfg.maxReach, ts);
+    // 指向：单臂伸出 + 手不是握拳（食指伸出与否由手势层判断，这里只保证「臂伸直且有手」）
+    const pointing = this.pointHold.update(extended && (anyOpen || closedL || closedR)
+      && (ap.arm_side_L || ap.arm_side_R || ap.arm_front_L || ap.arm_front_R), ts);
+
+    // 拿取状态机：reach（伸手且手张开）→ grasp（手合上）。两次都成立才算一次拿取。
+    const observed = extended && anyOpen ? 'reach'
+      : (extended && anyClosed ? 'grasp' : null);
+    const step = this.graspSeq.update(observed, ts);
+    this.graspPhase = step.phase;
+    this.graspCount = step.count;
+
     // —— 计数类
     const squatGate = s.leg_vertical > this.cfg.gates.squat.legVerticalGt
       && s.uprightness > this.cfg.gates.squat.uprightnessGt;
@@ -183,13 +235,17 @@ export class ActionEngine {
       frozen: false,
       flags: {
         armRaised, waving, crossed, onHips, armsOpen, bothHandsUp, handAtHead,
+        reaching, carrying, pointing,
+        armFront: ap.arm_front_L || ap.arm_front_R,
+        armSide: ap.arm_side_L || ap.arm_side_R,
       },
-      reps: { squat: squatCount, pushup: pushupCount, clap: clapCount },
+      reps: { squat: squatCount, pushup: pushupCount, clap: clapCount, grasp: this.graspCount },
       gates: { squat: squatGate, pushup: pushupGate, clap: clapGate },
       repPhase: {
         squat: this.reps.squat.phase,
         pushup: this.reps.pushup.phase,
         clap: this.reps.clap.phase,
+        grasp: this.graspPhase,
       },
     };
     this.last = out;
@@ -212,4 +268,9 @@ export const ARM_ACTIONS = [
   { id: 'hips', name: '叉腰' },
   { id: 'arms_open', name: '张开双臂' },
   { id: 'hand_head', name: '手在头部' },
+  { id: 'reach', name: '伸手' },
+  { id: 'carry', name: '持物' },
+  { id: 'point', name: '指向' },
+  { id: 'arm_front', name: '前平举' },
+  { id: 'arm_side', name: '侧平举' },
 ];

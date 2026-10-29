@@ -62,8 +62,11 @@ node web/test/evaluate.mjs --dir eval-data
 | 类别 | 取值 |
 |---|---|
 | 姿态 | `stand` / `sit` / `squat_static` / `lying` |
-| 手臂 | `armRaised` / `waving` / `crossed` / `onHips` / `armsOpen` |
-| 计数 | `squat` / `pushup` / `clap` |
+| 手臂 | `armRaised` / `bothHandsUp` / `waving` / `crossed` / `onHips` / `armsOpen` / `handAtHead` / `reaching` / `carrying` / `pointing` / `armFront` / `armSide` |
+| 计数 | `squat` / `pushup` / `clap` / `grasp` |
+
+动作名也接受 `ARM_ACTIONS` 里的 id（`arm_raised` / `reach` / `carry` / `point` …），
+两种写法等价，评估器内部会归一。
 | 反例 | `none` —— 这段时间内**不应**出现任何姿态或手臂动作（用来量误报） |
 
 `none` 是 precision 的唯一来源。只标正例，报告里的 precision 永远是 1，没有意义。

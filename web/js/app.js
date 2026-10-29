@@ -163,7 +163,7 @@ function resetRuntime() {
   lastInferTs = 0;
   handFails = 0;
   for (const k of Object.keys(shapeStable)) shapeStable[k].reset();
-  renderReps({ squat: 0, pushup: 0, clap: 0 });
+  renderReps({ squat: 0, pushup: 0, clap: 0, grasp: 0 });
   updateUI();
 }
 
@@ -338,6 +338,33 @@ function loop() {
   const persons = toPersons(res, w, h);
   let sig = null, act = null, target = null;
 
+  // —— 手部要先于动作判定：拿取/持物需要「手是张开还是握紧」，姿态层给不了。
+  // 手部模型失败不影响主体识别，hands 为空时这些动作一律不成立。
+  let hands = [];
+  if (show.hands && handReady) {
+    try {
+      const hr = detectHandsVideo(v, ts);
+      hands = toHands(hr, w, h).map((hd) => {
+        const cls = classifyHand(hd.kp);
+        // 手势去抖：连续 N 帧命中才切换，否则「张开↔剪刀手」会来回闪
+        const stable = shapeStable[hd.handedness === 'Left' ? 'L'
+          : hd.handedness === 'Right' ? 'R' : 'U'].update(cls.shape, ts);
+        // 中文名只从 handshape.js 的 SHAPE_LABELS 来（之前 app.js 又抄了一份 SHAPE_ZH）
+        const label = SHAPE_LABELS[stable] || '—';
+        return { ...hd, cls: { ...cls, shape: stable, label, raw: cls.shape } };
+      });
+      handFails = 0;
+    } catch (e) {
+      // 连续失败说明手部模型挂了：关掉它，别每帧都抛异常拖慢主循环
+      if (++handFails > 30) {
+        handReady = false;
+        $('chkHands').checked = false;
+        show.hands = false;
+        setStatus('手部模型异常，已自动关闭', 'err');
+      }
+    }
+  }
+
   if (persons.length) {
     // 目标人 = 画面里面积最大的那个人；其余人只画骨架不参与判定
     const area = (p) => (p.bbox[2] - p.bbox[0]) * (p.bbox[3] - p.bbox[1]);
@@ -357,40 +384,19 @@ function loop() {
     }
 
     sig = signalEngine.update(target, ts);
-    act = actionEngine.update(sig, ts);
+    // 只把「稳定后」的手势传给动作层；未检出的手给 undefined，动作层据此不判拿取
+    const handState = {
+      L: hands.find((h) => h.handedness === 'Left')?.cls.shape ?? null,
+      R: hands.find((h) => h.handedness === 'Right')?.cls.shape ?? null,
+    };
+    act = actionEngine.update(sig, ts, handState);
     $('badgeNoPerson').hidden = true;
   } else {
     clearCanvas(ctx, w, h);
     $('badgeNoPerson').hidden = false;
   }
 
-  // —— 手部（独立模型，失败不影响主体）
-  let hands = [];
-  if (show.hands && handReady) {
-    try {
-      const hr = detectHandsVideo(v, ts);
-      const raw = toHands(hr, w, h).map((hd) => {
-        const cls = classifyHand(hd.kp);
-        // 手势去抖：连续 N 帧命中才切换，否则「张开↔剪刀手」会来回闪
-        const stable = shapeStable[hd.handedness === 'Left' ? 'L'
-          : hd.handedness === 'Right' ? 'R' : 'U'].update(cls.shape, ts);
-        // 中文名只从 handshape.js 的 SHAPE_LABELS 来（之前 app.js 又抄了一份 SHAPE_ZH）
-        const label = SHAPE_LABELS[stable] || '—';
-        return { ...hd, cls: { ...cls, shape: stable, label, raw: cls.shape } };
-      });
-      hands = raw;
-      for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
-      handFails = 0;
-    } catch (e) {
-      // 连续失败说明手部模型挂了：关掉它，别每帧都抛异常拖慢主循环
-      if (++handFails > 30) {
-        handReady = false;
-        $('chkHands').checked = false;
-        show.hands = false;
-        setStatus('手部模型异常，已自动关闭', 'err');
-      }
-    }
-  }
+  for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
 
   pushLog(ts, target, sig, act, persons.length, hands);
   pushSpark(ts, sig ? sig.knee_pick : null);
@@ -451,12 +457,20 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
       reach_head_R: r2(sig.armPose.reach_head_R),
       has_world: !!sig.armPose.has_world,
       hands_close: r2(sig.armPose.hands_close),
+      // 拿取相关：伸出程度与水平方位角，拟合 extend/azimuth 阈值要靠这两列
+      reach_L: r2(sig.armPose.reach_L),
+      reach_R: r2(sig.armPose.reach_R),
+      extend_L: !!sig.armPose.extend_L,
+      extend_R: !!sig.armPose.extend_R,
+      azimuth_L: r1(sig.armPose.azimuth_L),
+      azimuth_R: r1(sig.armPose.azimuth_R),
     } : null,
     actions: act ? {
       posture: act.postureId,
       frozen: act.frozen,
       flags: act.flags,
       reps: act.reps,
+      grasp_phase: act.repPhase?.grasp ?? null,
     } : null,
     hands: hands.map((hd) => ({
       handedness: hd.handedness,
@@ -577,6 +591,7 @@ function renderReps(reps) {
   $('repSquat').textContent = reps.squat ?? 0;
   $('repPushup').textContent = reps.pushup ?? 0;
   $('repClap').textContent = reps.clap ?? 0;
+  $('repGrasp').textContent = reps.grasp ?? 0;
 }
 
 function buildGrids() {
@@ -596,6 +611,11 @@ const ARM_FLAG = {
   hips: 'onHips',
   arms_open: 'armsOpen',
   hand_head: 'handAtHead',
+  reach: 'reaching',
+  carry: 'carrying',
+  point: 'pointing',
+  arm_front: 'armFront',
+  arm_side: 'armSide',
 };
 
 function updateUI() {
@@ -698,7 +718,7 @@ $('chkMirror').addEventListener('change', (e) => {
 });
 $('btnReset').addEventListener('click', () => {
   actionEngine.reset();
-  renderReps({ squat: 0, pushup: 0, clap: 0 });
+  renderReps({ squat: 0, pushup: 0, clap: 0, grasp: 0 });
 });
 $('btnExport').addEventListener('click', exportJSON);
 window.addEventListener('beforeunload', () => { stopStream(); closeEstimator(); closeHandEstimator(); });

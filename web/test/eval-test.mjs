@@ -254,8 +254,12 @@ console.log('\n[8] 回归（审查修复）');
     check(`${id} 可被标注（不是未知动作）`, r.segments[0].type !== 'unknown',
       `type=${r.segments[0].type}`);
   }
-  check('ARM_ACTIONS 每个动作都能映射成 flag',
-    ARM_ACTIONS.every((a) => ['arm_raised', 'both_up', 'wave', 'crossed', 'hips', 'arms_open', 'hand_head'].includes(a.id)));
+  // 每个登记的手臂动作都必须能映射成 flag，否则评估器标注不了它
+  for (const a of ARM_ACTIONS) {
+    const r = evaluateClip(recs, { segments: [{ action: a.id, start: 0, end: 6000 }] }, tl0);
+    check(`动作 ${a.id} 可被评估器识别`, r.segments[0].type !== 'unknown',
+      `type=${r.segments[0].type}`);
+  }
 
   // 8.3 precision 归因：none 段的误报要记到真正误报的动作上
   const c = evaluateClip(recs, {

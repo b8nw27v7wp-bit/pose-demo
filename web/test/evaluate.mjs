@@ -214,17 +214,22 @@ function activeRanges(series, mergeMs = 0) {
 // —— 评估单段素材 -------------------------------------------------------
 
 const POSTURE_IDS = ['stand', 'sit', 'squat_static', 'lying'];
-const REP_IDS = ['squat', 'pushup', 'clap'];
+const REP_IDS = ['squat', 'pushup', 'clap', 'grasp'];
 /**
  * 手臂 flag 列表**从 ARM_ACTIONS 派生**，不手抄。
  * 手抄过一次，新增 bothHandsUp/handAtHead 时就漏了——标注这两个动作会得到「未知动作名」，
  * 而这正是本轮新增、最需要被度量的两个。
  */
-const ARM_ID_TO_FLAG = {
+export const ARM_ID_TO_FLAG = {
   arm_raised: 'armRaised', both_up: 'bothHandsUp', wave: 'waving',
   crossed: 'crossed', hips: 'onHips', arms_open: 'armsOpen', hand_head: 'handAtHead',
+  reach: 'reaching', carry: 'carrying', point: 'pointing',
+  arm_front: 'armFront', arm_side: 'armSide',
 };
 const FLAG_IDS = ARM_ACTIONS.map((a) => ARM_ID_TO_FLAG[a.id]).filter(Boolean);
+
+/** 标注里的动作名可以是 ARM_ACTIONS 的 id，也可以是内部 flag 名，两者都接受 */
+const canonical = (action) => ARM_ID_TO_FLAG[action] || action;
 
 /**
  * 一段素材评估。labels.segments 每段声明：
@@ -236,7 +241,8 @@ export function evaluateClip(frames, labels, timeline) {
   const segments = labels.segments || [];
   const span = frames.length ? frames[frames.length - 1].ts - frames[0].ts : 0;
 
-  const seriesOf = (action) => {
+  const seriesOf = (rawAction) => {
+    const action = canonical(rawAction);
     if (POSTURE_IDS.includes(action)) {
       return timeline.map((r) => ({ ts: r.ts, on: !r.empty && r.act.postureId === action }));
     }

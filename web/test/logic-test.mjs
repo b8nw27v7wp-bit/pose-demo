@@ -4,7 +4,7 @@
 // 说明：这里验证的是**判定逻辑**（角度、滤波、滞回、计数门控、姿态互斥、置信冻结），
 // 用人工构造的骨架/信号序列，不代表真实场景精度。真实精度必须用实拍素材校准。
 
-import { angleDeg, angleDeg3, OneEuro, Hold, RepCounter, SignalEngine } from '../js/signals.js';
+import { angleDeg, angleDeg3, OneEuro, Hold, RepCounter, PhaseSequence, SignalEngine } from '../js/signals.js';
 import { ActionEngine } from '../js/actions.js';
 import { classifyHand, HandShapeStabilizer } from '../js/handshape.js';
 import { toHands, handOrientation, spreadRatio } from '../js/handformat.js';
@@ -756,6 +756,170 @@ console.log('\n[21] 回归（审查修复）');
 
 function withVis0(kp, v) {
   return kp.map((p) => [p[0], p[1], v]);
+}
+
+// —— 22. 拿取 / 伸手 / 持物 / 指向 ——
+console.log('\n[22] 拿取与手臂扩展');
+{
+  const mkSig = (o = {}) => ({
+    ok: true, knee_pick: 170, elbow_pick: 170, uprightness: 0.95, leg_vertical: 1.3,
+    arm: {
+      any_raised: false, any_raised3d: false, raised_L: false, raised_R: false,
+      raised3d_L: false, raised3d_R: false, head_near_L: false, head_near_R: false,
+    },
+    armPose: {
+      elev_L: 90, elev_R: 170, elev_torso_L: 90, elev_torso_R: 170,
+      reach_L: 1.6, reach_R: 0.84, reach_head_L: 2, reach_head_R: 2,
+      hands_close: 2.0, crossed: false, on_hips: false, open_wide: false,
+      chest_height: false, has_world: false,
+      extend_L: true, extend_R: false, azimuth_L: 0, azimuth_R: 170,
+      arm_front_L: true, arm_front_R: false, arm_side_L: false, arm_side_R: false,
+    },
+    wave: { L: 0, R: 0, amp: 0 },
+    ...o,
+  });
+  const hands = (l, r) => ({ L: l, R: r });
+
+  // 伸手：臂伸出 + 手张开
+  const ae = new ActionEngine();
+  let t = 0; let r;
+  for (let i = 0; i < 5; i++) r = ae.update(mkSig(), t += 100, hands('open', null));
+  check('臂伸出 + 手张开 → 伸手', r.flags.reaching === true);
+
+  // 握着拳时不叫「伸手」（那是持物/拿取）
+  const ae2 = new ActionEngine();
+  let t2 = 0; let r2;
+  for (let i = 0; i < 5; i++) r2 = ae2.update(mkSig(), t2 += 100, hands('fist', null));
+  check('臂伸出但握拳 → 不算伸手', r2.flags.reaching === false);
+  check('臂伸出但握拳 → 不算持物（臂伸太远）', r2.flags.carrying === false);
+
+  // 持物：手闭合 + 臂没伸出
+  const ae3 = new ActionEngine();
+  let t3 = 0; let r3;
+  const carried = mkSig({
+    armPose: {
+      ...mkSig().armPose,
+      reach_L: 0.9, extend_L: false, elev_L: 160,
+      arm_front_L: false, arm_side_L: false,
+    },
+  });
+  for (let i = 0; i < 6; i++) r3 = ae3.update(carried, t3 += 100, hands('fist', null));
+  check('手闭合 + 臂未伸出 → 持物', r3.flags.carrying === true);
+
+  // 指向：臂伸出 + 朝向水平
+  const ae4 = new ActionEngine();
+  let t4 = 0; let r4;
+  for (let i = 0; i < 6; i++) r4 = ae4.update(mkSig(), t4 += 100, hands('pointing', null));
+  check('臂伸出 + 指示手势 → 指向', r4.flags.pointing === true);
+
+  // 拿取 = 伸手 → 合手，两次条件都成立才计 1
+  const ae5 = new ActionEngine();
+  let t5 = 0; let r5;
+  for (let i = 0; i < 6; i++) r5 = ae5.update(mkSig(), t5 += 100, hands('open', null));   // 伸手
+  for (let i = 0; i < 6; i++) r5 = ae5.update(mkSig(), t5 += 100, hands('fist', null));   // 合手
+  check('伸手 → 合手 → 计 1 次拿取', r5.reps.grasp === 1, `grasp=${r5.reps.grasp}`);
+  check('拿取相位回到起点', r5.repPhase.grasp === 'reach' || r5.repPhase.grasp === 'grasp'
+    || r5.repPhase.grasp === 'idle', `phase=${r5.repPhase.grasp}`);
+
+  // 直接合手（没有先伸手）不算拿取
+  const ae6 = new ActionEngine();
+  let t6 = 0; let r6;
+  for (let i = 0; i < 10; i++) r6 = ae6.update(mkSig(), t6 += 100, hands('fist', null));
+  check('没有先伸手就合手 → 不计拿取', r6.reps.grasp === 0, `grasp=${r6.reps.grasp}`);
+
+  // 伸手后超时没合手 → 状态机复位，之后合手也不计
+  const ae7 = new ActionEngine();
+  let t7 = 0; let r7;
+  for (let i = 0; i < 5; i++) r7 = ae7.update(mkSig(), t7 += 100, hands('open', null));
+  t7 += 3000;   // 超过 reachToGraspMs
+  for (let i = 0; i < 5; i++) r7 = ae7.update(mkSig(), t7 += 100, hands('fist', null));
+  check('伸手后超时再合手 → 不计拿取', r7.reps.grasp === 0, `grasp=${r7.reps.grasp}`);
+
+  // 手部未检出时，所有依赖手的动作都不成立（不能把"没检出"当"手是空的"）
+  const ae8 = new ActionEngine();
+  let t8 = 0; let r8;
+  for (let i = 0; i < 8; i++) r8 = ae8.update(mkSig(), t8 += 100, null);
+  check('无手部数据 → 不判伸手', r8.flags.reaching === false);
+  check('无手部数据 → 不判持物', r8.flags.carrying === false);
+  check('无手部数据 → 不判拿取', r8.reps.grasp === 0);
+
+  // 前平举 / 侧平举
+  const frontSig = mkSig({
+    armPose: { ...mkSig().armPose, arm_front_L: true, arm_side_L: false },
+  });
+  const ae9 = new ActionEngine();
+  let t9 = 0; let r9;
+  for (let i = 0; i < 3; i++) r9 = ae9.update(frontSig, t9 += 100, hands('open', null));
+  check('方位角在正前方 → 前平举', r9.flags.armFront === true);
+  check('方位角在正前方 → 不是侧平举', r9.flags.armSide === false);
+}
+
+// —— 23. PhaseSequence 原语（拿取状态机的地基）——
+console.log('\n[23] PhaseSequence');
+{
+  const seq = new PhaseSequence(['reach', 'grasp'], { minPhaseMs: 100, maxPhaseMs: 1000, completeAt: 'grasp' });
+  check('初始在阶段 0', seq.phase === 'reach');
+  seq.update('reach', 0);
+  check('阶段内不前进', seq.phase === 'reach' && seq.count === 0);
+  const a = seq.update('grasp', 50);
+  check('未满 minPhaseMs 不前进', a.phase === 'reach', `phase=${a.phase}`);
+  const b = seq.update('grasp', 200);
+  check('满 minPhaseMs 且进入终态 → 完成一次', b.count === 1 && b.completed === true, `count=${b.count}`);
+  check('完成后回到第一阶段', b.phase === 'reach');
+
+  // 超时复位：一直停在 reach 不动，超过 maxPhaseMs 后要能被新一轮识别
+  const seq2 = new PhaseSequence(['reach', 'grasp'], { minPhaseMs: 100, maxPhaseMs: 500, completeAt: 'grasp' });
+  seq2.update('reach', 0);
+  seq2.update('reach', 600);      // 超时
+  const c = seq2.update('grasp', 800);
+  check('超时复位后重新伸手→合手仍能完成', c.phase === 'reach', `phase=${c.phase}`);
+
+  // 乱序不前进
+  const seq3 = new PhaseSequence(['reach', 'grasp'], { minPhaseMs: 0, maxPhaseMs: 2000, completeAt: 'grasp' });
+  seq3.update('reach', 0);
+  const d = seq3.update(null, 100);
+  check('观察到 null 不前进', d.count === 0);
+}
+
+// —— 24. 前平举 / 侧平举：方位角必须配「手臂接近水平」——
+console.log('\n[24] 平举方位');
+{
+  const kp = [
+    [100, 50, 1],
+    [90, 100, 1], [110, 100, 1],
+    [85, 150, 1], [115, 150, 1],
+    [80, 200, 1], [120, 200, 1],
+    [92, 220, 1], [108, 220, 1],
+    [90, 300, 1], [110, 300, 1],
+    [88, 380, 1], [112, 380, 1],
+  ];
+  const mkWorld = (wristL, wristR) => {
+    const w = new Array(33).fill(null).map(() => [0, 0, 0]);
+    w[23] = [-0.1, 0, 0]; w[24] = [0.1, 0, 0];
+    w[11] = [-0.16, -0.48, 0]; w[12] = [0.16, -0.48, 0];
+    w[0] = [0, -0.62, 0];
+    w[13] = [-0.25, -0.4, 0]; w[15] = wristL;
+    w[14] = [0.25, -0.4, 0]; w[16] = wristR;
+    return w;
+  };
+  const person2 = (world) => ({ kp, kp_world: world, kp_raw: [], bbox: [0, 0, 1, 1], scale: 120, score: 0.92 });
+
+  // 自然下垂：腕在肩正下方 → 水平分量≈0，方位角无意义
+  const hang = new SignalEngine().update(person2(mkWorld([-0.16, 0.0, 0], [0.16, 0.0, 0])), 1000);
+  check('自然下垂 → 不算前平举', hang.armPose.arm_front_L === false,
+    `elev_torso=${hang.armPose.elev_torso_L?.toFixed(0)}`);
+  check('自然下垂 → 不算侧平举', hang.armPose.arm_side_L === false);
+
+  // 侧平举：臂水平、朝正侧方（x 方向外展）
+  const side = new SignalEngine().update(person2(mkWorld([-0.62, -0.48, 0], [0.62, -0.48, 0])), 1000);
+  check('水平侧展 → 侧平举', side.armPose.arm_side_L === true,
+    `azim=${side.armPose.azimuth_L?.toFixed(0)} elev=${side.armPose.elev_torso_L?.toFixed(0)}`);
+  check('水平侧展 → 不是前平举', side.armPose.arm_front_L === false);
+
+  // 前平举：臂水平、朝正前方（z 负方向）
+  const front = new SignalEngine().update(person2(mkWorld([-0.16, -0.48, -0.5], [0.16, -0.8, -0.5])), 1000);
+  check('水平前伸 → 前平举', front.armPose.arm_front_L === true,
+    `azim=${front.armPose.azimuth_L?.toFixed(0)} elev=${front.armPose.elev_torso_L?.toFixed(0)}`);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

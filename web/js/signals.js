@@ -125,8 +125,89 @@ export class RepCounter {
   reset() { this.count = 0; this.phase = 'up'; this.tDown = null; }
 }
 
-/** 关键点滤波器组：每个点两个一维滤波器（x/y）。 */
-class KpFilter {
+/**
+ * 有序阶段状态机（信号层原语 sequence，见 PLAN §5.2）。
+ *
+ * 「拿取」不是一个瞬时手势，而是一串有序阶段：伸手 → 合手 → 抬起。
+ * 用多个独立 Hold 拼不出来——Hold 不知道「先后顺序」，也不会在超时后复位。
+ *
+ * @param {string[]} phases 阶段名，按期望顺序
+ * @param {{minPhaseMs?:number, maxPhaseMs?:number, completeAt?:string}} opts
+ *   minPhaseMs：每阶段最短持续，滤单帧抖动
+ *   maxPhaseMs：每阶段最长持续时间，超时回到第一阶段（防止卡死在中间阶段）
+ *   completeAt：走到这个阶段就算完成一次并回到第一阶段
+ */
+export class PhaseSequence {
+  constructor(phases, { minPhaseMs = 120, maxPhaseMs = 1500, completeAt = null } = {}) {
+    if (!phases || !phases.length) throw new Error('PhaseSequence 需要至少一个阶段');
+    this.phases = phases;
+    this.minPhaseMs = minPhaseMs;
+    this.maxPhaseMs = maxPhaseMs;
+    this.completeAt = completeAt || phases[phases.length - 1];
+    this.reset();
+  }
+
+  reset() {
+    this.index = 0;
+    this.enteredAt = 0;
+    this.count = 0;
+    // started：当前阶段是否真的被观察到过。没有它，「没伸手直接合手」也会被当成阶段推进。
+    this.started = false;
+    // done：刚完成一次，必须回到第一阶段才能再次计数，否则握着手不动会逐帧累加。
+    this.done = false;
+  }
+
+  /** 当前阶段名 */
+  get phase() { return this.phases[this.index]; }
+
+  /**
+   * @param {string|null} observed 本帧观察到的阶段（null = 什么都不成立）
+   * @param {number} ts 毫秒
+   * @returns {{phase:string, count:number, completed:boolean}}
+   */
+  update(observed, ts) {
+    // 阶段超时：复位到开头，防止「伸手后一直没合手」永久卡在中间阶段
+    if (this.started && ts - this.enteredAt > this.maxPhaseMs) {
+      this.index = 0;
+      this.started = false;
+      this.enteredAt = ts;
+      this.done = false;
+    }
+
+    if (this.done) {
+      // 闭锁：要重新看到第一阶段（例如手重新张开再伸）才允许下一次
+      if (observed === this.phases[0]) {
+        this.done = false;
+        this.started = true;
+        this.enteredAt = ts;
+      }
+      return { phase: this.phase, count: this.count, completed: false };
+    }
+
+    if (observed === this.phase) {
+      if (!this.started) { this.started = true; this.enteredAt = ts; }
+      return { phase: this.phase, count: this.count, completed: false };
+    }
+
+    let completed = false;
+    if (this.started && this.phases[this.index + 1] === observed
+      && ts - this.enteredAt >= this.minPhaseMs) {
+      this.index++;
+      this.enteredAt = ts;
+      if (this.phase === this.completeAt) {
+        this.count++;
+        completed = true;
+        this.index = 0;
+        this.started = false;
+        this.done = true;
+      }
+    }
+
+    return { phase: this.phase, count: this.count, completed };
+  }
+}
+
+/** 关键点滤波器组：每个点两个一维滤波器（x/y）。 */class KpFilter {
   constructor(opts, visMin = 0.3) {
     this.opts = opts;
     this.visMin = visMin;
@@ -342,6 +423,33 @@ export class SignalEngine {
     // 3D 抬臂角判定举手：比 2D 稳，但只在 world 可用时生效
     const raisedTorso = (v) => Number.isFinite(v) && v < C.arm.elevTorso.raised;
 
+    // —— 伸手 / 指向 / 持物（拿取动作的基础信号）
+    // 伸出 = 腕离肩足够远且不是自然下垂。用 reach（已按 scale 归一）而不是像素。
+    const extendCfg = C.arm.extend;
+    const extendedL = Number.isFinite(reachL) && reachL > extendCfg.minReach && elevL > extendCfg.minElev;
+    const extendedR = Number.isFinite(reachR) && reachR > extendCfg.minReach && elevR > extendCfg.minElev;
+
+    // 3D 水平方位角：肩→腕在水平面上的朝向。0°=正前方（朝镜头），±180°=正后方。
+    // 世界坐标 z 轴指向屏幕内，所以 atan2(x, -z) 得到「相对身体正前方」的偏角。
+    let azimL = NaN, azimR = NaN;
+    if (w3) {
+      const azimuth = (sh, wr) => {
+        const v = sub(wr, sh);
+        return (Math.atan2(v[0], -v[2]) * 180) / Math.PI;
+      };
+      if (visWristL >= VIS_MIN) azimL = azimuth(W3('shoulder_L'), W3('wrist_L'));
+      if (visWristR >= VIS_MIN) azimR = azimuth(W3('shoulder_R'), W3('wrist_R'));
+    }
+    const azimCfg = C.arm.azimuth;
+    // 方位角只在手臂接近水平时才有意义：自然下垂时水平分量≈0，atan2 出来的是噪声。
+    // 实测过没这道门控时，走路视频里 armFront 一直是 true。
+    const horizontal = (elevT) => Number.isFinite(elevT)
+      && elevT > azimCfg.minElev && elevT < azimCfg.maxElev;
+    const armFrontL = horizontal(elevTorsoL) && Math.abs(azimL) < azimCfg.frontMax;
+    const armFrontR = horizontal(elevTorsoR) && Math.abs(azimR) < azimCfg.frontMax;
+    const armSideL = horizontal(elevTorsoL) && Math.abs(azimL) > azimCfg.sideMin;
+    const armSideR = horizontal(elevTorsoR) && Math.abs(azimR) > azimCfg.sideMin;
+
     // 抱臂：两腕的左右顺序相对肩膀翻转（用顺序而不是固定符号，人转身背对镜头也成立）
     const shOrder = Math.sign(shL[0] - shR[0]) || 1;
     const wrOrder = Math.sign(wristL[0] - wristR[0]) || 1;
@@ -433,6 +541,14 @@ export class SignalEngine {
         open_wide: armsOpen,
         chest_height: chestHeight,
         has_world: !!w3,
+        extend_L: extendedL,
+        extend_R: extendedR,
+        azimuth_L: azimL,
+        azimuth_R: azimR,
+        arm_front_L: armFrontL,
+        arm_front_R: armFrontR,
+        arm_side_L: armSideL,
+        arm_side_R: armSideR,
       },
       wave: { L: waveL.flips, R: waveR.flips, amp: Math.max(waveL.amp, waveR.amp) },
     };

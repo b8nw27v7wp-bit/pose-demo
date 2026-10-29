@@ -35,6 +35,23 @@ export const DEFAULT_PARAMS = {
       head: { maxDist: 0.55, aboveShoulder: 0.5 },
       // 3D 抬臂角（相对躯干）：0°=手在躯干延长线上（举起），90°=水平，180°=沿身体下垂
       elevTorso: { raised: 75 },
+      // 手臂伸出：腕到肩距离 / scale。自然下垂实测 ≈0.84，前伸约 1.5+
+      extend: { minReach: 1.25, minElev: 30 },
+      // 3D 水平方位角：0°=正前方，±90°=正侧方。用来区分前平举与侧平举。
+      // 必须配合「手臂接近水平」才有效：手自然下垂时水平分量接近 0，方位角是噪声
+      azimuth: { frontMax: 35, sideMin: 55, minElev: 60, maxElev: 120 },
+      // 持物：手闭合且臂未伸出
+      carry: { maxReach: 1.2 },
+    },
+    hand: {
+      // 判定为「握住」的手势。ok/gun 是捏取，也算能拿东西
+      closedShapes: ['fist', 'ok'],
+    },
+    grasp: {
+      // 拿取状态机的时间窗
+      reachToGraspMs: 1500,   // 伸手后多久内合手才算拿取
+      minPhaseMs: 120,        // 每阶段最短持续，滤掉单帧抖动
+      releaseMs: 200,         // 张手后多久确认「放下」
     },
     gesture: {
       streak: 3,        // 手势要连续命中几帧才切换（治「张开→剪刀手」来回闪）
@@ -51,6 +68,7 @@ export const DEFAULT_PARAMS = {
     holds: {
       arm: 300, wave: 150, crossed: 400, hips: 400, open: 400,
       handFace: 350, handChest: 350, bothHandsUp: 350,
+      reach: 250, carry: 300, point: 250,
     },
     reps: {
       squat: { down: 100, up: 150, minCycleMs: 600, minHalfMs: 120 },
