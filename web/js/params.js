@@ -133,3 +133,28 @@ export function profileParams(raw) {
 export function profileName(raw, fallback = 'default') {
   return (raw && typeof raw.name === 'string' && raw.name) || fallback;
 }
+
+/** 稳定序列化：键按字典序排列，保证"同一组参数、不同写法"得到同一个字符串。 */
+function stableStringify(v) {
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(',')}]`;
+  if (v && typeof v === 'object') {
+    const keys = Object.keys(v).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(v[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v) ?? String(v);
+}
+
+/**
+ * 参数指纹（FNV-1a 32 位）。
+ * 为什么需要：导出里带一份完整 params 又大又难比，事后想确认"两份数据是不是同一套阈值"
+ * 只能人工 diff。指纹让"同阈值"变成一次字符串比较（PLAN §13 R0）。
+ */
+export function paramsHash(overrides = {}) {
+  const s = stableStringify(resolveParams(overrides));
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `fnv1a:${(h >>> 0).toString(16).padStart(8, '0')}`;
+}

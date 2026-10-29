@@ -1,6 +1,7 @@
 {
   "name": "fitness",
-  "note": "示例 profile：只写与默认值不同的键，其余走 params.js 的默认值。数值是量级参考，必须用实拍素材校准后替换（PLAN §12.3 B）。",
+  "model": "lite",
+  "note": "示例 profile：只写与默认值不同的键，其余走 params.js 的默认值。model 声明这套阈值是在哪个姿态模型档位下校准的（full 更准、噪声更小，阈值不能混用）。数值是量级参考，必须用实拍素材校准后替换（PLAN §12.3 B）。",
   "params": {
     "signals": {
       "wave": { "minFlips": 3, "minAmp": 0.25 }
