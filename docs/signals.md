@@ -46,6 +46,10 @@
 2D 与 3D 分别有自己的 One Euro 滤波器，不共用历史：混用会让「3D 偶尔丢一帧」
 变成信号台阶。3D 侧**不保持旧值**（本帧没有有效世界点就不给数），避免陈旧值冒充当前。
 
+举手的 3D 判定同样按这条规则**逐侧**回退：`raised_sel_L/R` 在本帧该侧 3D 有效时直接采用
+3D（`elev_torso`），3D 无效（无 world、该侧世界点缺失、骨骼判不可靠）时才退回 2D。
+只在 `has_world` 为真时整体改用 3D，会在「world 在、某侧世界点坏掉」时把举手整个丢掉。
+
 ### 每个信号族的开关（`params.signals.world`）
 
 | 键 | 默认 | 说明 |
@@ -162,6 +166,8 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
    置信度 < 0.3 的点**不喂滤波器**，避免把噪声写进历史。
 2. **角度信号再滤一次**（`minCutoff=1.5, beta=0.02`）：关键点平滑后角度仍会抖 1~2°，
    而阈值判定对 1° 的抖动很敏感（尤其滞回的上阈）。
+   2D 角在三点中任一点可见性 < `visMin` 时直接给 **NaN**（该帧不喂滤波器，也不沿用上一次的值）：
+   否则腿被桌子挡住、脚出画时，会拿漂移坐标或陈旧值凑出一个膝角，姿态层据此判成「下蹲」。
 3. **尺度锚点做 5 帧中值滤波**：单帧关键点跳变会让 `scale` 突变，进而让所有 ratio 类信号跳变。
    3D 的 `scale_world` 同样做中值滤波，但它不替代像素 `scale`。
 4. **2D / 3D 各自一套滤波器**：同一条信号不要在两套实现之间来回喂同一个滤波器，
@@ -193,12 +199,13 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 |---|---|---|---|
 | 膝角 站立 | > 150° | 解剖学伸直约 175~180°，留抖动余量 | `actions.posture.stand.kneeGt` |
 | 膝角 下蹲 | < 110° | 深蹲底部约 60~100° | `actions.posture.squat.kneeLt` |
-| 膝角 坐 | 60~135° | 坐姿膝屈约 90° | `actions.posture.sit.knee*` |
+| 膝角 坐 | 55~135° | 坐姿膝屈约 90° | `actions.posture.sit.knee*` |
 | 肘角 俯卧撑底 | < 90° | 肘屈到底约 60~90° | `actions.reps.pushup.down` |
 | 肘角 伸直 | > 150° | | `actions.reps.pushup.up` |
 | `uprightness` 站立 | > 0.8 | cos 值；0.8≈36° 以内 | `actions.posture.stand.uprightnessGt` |
 | `uprightness` 躺卧 | < 0.45 | 躯干近水平 | `actions.posture.lying.uprightnessLt` |
 | `leg_vertical` 站立 | > 0.8 | 踝明显在髋下方 | `actions.posture.stand.legVerticalGt` |
+| `leg_vertical` 下蹲姿态 | > 0.85 | 与计数门控同口径：坐姿的腿不再竖直向下 | `actions.posture.squat.legVerticalGt` |
 | `leg_vertical` 躺卧 | < 0.8 且 `uprightness` < 0.45 | 两个条件必须同时满足 | `actions.posture.lying.legVerticalLt` |
 | 骨骼长度偏离 | > 20% 判不可靠 | 模型估计值的正常波动约 5~10%；20% 已明显是漂移 | `signals.world.boneCheck.tolerance` |
 | 骨骼样本数 | ≥ 10 帧才启用 | 太少的中位数本身不可信 | `signals.world.boneCheck.minSamples` |
@@ -214,6 +221,10 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 ```
 
 优先级高的更「具体」也更「危险」，误判代价更小。
+
+「下蹲」还要求 `leg_vertical > 0.85`（与深蹲计数门控同口径）：坐姿的膝角也会 < 110°、
+躯干也会直，少了这道门，坐会被优先级更高的「下蹲」吃掉。「坐」要求 `leg_vertical < 1.05`；
+两者在 0.85~1.05 之间重叠时按下蹲算——腿仍明显朝下，形态上更接近蹲。
 
 ## 六、门控（为什么计数要加门）
 
@@ -247,6 +258,10 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 
 **门控**：鼓掌必须 `chest_height && !crossed`。抱臂时两腕也很近，只用「两腕距离」会把抱臂算成鼓掌。
 鼓掌计数用 `RepCounter`：`down=0.45`（合掌）、`up=1.0`（分开）、`minCycleMs=400`。
+
+**挥手（`waving`）**：翻转次数与幅度必须来自**同一条举起的臂**。`wave.L/R` 是左右腕的翻转次数，
+`wave.amp_L/amp_R` 是对应侧的幅度，判定只看「该侧举起」的那一份。
+只取两侧最大幅度时，「左手举着不动、右手在髋旁摆动」会被凑成挥手（走路视频里就会误报）。
 
 ### 手部（MediaPipe HandLandmarker，每只手 21 点）
 

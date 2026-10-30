@@ -21,8 +21,11 @@ export function buildPostures(actions) {
     {
       id: 'squat_static', name: '下蹲', prio: 30,
       minMs: posture.squat.minMs, streak: posture.squat.streak,
+      // 腿竖直比与计数门控同口径：坐姿膝角也会 <110°、躯干也会直，
+      // 少了这道门，坐会被更高优先级的「下蹲」吃掉。
       cond: (s) => s.knee_pick < posture.squat.kneeLt
-        && s.uprightness > posture.squat.uprightnessGt,
+        && s.uprightness > posture.squat.uprightnessGt
+        && s.leg_vertical > posture.squat.legVerticalGt,
     },
     {
       id: 'sit', name: '坐', prio: 20,
@@ -163,28 +166,42 @@ export class ActionEngine {
 
     // —— 举手 / 挥手
     // 举手优先用 3D（相对躯干）判定：俯拍时 2D 抬臂角会把「前伸」误当「举起」。
-    // has_world 为假时退回 2D，行为与之前一致。
+    // 「哪一档可用」由信号层逐侧决定（raised_sel_*）：本帧 3D 有效用 3D，
+    // 3D 无效（无 world / 该侧世界点缺失）才退回 2D。只看 has_world 会在
+    // 「world 在、某侧世界点坏掉」时把举手整个丢掉。
     const ap = s.armPose || {};
+    const arm = s.arm || {};
     const waveCfg = this.waveCfg;
-    const raisedNow = ap.has_world ? s.arm.any_raised3d : s.arm.any_raised;
+    const wv = s.wave || {};
+    const sideRaised = (side) => {
+      const sel = side === 'L' ? arm.raised_sel_L : arm.raised_sel_R;
+      if (sel === true || sel === false) return sel;
+      // 兼容手搓的信号对象（单测/旧导出）：没有逐侧字段时按旧的整体口径
+      const from3d = side === 'L' ? arm.raised3d_L : arm.raised3d_R;
+      const from2d = side === 'L' ? arm.raised_L : arm.raised_R;
+      if (from3d === undefined && from2d === undefined) return !!arm.any_raised;
+      return ap.has_world ? !!from3d : !!from2d;
+    };
+    const raisedL = sideRaised('L');
+    const raisedR = sideRaised('R');
+    const raisedNow = raisedL || raisedR;
     const armRaised = this.armHold.update(raisedNow, ts);
     // 挥手也走同一套举手判定：之前单独用 2D 的 any_raised，会导出
     // armRaised=false 而 waving=true ——「挥手必然蕴含举手」这条不变量不能破。
-    const waving = this.waveHold.update(
-      raisedNow && (s.wave.L >= waveCfg.minFlips || s.wave.R >= waveCfg.minFlips)
-        && s.wave.amp > waveCfg.minAmp,
-      ts,
-    );
+    // 翻转次数与幅度必须来自**同一条举起的臂**：只取两侧 max(amp) 时，
+    // 「左手举着不动、右手在髋旁摆动」会凑成挥手。
+    const ampOf = (side) => Number(side === 'L' ? wv.amp_L ?? wv.amp : wv.amp_R ?? wv.amp);
+    const waveL = raisedL && (wv.L ?? 0) >= waveCfg.minFlips && ampOf('L') > waveCfg.minAmp;
+    const waveR = raisedR && (wv.R ?? 0) >= waveCfg.minFlips && ampOf('R') > waveCfg.minAmp;
+    const waving = this.waveHold.update(waveL || waveR, ts);
 
     // —— 手臂姿态（抱臂 / 叉腰 / 张开双臂 / 双手高举 / 手在头部附近）
     const crossed = this.crossedHold.update(!!ap.crossed, ts);
     const onHips = this.hipsHold.update(!!ap.on_hips, ts);
     const armsOpen = this.openHold.update(!!ap.open_wide, ts);
     // 双手高举：两边都举起，才算「欢呼/投降」式，和单臂举手区分开
-    const bothRaisedNow = ap.has_world
-      ? (s.arm.raised3d_L && s.arm.raised3d_R)
-      : (s.arm.raised_L && s.arm.raised_R);
-    const bothHandsUp = this.upHold.update(bothRaisedNow, ts);
+    // （同一套逐侧选择，避免一侧 3D 无效就把双手高举整体判掉）
+    const bothHandsUp = this.upHold.update(raisedL && raisedR, ts);
     // 手在头部附近：扶额/摸头/敬礼一类，动作本身不重要，重要的是「手不在躯干平面」
     const handAtHead = this.headHold.update(s.arm.head_near_L || s.arm.head_near_R, ts);
 

@@ -11,11 +11,12 @@ import {
   wilson, postureConfusion, armCooccurrence, groupSummaries,
   evaluateGates, sweepVariants, diffSummary, compareSummaries, compareSegments,
   temporalStats, gestureFrames, gestureSummary, gestureSummaryIfAny,
+  fitToParams, resampleFrames, FIT_MIN_SAMPLES,
 } from './evaluate.mjs';
-import { DEFAULT_PARAMS, profileParams, profileName, paramsHash } from '../js/params.js';
+import { DEFAULT_PARAMS, mergeParams, profileParams, profileName, paramsHash } from '../js/params.js';
 import { videoTimeMonotonic } from './frame-io.mjs';
 import { ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
-import { writeFile, mkdtemp, rm } from 'node:fs/promises';
+import { writeFile, readFile, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -1208,6 +1209,205 @@ console.log('\n[27] 手势评估');
     check('CLI 手势门槛未达标 → 退出码 2', code === 2, `code=${code}`);
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+
+// —— 28. R4 拟合工具：分位→profile、LOSO、帧率敏感性 ——
+// 这些工具不依赖实拍数据；这里用已知答案的合成帧验证「翻译方向」和「留一人流程」，
+// 不验证真实阈值是否好用（那需要 R2 的数据）。
+console.log('\n[28] R4 拟合工具');
+{
+  // 分位 → profile：方向约定见 evaluate.fitToParams 的注释
+  const fit = {
+    'stand/knee': { n: 50, p5: 160, p50: 168, p95: 175 },
+    'squat_static/knee': { n: 50, p5: 95, p50: 105, p95: 110 },
+    'sit/knee': { n: 30, p5: 70, p50: 100, p95: 130 },
+    'stand/uprightness': { n: 50, p5: 0.9, p50: 0.95, p95: 0.98 },
+    'squat_static/uprightness': { n: 50, p5: 0.5, p50: 0.55, p95: 0.6 },
+    'squat_static/leg_vertical': { n: 50, p5: 1.0, p50: 1.2, p95: 1.4 },
+    'sit/uprightness': { n: 30, p5: 0.6, p50: 0.7, p95: 0.8 },
+    'lying/uprightness': { n: 30, p5: 0.15, p50: 0.2, p95: 0.3 },
+    'stand/leg_vertical': { n: 50, p5: 0.95, p50: 1.0, p95: 1.1 },
+    'sit/leg_vertical': { n: 30, p5: 0.4, p50: 0.6, p95: 0.8 },
+    'lying/leg_vertical': { n: 30, p5: 0.7, p50: 0.8, p95: 0.9 },
+    'squat_baseline/knee': { n: 40, p5: 95, p50: 105, p95: 115 },
+    'pushup_baseline/elbow': { n: 20, p5: 70, p50: 120, p95: 160 },
+    'pushup_baseline/uprightness': { n: 20, p5: 0.1, p50: 0.2, p95: 0.3 },
+    'clap_baseline/hands_close': { n: 20, p5: 0.3, p50: 0.45, p95: 0.6 },
+    'armRaised/elev_torso_L': { n: 30, p5: 20, p50: 30, p95: 40 },
+    // 单臂动作：另一侧是「放下/未伸出」的高位/低位，拟合必须排除它
+    'armRaised/elev_torso_R': { n: 30, p5: 150, p50: 160, p95: 170 },
+    'reaching/reach_L': { n: 30, p5: 1.4, p50: 1.6, p95: 1.9 },
+    'reaching/reach_R': { n: 30, p5: 0.8, p50: 0.9, p95: 1.0 },
+  };
+  const fp = fitToParams(fit, { margin: 0.1 });
+  const P = fp.params;
+  check('姿态下限型：stand.kneeGt = P5 − 10%', P.actions?.posture?.stand?.kneeGt === 144,
+    `got=${P.actions?.posture?.stand?.kneeGt}`);
+  check('姿态上限型：squat.kneeLt = P95 + 10%', P.actions?.posture?.squat?.kneeLt === 121,
+    `got=${P.actions?.posture?.squat?.kneeLt}`);
+  check('sit 区间同时拟合', P.actions?.posture?.sit?.kneeGt === 63
+    && P.actions?.posture?.sit?.kneeLt === 143);
+  check('uprightness 按比例留余量', P.actions?.posture?.stand?.uprightnessGt === 0.81
+    && P.actions?.posture?.lying?.uprightnessLt === 0.33);
+  check('站姿/计数门控同源', P.actions?.posture?.stand?.legVerticalGt === 0.855
+    && P.actions?.gates?.squat?.legVerticalGt === 0.855
+    && P.actions?.gates?.squat?.uprightnessGt === 0.81);
+  check('下蹲姿态的腿竖直比也能拟合（P5 − 10%）',
+    P.actions?.posture?.squat?.legVerticalGt === 0.9,
+    `got=${P.actions?.posture?.squat?.legVerticalGt}`);
+  check('squat 计数阈值成对且 down < up',
+    P.actions?.reps?.squat?.down === 127 && P.actions?.reps?.squat?.up === 144,
+    JSON.stringify(P.actions?.reps?.squat));
+  check('pushup up 夹在 175（角度极限 180）', P.actions?.reps?.pushup?.up === 175
+    && P.actions?.reps?.pushup?.down === 63);
+  check('clap 比例阈值成对', P.actions?.reps?.clap?.down === 0.27
+    && P.actions?.reps?.clap?.up === 0.66);
+  check('elevTorso.raised 取两侧较低 P95（上限型，排除下垂臂）',
+    P.signals?.arm?.elevTorso?.raised === 44, `got=${P.signals?.arm?.elevTorso?.raised}`);
+  check('extend.minReach 取两侧较高 P5（下限型，排除未伸出的臂）',
+    P.signals?.arm?.extend?.minReach === 1.26, `got=${P.signals?.arm?.extend?.minReach}`);
+  check('pushup 门控用 P95', P.actions?.gates?.pushup?.uprightnessLt === 0.33);
+  check('分位来源可追溯', fp.sources.length > 0 && fp.sources.every((s) => s.n >= FIT_MIN_SAMPLES));
+
+  const tight = fitToParams({ 'stand/knee': { n: 20, p5: 160, p95: 175 } }, { margin: 0.05 });
+  check('margin 可调（5%）', tight.params.actions?.posture?.stand?.kneeGt === 152);
+
+  const thin = fitToParams({ 'stand/knee': { n: FIT_MIN_SAMPLES - 1, p5: 160, p95: 175 } });
+  check('样本不足不采用', !thin.params.actions && thin.warnings.length === 0,
+    `params=${JSON.stringify(thin.params)}`);
+
+  const bad = fitToParams({
+    'squat_baseline/knee': { n: 20, p5: 160, p95: 170 },
+    'stand/knee': { n: 20, p5: 100, p95: 120 },
+  });
+  check('down >= up 时整对跳过并告警',
+    !bad.params.actions?.reps?.squat && bad.warnings.some((w) => /squat/.test(w)),
+    bad.warnings.join('；'));
+
+  const merged = mergeParams(
+    { signals: { arm: { extend: { minReach: 1.2 } } } },
+    { signals: { arm: { onHips: { maxDist: 0.6 } } } },
+  );
+  check('mergeParams 深合并、后者覆盖前者',
+    merged.signals.arm.extend.minReach === 1.2 && merged.signals.arm.onHips.maxDist === 0.6);
+
+  // 重采样：10 帧 @10fps → 5fps 保留 5 帧；高帧率不丢；video_time 时间基
+  const recs = Array.from({ length: 10 }, (_, i) => frame(i * 100, STAND));
+  recs.meta = { model: 'lite' };
+  const rs = resampleFrames(recs, 5);
+  check('10fps → 5fps 保留 5 帧', rs.length === 5 && rs[0] === recs[0] && rs[4] === recs[8],
+    `n=${rs.length}`);
+  check('重采样保留 meta', rs.meta?.model === 'lite');
+  check('目标帧率高于源帧率时不丢帧', resampleFrames(recs, 60).length === 10);
+  const vrecs = recs.map((r, i) => ({ ...r, video_time: i * 0.1 }));
+  check('video_time 时间基同样抽帧', resampleFrames(vrecs, 5).length === 5);
+  const center = resampleFrames([{ ts: 0 }, { ts: 50 }, { ts: 200 }], 5);
+  check('首帧无条件保留、间隔不足的帧丢弃', center.length === 2 && center[1].ts === 200);
+  // 目标帧率 = 源帧率时必须是 no-op；video_time 三位小数取整后间隔可能是 66ms
+  const rounded = [0, 0.067, 0.133, 0.2].map((v, i) => ({ ts: i * 67, video_time: v }));
+  check('同帧率重采样不丢帧（时间戳取整）', resampleFrames(rounded, 15).length === 4,
+    `n=${resampleFrames(rounded, 15).length}`);
+
+  // LOSO 门槛（不依赖 CLI）
+  const gLoso = evaluateGates([], {
+    loso: { folds: [{ subject: 'X', deltas: [{ action: 'stand', recallDelta: -0.5, precisionDelta: -0.2 }] }] },
+    maxLosoDrop: 0.1,
+  });
+  check('LOSO 退化超限 → 门槛违规', !gLoso.passed
+    && gLoso.violations.filter((v) => v.kind === 'loso').length === 2,
+    JSON.stringify(gLoso.violations));
+
+  // CLI：两个 subject，A 的「深蹲」被标成 stand（构造退化），B 是正常站姿
+  const { execFileSync } = await import('node:child_process');
+  const cli = path.join(process.cwd(), 'web/test/evaluate.mjs');
+  const runCli = (...argv) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [cli, ...argv], { encoding: 'utf8' }), err: '' };
+    } catch (e) {
+      return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
+    }
+  };
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'evalr4-'));
+  try {
+    const writeClip = async (name, kp, subject) => {
+      const frames = Array.from({ length: 20 }, (_, i) => frame(i * 100, kp));
+      await writeFile(path.join(dir, `${name}.frames.json`), JSON.stringify({ frames }), 'utf8');
+      await writeFile(path.join(dir, `${name}.labels.json`), JSON.stringify({
+        name, subject, camera: 'front',
+        segments: [{ action: 'stand', start: 0, end: 1900 }],
+      }), 'utf8');
+    };
+    await writeClip('a', squatKp(1), 'A');
+    await writeClip('b', STAND, 'B');
+    // subject 不是字符串：既不能当受试（不会出现在 subjects 里），也不能进训练集
+    await writeClip('c', STAND, 1);
+
+    const losoRes = runCli('--dir', dir, '--loso', '--json');
+    const lrep = JSON.parse(losoRes.out);
+    check('LOSO 按 subject 生成 fold', lrep.loso?.folds?.length === 2,
+      JSON.stringify(lrep.loso?.subjects));
+    check('非字符串 subject 不参与 LOSO',
+      !lrep.loso?.subjects?.includes(1) && (lrep.loso?.warnings || []).some((w) => /没有 subject/.test(w)),
+      JSON.stringify(lrep.loso?.warnings));
+    check('每个 fold 都有训练/留出/Δ', (lrep.loso?.folds || []).every((f) => Array.isArray(f.train)
+      && Array.isArray(f.heldout) && Array.isArray(f.deltas)));
+    const foldA = lrep.loso?.folds?.find((f) => f.subject === 'A');
+    const standDelta = foldA?.deltas?.find((d) => d.action === 'stand');
+    check('留出 A 相对训练集退化 → Δ = −1', standDelta?.recallDelta === -1,
+      JSON.stringify(standDelta));
+
+    const gateRes = runCli('--dir', dir, '--loso', '--max-loso-drop', '0', '--json');
+    const grep = JSON.parse(gateRes.out);
+    check('--max-loso-drop 进入门槛并触发违规',
+      grep.gates?.thresholds?.maxLosoDrop === 0
+      && (grep.gates?.violations || []).some((v) => v.kind === 'loso'),
+      JSON.stringify(grep.gates?.violations));
+
+    // 拟合结果写到 --dir 之外：目录扫描会把任何 .json 当帧文件（docs/eval.md 的提醒）
+    const fitOut = path.join(os.tmpdir(), `evalr4-fit-${Date.now()}.json`);
+    try {
+      const fitRes = runCli('--dir', dir, '--fit', '--fit-out', fitOut, '--json');
+      const frep = JSON.parse(fitRes.out);
+      check('--fit 报告带自动转换结果',
+        Number.isFinite(frep.fitProfile?.params?.actions?.posture?.stand?.kneeGt),
+        JSON.stringify(frep.fitProfile?.params));
+      const fitRaw = JSON.parse(await readFile(fitOut, 'utf8'));
+      check('--fit-out 写出可被 profileParams 读取的 profile',
+        typeof profileParams(fitRaw).actions?.posture?.stand?.kneeGt === 'number',
+        JSON.stringify(fitRaw));
+      check('拟合 profile 带 model 与复核提示',
+        typeof fitRaw.name === 'string' && /复核/.test(fitRaw.note || ''));
+    } finally {
+      await rm(fitOut, { force: true }).catch(() => {});
+    }
+
+    const rres = runCli('--dir', dir, '--resample', '5', '--json');
+    const rrep = JSON.parse(rres.out);
+    check('--resample 减少帧数并给出 Δ',
+      rrep.resample?.framesAfter < rrep.resample?.framesBefore
+      && Array.isArray(rrep.resample?.deltas),
+      JSON.stringify(rrep.resample && {
+        before: rrep.resample.framesBefore, after: rrep.resample.framesAfter, n: rrep.resample.deltas.length,
+      }));
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 重采样 + 帧序号标注：必须明确拒绝
+  const dir2 = await mkdtemp(path.join(os.tmpdir(), 'evalr4sf-'));
+  try {
+    const frames = Array.from({ length: 20 }, (_, i) => frame(i * 100, STAND));
+    await writeFile(path.join(dir2, 'c.frames.json'), JSON.stringify({ frames }), 'utf8');
+    await writeFile(path.join(dir2, 'c.labels.json'), JSON.stringify({
+      name: 'c', subject: 'C', segments: [{ action: 'stand', startFrame: 0, endFrame: 19 }],
+    }), 'utf8');
+    const res = runCli('--dir', dir2, '--resample', '5');
+    check('--resample 遇到 startFrame 标注报错', res.code === 1 && /startFrame/.test(res.err),
+      `code=${res.code} err=${res.err.slice(0, 120)}`);
+  } finally {
+    await rm(dir2, { recursive: true, force: true }).catch(() => {});
   }
 }
 

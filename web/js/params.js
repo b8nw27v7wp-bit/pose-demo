@@ -79,7 +79,9 @@ export const DEFAULT_PARAMS = {
   actions: {
     posture: {
       lying: { minMs: 450, streak: 4, uprightnessLt: 0.45, legVerticalLt: 0.8 },
-      squat: { minMs: 350, streak: 4, kneeLt: 110, uprightnessGt: 0.45 },
+      // legVerticalGt 与计数门控（actions.gates.squat.legVerticalGt）同一个口径：
+      // 少了它，坐姿（膝角同样 <110°、躯干同样直）会因为优先级更高被判成「下蹲」。
+      squat: { minMs: 350, streak: 4, kneeLt: 110, uprightnessGt: 0.45, legVerticalGt: 0.85 },
       sit: { minMs: 450, streak: 5, kneeGt: 55, kneeLt: 135, uprightnessGt: 0.5, legVerticalLt: 1.05 },
       stand: { minMs: 350, streak: 4, uprightnessGt: 0.8, kneeGt: 150, legVerticalGt: 0.8 },
     },
@@ -117,6 +119,15 @@ function deepMerge(base, over) {
 /** 把 profile 覆盖项合到默认参数上。未给出的键保持默认，便于 profile 只写差分。 */
 export function resolveParams(overrides = {}) {
   return deepMerge(DEFAULT_PARAMS, overrides);
+}
+
+/**
+ * 合并两份覆盖项（后者覆盖前者），不注入默认值。
+ * 用于「profile + 自动拟合结果」这类叠加场景：拟合只写它算出来的键，
+ * 其余仍由 profile/默认值决定（R4 的 `--fit-out` 与 LOSO 都走这里）。
+ */
+export function mergeParams(base = {}, over = {}) {
+  return deepMerge(base, over);
 }
 
 /**

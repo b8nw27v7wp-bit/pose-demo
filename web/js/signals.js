@@ -561,6 +561,16 @@ export class SignalEngine {
       hip_R: angleDeg(P('shoulder_R'), P('hip_R'), P('knee_R')),
     };
     const visTri = (names) => names.every((n) => (V(n) ?? 0) >= VIS_MIN);
+    // 2D 角同样要过可见性门控：看不见的点算出来的角度是垃圾（滤波又会把上一次的值留住），
+    // 之前只有 3D 分支检查，结果「腿被桌子挡住」也能凑出一个膝角，姿态层据此判下蹲。
+    const visAngle2d = {
+      knee_L: visTri(['hip_L', 'knee_L', 'ankle_L']),
+      knee_R: visTri(['hip_R', 'knee_R', 'ankle_R']),
+      elbow_L: visTri(['shoulder_L', 'elbow_L', 'wrist_L']),
+      elbow_R: visTri(['shoulder_R', 'elbow_R', 'wrist_R']),
+      hip_L: visTri(['shoulder_L', 'hip_L', 'knee_L']),
+      hip_R: visTri(['shoulder_R', 'hip_R', 'knee_R']),
+    };
     const angleW = (a, b, c) => {
       const pa = Wp(a), pb = Wp(b), pc = Wp(c);
       return (finite3(pa) && finite3(pb) && finite3(pc)) ? angleDeg3(pa, pb, pc) : NaN;
@@ -594,9 +604,10 @@ export class SignalEngine {
     const angles3d = {};
     const angleSource = {};
     for (const k of ANGLE_KEYS) {
-      // 2D 保持旧行为：低可见时滤波器保持上一次值
-      const a2 = this._smoothAngle(`2d:${k}`, raw2d[k], tSec);
-      angles2d[k] = a2;
+      // 2D：三点都够可见才算；否则给 NaN（滤波器喂 NaN 不会污染历史）
+      const ok2d = visAngle2d[k];
+      const a2 = this._smoothAngle(`2d:${k}`, ok2d ? raw2d[k] : NaN, tSec);
+      angles2d[k] = ok2d ? a2 : NaN;
       // 3D 不保持旧值：本帧没有有效 world 点就不给数，避免拿陈旧 3D 冒充当前
       const a3 = (w3 && Number.isFinite(raw3d[k]))
         ? this._smoothAngle(`3d:${k}`, raw3d[k], tSec) : NaN;
@@ -745,6 +756,13 @@ export class SignalEngine {
 
     // 3D 抬臂角判定举手：比 2D 稳，但只在 world 可用时生效
     const raisedTorso = (v) => Number.isFinite(v) && v < C.arm.elevTorso.raised;
+    const raised3dL = raisedTorso(elevTorsoL);
+    const raised3dR = raisedTorso(elevTorsoR);
+    // 逐侧、逐信号回退（docs/signals.md §一·五 规则 2）：
+    // 3D 本帧有效就听 3D（俯拍时 2D 会把「前伸」当「举起」）；
+    // 只有本帧 3D 无效（NaN：没有 world / 该侧世界点缺失 / 骨骼判不可靠）才退回 2D。
+    const raisedSelL = Number.isFinite(elevTorsoL) ? raised3dL : raisedL;
+    const raisedSelR = Number.isFinite(elevTorsoR) ? raised3dR : raisedR;
 
     // —— 伸手 / 指向 / 持物（拿取动作的基础信号）
     // 伸出 = 腕离肩足够远且不是自然下垂。用 reach（已按 scale 归一）而不是像素。
@@ -890,10 +908,15 @@ export class SignalEngine {
         raised_R: raisedR,
         both_raised: raisedL && raisedR,
         any_raised: raisedL || raisedR,
-        // 3D 版举手（只有 world 可用时有效，NaN 时下游自然不成立）
-        raised3d_L: raisedTorso(elevTorsoL),
-        raised3d_R: raisedTorso(elevTorsoR),
-        any_raised3d: raisedTorso(elevTorsoL) || raisedTorso(elevTorsoR),
+        // 3D 版举手（只有 world 可用时有效，NaN 时 false）
+        raised3d_L: raised3dL,
+        raised3d_R: raised3dR,
+        any_raised3d: raised3dL || raised3dR,
+        // 判定用：逐侧「3D 有效用 3D，否则退回 2D」。
+        // 动作层用这两个字段，不再只看 has_world（world 在、但某侧世界点坏掉时会漏判举手）。
+        raised_sel_L: raisedSelL,
+        raised_sel_R: raisedSelR,
+        any_raised_sel: raisedSelL || raisedSelR,
         head_near_L: headNearL,
         head_near_R: headNearR,
       },
@@ -932,7 +955,13 @@ export class SignalEngine {
         arm_side_R: armSideR,
         ratio_source: useRatios ? '3d-if-available' : '2d',
       },
-      wave: { L: waveL.flips, R: waveR.flips, amp: Math.max(waveL.amp, waveR.amp) },
+      // 挥手：左右各自一份翻转次数与幅度。判定必须把「翻转」和「幅度」绑到同一条举起的臂，
+      // 只取 max(amp) 会让「左手举着不动、右手在髋旁摆动」凑成挥手。
+      wave: {
+        L: waveL.flips, R: waveR.flips,
+        amp: Math.max(waveL.amp, waveR.amp),
+        amp_L: waveL.amp, amp_R: waveR.amp,
+      },
     };
   }
 

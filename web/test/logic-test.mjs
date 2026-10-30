@@ -156,6 +156,23 @@ console.log('\n[6] 姿态判定');
   for (let i = 0; i <= 10; i++) act2 = ae2.update(se2.update(person(lieKp), 1000 + i * 100), 1000 + i * 100);
   check('卧姿 → 躺卧', act2.postureId === 'lying', `posture=${act2.posture}`);
 
+  // 坐姿与深蹲的膝角/直立度量级相同，只能靠腿竖直比分：
+  // 少了这道门，「坐」会被更高优先级的「下蹲」吃掉（实测膝 90°、腿竖直比 0.6）。
+  const poseSig = (o = {}) => ({
+    ok: true, knee_pick: 170, elbow_pick: 170, uprightness: 0.95, leg_vertical: 1.3,
+    arm: {}, armPose: {}, wave: { L: 0, R: 0, amp: 0 }, extrapolated: [], ...o,
+  });
+  const runPose = (sig, n = 12) => {
+    const ae = new ActionEngine();
+    let r = null;
+    for (let i = 1; i <= n; i++) r = ae.update(sig, 1000 + i * 100);
+    return r;
+  };
+  const sitAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.9, leg_vertical: 0.6 }));
+  check('坐姿（腿不竖直）→ 坐，而不是下蹲', sitAct.postureId === 'sit', `posture=${sitAct.postureId}`);
+  const squatAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.9, leg_vertical: 1.3 }));
+  check('深蹲（腿仍竖直）→ 下蹲', squatAct.postureId === 'squat_static', `posture=${squatAct.postureId}`);
+
   // 注册表一致性：ARM_ACTIONS.flag 是页面、评估器、难例导出共用的键名。
   // 写错一个字母不会报错，只会让这个动作在 UI/评估里永远为 false——手抄时代就这么漏过。
   // 这里直接对着 ActionEngine 的真实输出校验；冻结分支用的是另一份 flags 字面量，一并覆盖。
@@ -260,6 +277,44 @@ console.log('\n[9] 挥手');
   }
   check('幅度足够算挥手', r2.flags.waving === true, `waving=${r2.flags.waving}`);
   check('举手同时成立', r2.flags.armRaised === true);
+
+  // 左右手不能混用：左手举着不动、右手在髋旁大幅摆动，不算挥手
+  const crossWave = mkSig({
+    arm: { any_raised: true, raised_sel_L: true, raised_sel_R: false, raised_L: true, raised_R: false },
+    wave: { L: 0, R: 4, amp: 0.6, amp_L: 0, amp_R: 0.6 },
+  });
+  const ae3 = new ActionEngine();
+  let t3 = 0; let r3 = null;
+  for (let i = 0; i < 8; i++) r3 = ae3.update(crossWave, t3 += 100);
+  check('举起的是左手、摆动的是右手 → 不算挥手', r3.flags.waving === false, `waving=${r3.flags.waving}`);
+
+  // 同一条举起的臂在摆动 → 算挥手
+  const sameWave = mkSig({
+    arm: { any_raised: true, raised_sel_L: false, raised_sel_R: true, raised_L: false, raised_R: true },
+    wave: { L: 0, R: 4, amp: 0.6, amp_L: 0, amp_R: 0.6 },
+  });
+  const ae4 = new ActionEngine();
+  let t4 = 0; let r4 = null;
+  for (let i = 0; i < 8; i++) r4 = ae4.update(sameWave, t4 += 100);
+  check('同一条举起的臂在摆动 → 算挥手', r4.flags.waving === true, `waving=${r4.flags.waving}`);
+
+  // 端到端：信号层要给出逐侧幅度，动作层才能把翻转与幅度绑到同一条臂
+  const kpWave = (rx) => [
+    [150, 50, 1], [100, 100, 1], [200, 100, 1], [100, 140, 1], [200, 140, 1],
+    [100, 20, 1], [rx, 170, 1], [100, 200, 1], [200, 200, 1],
+    [100, 300, 1], [200, 300, 1], [100, 400, 1], [200, 400, 1],
+  ];
+  const seW = new SignalEngine();
+  const aeW = new ActionEngine();
+  const xsW = [200, 240, 200, 160, 200, 240, 200, 160, 200, 240, 200, 160, 200, 240, 200, 160];
+  let tW = 0; let rW = null;
+  for (const x of xsW) {
+    tW += 66;
+    rW = aeW.update(seW.update(person(kpWave(x)), tW), tW);
+  }
+  check('端到端：左手举起、右手摆动 → 不算挥手',
+    rW.flags.waving === false && rW.flags.armRaised === true,
+    `waving=${rW.flags.waving} raised=${rW.flags.armRaised}`);
 }
 
 // —— 10. 手臂信号：抱臂 / 叉腰 / 张开双臂 / 抬手角 ——
@@ -427,6 +482,18 @@ console.log('\n[13] 可见性门控');
   check('腕不可见 → elev=NaN', Number.isNaN(s2.armPose.elev_L), `elev=${s2.armPose.elev_L}`);
   check('腕不可见 → 不算抱臂', s2.armPose.crossed === false);
   check('腕不可见 → 不算鼓掌高度', s2.armPose.chest_height === false);
+
+  // 膝/踝不可见时，2D 膝角不能继续拿漂移坐标算（滤波又会把上一次的值留住）。
+  // 这正是「腿被桌子挡住却被判成下蹲」的来源。
+  const hiddenLegs = standKp.map((p) => [...p]);
+  hiddenLegs[9] = [100, 400, 0]; hiddenLegs[10] = [200, 400, 0];
+  hiddenLegs[11] = [40, 380, 0]; hiddenLegs[12] = [360, 380, 0];
+  const sHidden = new SignalEngine().update(person(hiddenLegs), 1000);
+  check('膝/踝不可见 → knee_pick=NaN', Number.isNaN(sHidden.knee_pick), `knee=${sHidden.knee_pick}`);
+  const aeHidden = new ActionEngine();
+  let rHidden = null;
+  for (let i = 0; i < 12; i++) rHidden = aeHidden.update(sHidden, 1000 + i * 100);
+  check('腿不可见 → 不误判下蹲', rHidden.postureId !== 'squat_static', `posture=${rHidden.postureId}`);
 }
 
 // —— 14. 抱臂判定要抗转身 ——
@@ -531,6 +598,18 @@ console.log('\n[17] 3D 信号');
   check('举起 3D 抬臂角 ≈0°', near(s.armPose.elev_torso_R, 0, 20), `R=${s.armPose.elev_torso_R.toFixed(0)}`);
   check('右臂举起 → raised3d_R', s.arm.raised3d_R === true);
   check('左臂下垂 → 不 raised3d_L', s.arm.raised3d_L === false);
+
+  // 逐侧、逐信号回退：world 存在，但举起那只手的腕部世界点无效 → 该侧退回 2D。
+  // 之前只看 has_world，这种帧会把举手整个丢掉。
+  const raisedKp = standKp.map((p) => [...p]);
+  raisedKp[5] = [80, 20, 1];                       // 左手腕举到肩上方（2D 判定为举起）
+  const sBroken = new SignalEngine().update(withWorld(raisedKp, mkW({ 15: [NaN, NaN, NaN] })), 1000);
+  check('3D 无效（NaN）→ 逐侧退回 2D 举手',
+    sBroken.arm.raised_sel_L === true && sBroken.arm.raised_L === true,
+    `sel=${sBroken.arm.raised_sel_L} 2d=${sBroken.arm.raised_L}`);
+  const sValid = new SignalEngine().update(withWorld(raisedKp, mkW()), 1000);
+  check('3D 有效且判定未举起 → 以 3D 为准（不退回 2D）',
+    sValid.arm.raised_sel_L === false, `sel=${sValid.arm.raised_sel_L} 3d=${sValid.arm.raised3d_L}`);
 
   // 没有 world 时不崩，has_world=false，下游退回 2D
   const se2 = new SignalEngine();
