@@ -120,6 +120,15 @@ export function resolveParams(overrides = {}) {
 }
 
 /**
+ * 合并两份覆盖项（后者覆盖前者），不注入默认值。
+ * 用于「profile + 自动拟合结果」这类叠加场景：拟合只写它算出来的键，
+ * 其余仍由 profile/默认值决定（R4 的 `--fit-out` 与 LOSO 都走这里）。
+ */
+export function mergeParams(base = {}, over = {}) {
+  return deepMerge(base, over);
+}
+
+/**
  * profile 文件的解包：文件形如 {name, note, params:{...}}，也接受裸的参数对象。
  * 页面（app.js）与评估器（evaluate.mjs）必须走同一个函数——
  * 曾经只有页面解包、CLI 没有，导致 `--profile` 静默用默认阈值却仍显示已应用。

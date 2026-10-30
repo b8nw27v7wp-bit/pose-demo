@@ -9,6 +9,9 @@
 //   node web/test/evaluate.mjs --dir eval-data            # 目录下 *.frames.json 配同名 *.labels.json
 //   node web/test/evaluate.mjs --dir eval-data --report out.md
 //   node web/test/evaluate.mjs --dir eval-data --fit      # 用标好的数据算阈值分位（B 阶段）
+//   node web/test/evaluate.mjs --dir eval-data --fit --fit-out web/profiles/fitness-fit.json
+//   node web/test/evaluate.mjs --dir eval-data --loso --max-loso-drop 0.1   # 留一人验证（需 subject）
+//   node web/test/evaluate.mjs --dir eval-data --resample 15                 # 帧率敏感性
 //   node web/test/evaluate.mjs --dir eval-data --profile web/profiles/fitness.json
 //   node web/test/evaluate.mjs --input a.jsonl --autolabel --out a.labels.json   # 生成标注草稿
 //
@@ -21,7 +24,7 @@ import { pathToFileURL } from 'node:url';
 import { SignalEngine } from '../js/signals.js';
 import { ActionEngine, ARM_FLAG_IDS, ARM_ID_TO_FLAG, POSTURE_IDS, REP_IDS } from '../js/actions.js';
 import { SHAPE_IDS } from '../js/handshape.js';
-import { resolveParams, profileParams, profileName, paramsHash } from '../js/params.js';
+import { resolveParams, mergeParams, profileParams, profileName, paramsHash } from '../js/params.js';
 import { videoTimeMonotonic } from './frame-io.mjs';
 
 // —— 参数 ---------------------------------------------------------------
@@ -32,6 +35,7 @@ function parseArgs(argv) {
     compare: null, baseline: null, sweep: null, sweepActions: null,
     minRecall: null, minPrecision: null, maxCountErr: null, maxDrop: 0.05,
     minGestureRecall: null, maxGestureAbstain: null,
+    loso: false, maxLosoDrop: null, margin: 0.1, fitOut: null, resample: null,
     fit: false, json: false, quiet: false, timeline: false, autolabel: false, every: 1,
   };
   const num = (v, name) => {
@@ -58,6 +62,11 @@ function parseArgs(argv) {
     else if (a === '--min-gesture-recall') out.minGestureRecall = num(next(), '--min-gesture-recall');
     else if (a === '--max-gesture-abstain') out.maxGestureAbstain = num(next(), '--max-gesture-abstain');
     else if (a === '--max-drop') out.maxDrop = num(next(), '--max-drop');
+    else if (a === '--loso') out.loso = true;
+    else if (a === '--max-loso-drop') out.maxLosoDrop = num(next(), '--max-loso-drop');
+    else if (a === '--margin') out.margin = num(next(), '--margin');
+    else if (a === '--fit-out') out.fitOut = next();
+    else if (a === '--resample') out.resample = num(next(), '--resample');
     else if (a === '--fit') out.fit = true;
     else if (a === '--json') out.json = true;
     else if (a === '--quiet') out.quiet = true;
@@ -70,10 +79,12 @@ function parseArgs(argv) {
   for (const [k, flag] of [
     ['minRecall', '--min-recall'], ['minPrecision', '--min-precision'],
     ['minGestureRecall', '--min-gesture-recall'], ['maxGestureAbstain', '--max-gesture-abstain'],
+    ['maxLosoDrop', '--max-loso-drop'], ['margin', '--margin'],
   ]) {
     if (out[k] !== null && (out[k] < 0 || out[k] > 1)) throw new Error(`${flag} 必须在 0~1 之间`);
   }
   if (out.maxCountErr !== null && out.maxCountErr < 0) throw new Error('--max-count-err 不能为负');
+  if (out.resample !== null && !(out.resample > 0)) throw new Error('--resample 必须是正数（fps）');
   return out;
 }
 
@@ -98,6 +109,11 @@ const USAGE = `用法:
   --min-gesture-recall R   每种手势的 recall 下限（0~1，帧级）
   --max-gesture-abstain P  手势弃权率上限（unknown / 侧对 / 未检出，0~1）
   --baseline <报告> 用 --json 导出的旧报告做基线，下降超过 --max-drop（默认 0.05）即失败
+  --loso            留一人验证：按 labels.subject 轮流留出一人，用其余人拟合阈值后测留出者
+  --max-loso-drop R 留出 recall/precision 相对训练集的最大退化（0~1），超出退出码 2
+  --margin R        拟合余量比例（默认 0.1），角度/比例按分位值乘此比例留余量
+  --fit-out <文件>  配合 --fit，把分位转换成 profile 覆盖项并写入文件
+  --resample <fps>  把素材按目标帧率重采样后再评估，报告帧率敏感性（15 fps 验收用）
 
 labels 文件格式见 docs/eval.md。反例写法：{\"action\":\"onHips\",\"expect\":false} 或 \"!onHips\"；
 \"none\" = 姿态和手臂都不许出现；\"noArm\" = 姿态不限，但不许有手臂动作。
@@ -1274,6 +1290,191 @@ function fitThresholds(labelsByClip, timelines, framesByClip) {
   return out;
 }
 
+// —— R4：分位 → profile 覆盖项 -------------------------------------------
+// 拟合出来的分位还要「翻译」成参数路径，否则只能人工抄（PLAN §13 R4）。
+// 这里只翻译有信号来源、方向明确的阈值；onHips/head/carry 的距离阈值与有符号方位角
+// 没有对应的导出信号列，保持人工，报告里会列出来。
+
+/** 少于这个样本量的分位不采用：10 帧以内定阈值等于对噪声过拟合。 */
+export const FIT_MIN_SAMPLES = 10;
+
+const isPlainObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function setParamPath(obj, dotted, value) {
+  const parts = dotted.split('.');
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (!isPlainObj(cur[parts[i]])) cur[parts[i]] = {};
+    cur = cur[parts[i]];
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+
+/** 分位表里取一个 bucket/signal；样本不足或分位缺失时返回 null。 */
+function fitBucket(fit, bucket, signal) {
+  const v = fit && fit[`${bucket}/${signal}`];
+  if (!v || !(v.n >= FIT_MIN_SAMPLES)) return null;
+  return Number.isFinite(v.p5) && Number.isFinite(v.p95) ? v : null;
+}
+
+/**
+ * 把 fitThresholds() 的分位表转换成 profile 覆盖项。
+ *
+ * 方向约定（与 signals.js/actions.js 的比较方向一致）：
+ * - 下限型（`> threshold` 才算成立）：取 P5 / P95 再往「更宽松」的方向留余量；
+ * - 上限型（`< threshold` 才算成立）：取 P95 再往上留余量。
+ * 余量 = 分位值 × margin（默认 10%，PLAN §13.4 的 10~15%）。
+ *
+ * @returns {{params: object, warnings: string[], sources: Array}}
+ */
+export function fitToParams(fit, { margin = 0.1 } = {}) {
+  const params = {};
+  const warnings = [];
+  const sources = [];
+  const m = (v) => Math.abs(v) * margin;
+  const angle = (v) => Math.max(0, Math.min(180, Math.round(v)));
+  // rep 的 up 是「高于它才算站起/伸直」；留到 180 会让计数永远等不到 up（角度极限是 180）
+  const angleUp = (v) => Math.max(0, Math.min(175, Math.round(v)));
+  const ratio = (v) => +Math.max(0, v).toFixed(3);
+  const lower = (v) => v.p5 - m(v.p5);          // 下限型：往下放
+  const upper = (v) => v.p95 + m(v.p95);        // 上限型：往上放
+
+  const take = (bucket, signal) => {
+    const v = fitBucket(fit, bucket, signal);
+    if (!v) return null;
+    sources.push({ key: `${bucket}/${signal}`, n: v.n, p5: v.p5, p95: v.p95 });
+    return v;
+  };
+  const set = (path, value) => {
+    if (!Number.isFinite(value)) return;
+    setParamPath(params, path, value);
+  };
+  const pair = (label, down, up) => {
+    if (!(down < up)) {
+      warnings.push(`${label}：拟合后 down(${down}) >= up(${up})，已跳过，请人工看分位表`);
+      return false;
+    }
+    return true;
+  };
+
+  // —— 姿态门限
+  const standKnee = take('stand', 'knee');
+  if (standKnee) set('actions.posture.stand.kneeGt', angle(lower(standKnee)));
+  const squatKnee = take('squat_static', 'knee');
+  if (squatKnee) set('actions.posture.squat.kneeLt', angle(upper(squatKnee)));
+  const sitKnee = take('sit', 'knee');
+  if (sitKnee) {
+    const gt = angle(lower(sitKnee));
+    const lt = angle(upper(sitKnee));
+    if (gt < lt) {
+      set('actions.posture.sit.kneeGt', gt);
+      set('actions.posture.sit.kneeLt', lt);
+    } else {
+      warnings.push(`sit：拟合后 kneeGt(${gt}) >= kneeLt(${lt})，已跳过`);
+    }
+  }
+  const standUp = take('stand', 'uprightness');
+  if (standUp) set('actions.posture.stand.uprightnessGt', ratio(lower(standUp)));
+  const squatUp = take('squat_static', 'uprightness');
+  if (squatUp) set('actions.posture.squat.uprightnessGt', ratio(lower(squatUp)));
+  const sitUp = take('sit', 'uprightness');
+  if (sitUp) set('actions.posture.sit.uprightnessGt', ratio(lower(sitUp)));
+  const lyingUp = take('lying', 'uprightness');
+  if (lyingUp) set('actions.posture.lying.uprightnessLt', ratio(upper(lyingUp)));
+  const standLv = take('stand', 'leg_vertical');
+  if (standLv) set('actions.posture.stand.legVerticalGt', ratio(lower(standLv)));
+  const sitLv = take('sit', 'leg_vertical');
+  if (sitLv) set('actions.posture.sit.legVerticalLt', ratio(upper(sitLv)));
+  const lyingLv = take('lying', 'leg_vertical');
+  if (lyingLv) set('actions.posture.lying.legVerticalLt', ratio(upper(lyingLv)));
+
+  // —— 计数：down 低、up 高；成对校验，避免拟合出永远触发不了的区间
+  const squatRep = take('squat_baseline', 'knee') || squatKnee;
+  if (squatRep && standKnee) {
+    const down = angle(upper(squatRep));
+    const up = angleUp(lower(standKnee));
+    if (pair('squat', down, up)) {
+      set('actions.reps.squat.down', down);
+      set('actions.reps.squat.up', up);
+    }
+  } else if (squatRep) {
+    // 只有「确实有深蹲分位、但缺 stand」才算缺一侧；从没标过 squat 的素材不该被告警
+    warnings.push('squat：有深蹲分位但缺少 stand/knee，无法定上阈，已跳过');
+  }
+  const pushElbow = take('pushup_baseline', 'elbow');
+  if (pushElbow) {
+    const down = angle(lower(pushElbow));
+    const up = angleUp(upper(pushElbow));
+    if (pair('pushup', down, up)) {
+      set('actions.reps.pushup.down', down);
+      set('actions.reps.pushup.up', up);
+    }
+  }
+  const clap = take('clap_baseline', 'hands_close');
+  if (clap) {
+    const down = ratio(lower(clap));
+    const up = ratio(upper(clap));
+    if (pair('clap', down, up)) {
+      set('actions.reps.clap.down', down);
+      set('actions.reps.clap.up', up);
+    }
+  }
+
+  // —— 计数门控（与姿态共用 stand/pushup 的分位）
+  if (standLv) set('actions.gates.squat.legVerticalGt', ratio(lower(standLv)));
+  if (standUp) set('actions.gates.squat.uprightnessGt', ratio(lower(standUp)));
+  const pushUp = take('pushup_baseline', 'uprightness');
+  if (pushUp) set('actions.gates.pushup.uprightnessLt', ratio(upper(pushUp)));
+
+  // —— 手臂：两侧信号要合起来看，不能各自拍脑袋
+  // raised 是上限型（elev < raised）：取两侧**较低**的 P95。
+  // 单臂举手时另一只手臂自然下垂（elev≈170），取 max 会把阈值抬到 180，
+  // 于是「手放下」也满足 elev < 阈值，armRaised 几乎恒真。
+  const elev = [take('armRaised', 'elev_torso_L'), take('armRaised', 'elev_torso_R')].filter(Boolean);
+  if (elev.length) set('signals.arm.elevTorso.raised', angle(Math.min(...elev.map(upper))));
+  // extend 是下限型（reach > minReach）：取两侧**较高**的 P5。
+  // 单臂伸手时另一只手臂的 reach 只有自然下垂的 0.8 左右，取 min 会让它也越过阈值。
+  const reach = [take('reaching', 'reach_L'), take('reaching', 'reach_R')].filter(Boolean);
+  if (reach.length) set('signals.arm.extend.minReach', ratio(Math.max(...reach.map(lower))));
+
+  return { params, warnings, sources };
+}
+
+// —— R4：帧率敏感性 -------------------------------------------------------
+
+/**
+ * 按目标帧率等间隔抽帧。
+ *
+ * 时间基的选择必须整份统一：有 `video_time` 且单调（单次播放）就用秒，
+ * 否则（摄像头、循环/拖回素材）用 `ts`。混用会让间隔判断失真。
+ * 保留首帧；不修改输入数组，返回的新数组带上 `meta`。
+ */
+export function resampleFrames(frames, fps) {
+  const list = frames || [];
+  const step = 1000 / fps;
+  if (!(step > 0)) return list;
+  const hasVideo = list.length > 0
+    && list.every((f) => Number.isFinite(f && f.video_time))
+    && videoTimeMonotonic(list);
+  const timeOf = (f) => (hasVideo ? f.video_time * 1000 : f && f.ts);
+  const out = [];
+  let last = -Infinity;
+  // 5% 的容差：video_time 常见三位小数、performance.now 也可能取整，
+  // 目标帧率等于源帧率时 66ms 与 66.667ms 的差不应被当成「这一帧该丢」。
+  const tol = step * 0.05;
+  for (const f of list) {
+    const t = timeOf(f);
+    if (!Number.isFinite(t)) continue;
+    // 首帧无条件保留
+    if (!out.length || t - last >= step - tol) {
+      out.push(f);
+      last = t;
+    }
+  }
+  out.meta = list.meta;
+  return out;
+}
+
 // —— 门槛 ---------------------------------------------------------------
 
 function baselineRows(raw) {
@@ -1292,6 +1493,7 @@ export function evaluateGates(summary, opts = {}) {
   const {
     minRecall = null, minPrecision = null, maxCountErr = null, maxDrop = 0.05, baseline = null,
     gestureRows = null, minGestureRecall = null, maxGestureAbstain = null,
+    loso = null, maxLosoDrop = null,
   } = opts;
   const violations = [];
   for (const row of summary || []) {
@@ -1347,14 +1549,31 @@ export function evaluateGates(summary, opts = {}) {
       }
     }
   }
+  // 留一人验证：留出者相对训练集的退化超过上限即失败（PLAN §13.4：≤10 个百分点）
+  if (Number.isFinite(maxLosoDrop) && loso) {
+    for (const fold of loso.folds || []) {
+      for (const d of fold.deltas || []) {
+        for (const metric of ['recall', 'precision']) {
+          const delta = d[`${metric}Delta`];
+          if (delta !== null && delta < -maxLosoDrop) {
+            violations.push({
+              action: `${d.action}（留出 ${fold.subject}）`, metric: `loso_${metric}`,
+              value: delta, threshold: -maxLosoDrop, kind: 'loso',
+            });
+          }
+        }
+      }
+    }
+  }
   const configured = Number.isFinite(minRecall) || Number.isFinite(minPrecision)
-    || Number.isFinite(maxCountErr) || !!baseline || gestureGate;
+    || Number.isFinite(maxCountErr) || !!baseline || gestureGate
+    || Number.isFinite(maxLosoDrop);
   return {
     configured,
     passed: violations.length === 0,
     thresholds: {
       minRecall, minPrecision, maxCountErr, maxDrop, baseline: !!baseline,
-      minGestureRecall, maxGestureAbstain,
+      minGestureRecall, maxGestureAbstain, maxLosoDrop,
     },
     violations,
   };
@@ -1580,6 +1799,7 @@ function renderGates(gates, lines) {
   if (Number.isFinite(t.maxCountErr)) rules.push(`计数误差（每 20 次） ≤ ${t.maxCountErr}`);
   if (Number.isFinite(t.minGestureRecall)) rules.push(`手势 recall ≥ ${t.minGestureRecall}`);
   if (Number.isFinite(t.maxGestureAbstain)) rules.push(`手势弃权率 ≤ ${t.maxGestureAbstain}`);
+  if (Number.isFinite(t.maxLosoDrop)) rules.push(`留一人退化 ≤ ${t.maxLosoDrop}`);
   if (t.baseline) rules.push(`相对 baseline 下降 ≤ ${t.maxDrop}`);
   lines.push('## 门槛', '', `- ${rules.join('；')}`);
   lines.push(gates.passed ? '- ✅ 全部达标' : `- ❌ ${gates.violations.length} 项未达标`, '');
@@ -1589,11 +1809,85 @@ function renderGates(gates, lines) {
     for (const v of gates.violations) {
       const src = v.kind === 'baseline' ? `baseline ${v.baseline}`
         : v.kind === 'missing' ? '缺少数据'
-          : v.kind === 'min' ? '绝对门槛' : '上限';
+          : v.kind === 'loso' ? '留一人'
+            : v.kind === 'min' ? '绝对门槛' : '上限';
       lines.push(`| ${v.action} | ${v.metric} | ${v.value ?? '—'} | ${v.threshold ?? '—'} | ${src} |`);
     }
     lines.push('');
   }
+}
+
+/** 留一人验证：退化 = 留出 − 训练，负数才是退化。 */
+function renderLoso(loso, lines) {
+  if (!loso) return;
+  lines.push('## 留一人验证（LOSO）', '');
+  if (!loso.folds.length) {
+    lines.push('没有可用的 fold（需要至少 2 个带 `subject` 的受试）。', '');
+    return;
+  }
+  lines.push('阈值只在训练集上拟合，留出者完全不参与；Δ = 留出 − 训练，负数是退化。', '');
+  for (const f of loso.folds) {
+    lines.push(`### 留出 ${f.subject}（训练 ${f.trainClips} 段 / 留出 ${f.heldoutClips} 段 · ${f.paramsHash}）`, '');
+    const rows = f.deltas.filter((d) => d.recallA !== null || d.recallB !== null
+      || d.precisionA !== null || d.precisionB !== null);
+    if (!rows.length) {
+      lines.push('没有可比较的动作。', '');
+      continue;
+    }
+    lines.push('| 动作 | 训练 recall | 留出 recall | Δ | 训练 precision | 留出 precision | Δ |');
+    lines.push('|---|---|---|---|---|---|---|');
+    for (const d of rows) {
+      lines.push(`| ${d.action} | ${d.recallA ?? '—'} | ${d.recallB ?? '—'} | ${fmtDelta(d.recallDelta)}`
+        + ` | ${d.precisionA ?? '—'} | ${d.precisionB ?? '—'} | ${fmtDelta(d.precisionDelta)} |`);
+    }
+    lines.push('');
+  }
+  if (loso.warnings?.length) lines.push(`> ⚠ ${loso.warnings.join('；')}`, '');
+}
+
+/** --resample：重采样后的指标变化（只列有变化的动作）。 */
+function renderResample(rs, lines) {
+  if (!rs) return;
+  lines.push(`## 帧率敏感性（重采样到 ${rs.fps} fps）`, '');
+  lines.push(`- 帧数：${rs.framesBefore} → ${rs.framesAfter}`);
+  const changed = rs.deltas.filter((d) => d.changed);
+  if (!changed.length) {
+    lines.push('- ✅ 所有动作的 recall / precision / 计数误差都没有变化。', '');
+    return;
+  }
+  lines.push('', '| 动作 | recall Δ | precision Δ | 计数误差 Δ |', '|---|---|---|---|');
+  for (const d of changed) {
+    lines.push(`| ${d.action} | ${fmtDelta(d.recallDelta)} | ${fmtDelta(d.precisionDelta)} | ${fmtDelta(d.countErrDelta)} |`);
+  }
+  lines.push('', '> Δ = 重采样后 − 原始。15 fps 下 120 ms 只有 2 帧，`minHalfMs`/Hold 会先失效。', '');
+}
+
+/** 把嵌套的 profile 覆盖项摊平成 `a.b.c = value`，给报告与 CLI 回显。 */
+function flattenParams(obj, prefix = '') {
+  const out = [];
+  for (const [k, v] of Object.entries(obj || {})) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (isPlainObj(v)) out.push(...flattenParams(v, key));
+    else out.push([key, v]);
+  }
+  return out;
+}
+
+/** --fit 的自动转换结果：明确标「需人工复核」，避免把分位当阈值直接用。 */
+function renderFitProfile(fitProfile, lines) {
+  if (!fitProfile) return;
+  lines.push('## 建议 profile 覆盖（自动拟合，需人工复核）', '');
+  const rows = flattenParams(fitProfile.params);
+  if (!rows.length) {
+    lines.push('没有可自动转换的阈值（分位样本不足或缺少对应标注段）。', '');
+    return;
+  }
+  lines.push('| 参数 | 拟合值 |', '|---|---|');
+  for (const [k, v] of rows) lines.push(`| \`${k}\` | ${v} |`);
+  lines.push('',
+    '> 只翻译了有信号来源、方向明确的阈值；`onHips` / `head` / `carry` 的距离阈值、',
+    '> 有符号方位角与 2D/3D 分支开关仍需人工看分位表决定。写入 profile 前请复核。', '');
+  if (fitProfile.warnings?.length) lines.push(`> ⚠ ${fitProfile.warnings.join('；')}`, '');
 }
 
 function renderConfusion(conf, lines) {
@@ -1740,6 +2034,8 @@ export function toMarkdown(report) {
     '> 区间是 Wilson 95%，段之间并不独立，所以是近似——但 n=3 时它不会让你以为 100% 是真的。', '');
 
   renderGates(report.gates, lines);
+  renderLoso(report.loso, lines);
+  renderResample(report.resample, lines);
   renderGestures(report.gestures, lines);
   renderConfusion(report.confusion, lines);
   renderGroups(report.groups, lines);
@@ -1770,6 +2066,7 @@ export function toMarkdown(report) {
   }
 
   renderSweep(report.sweep, lines);
+  renderFitProfile(report.fitProfile, lines);
 
   if (report.fit) {
     lines.push('## 信号分位 · 按标注动作段分组（用于替换手写阈值）', '');
@@ -2023,11 +2320,98 @@ function runSweep(loaded, profile, args, baseSummary = null) {
   return { key, baseValue, baseSummary: baseRows, variants: results };
 }
 
+/**
+ * R4：留一人验证（LOSO）。
+ *
+ * 每个 fold 把一个人的素材整个留出，用其余人拟合阈值，再在留出者上重放。
+ * 报「留出 − 训练」的退化，而不是留出者的绝对准确率——后者混了「阈值拟合到了训练者身上」
+ * 和「这个人本身难」两件事（PLAN §13.4：留一人退化 ≤10 个百分点）。
+ *
+ * @returns {{subjects: string[], folds: Array, warnings: string[], maxDrop: number|null}}
+ */
+function runLoso(loaded, profile, args) {
+  const base = runEvaluation(loaded, profile.params, { confusion: false });
+  const subjects = [...new Set(base.clips.map((c) => c.subject).filter((s) => typeof s === 'string' && s))].sort();
+  if (!subjects.length) throw new Error('--loso 需要 labels.subject（至少 2 个受试）');
+  if (subjects.length < 2) throw new Error(`--loso 至少需要 2 个 subject，当前只有 ${subjects.join('、')}`);
+
+  const warnings = [];
+  const named = (c) => typeof c.subject === 'string' && c.subject;
+  const unlabeled = base.clips.filter((c) => !named(c)).length;
+  if (unlabeled) warnings.push(`${unlabeled} 段素材没有 subject（需非空字符串），不参与 LOSO`);
+
+  const folds = [];
+  for (const subject of subjects) {
+    const trainIdx = [];
+    const heldoutIdx = [];
+    for (let i = 0; i < base.clips.length; i++) {
+      const s = base.clips[i].subject;
+      if (s === subject) heldoutIdx.push(i);
+      // 非字符串 subject 不会出现在 subjects 里，也就永远不会被留出；不能拿它训练
+      else if (named(base.clips[i])) trainIdx.push(i);
+    }
+    if (!heldoutIdx.length) continue;
+    if (!trainIdx.length) {
+      warnings.push(`留出 ${subject}：训练集为空，跳过`);
+      continue;
+    }
+    const fit = fitThresholds(
+      trainIdx.map((i) => base.clipLabels[i]),
+      trainIdx.map((i) => base.timelines[i]),
+      trainIdx.map((i) => base.clipFrames[i]),
+    );
+    const converted = fitToParams(fit, { margin: args.margin });
+    if (!Object.keys(converted.params).length) {
+      warnings.push(`留出 ${subject}：训练集没有可自动拟合的阈值`);
+    }
+    const params = mergeParams(profile.params, converted.params);
+    // 重放全部素材：训练段与留出段必须在同一套拟合参数下比较，只重放留出者会让噪声不可比
+    const run = runEvaluation(loaded, params, { confusion: false });
+    const train = summarize(trainIdx.map((i) => run.clips[i]));
+    const heldout = summarize(heldoutIdx.map((i) => run.clips[i]));
+    folds.push({
+      subject,
+      trainClips: trainIdx.length,
+      heldoutClips: heldoutIdx.length,
+      fitted: converted.params,
+      fitWarnings: converted.warnings,
+      paramsHash: paramsHash(params),
+      train,
+      heldout,
+      deltas: compareSummaries(train, heldout),
+    });
+  }
+  for (const w of warnings) if (!args.quiet) console.error(`⚠ ${w}`);
+  return { subjects, folds, warnings, maxDrop: args.maxLosoDrop };
+}
+
 async function runSingle(args, loaded, profile) {
-  const run = runEvaluation(loaded, profile.params);
+  // —— R4：帧率敏感性。重采样会改变帧序号，startFrame/endFrame 标注必须先换掉。
+  let evalLoaded = loaded;
+  let resampleBase = null;
+  if (args.resample) {
+    for (const item of loaded) {
+      for (const seg of item.labels?.segments || []) {
+        if (Number.isFinite(seg.startFrame) || Number.isFinite(seg.endFrame)) {
+          throw new Error('--resample 会改变帧序号，请把 startFrame/endFrame 改成 start/end 或 startSec 后再重采样');
+        }
+      }
+    }
+    const framesBefore = loaded.reduce((n, i) => n + i.frames.length, 0);
+    evalLoaded = loaded.map((i) => ({ ...i, frames: resampleFrames(i.frames, args.resample) }));
+    const framesAfter = evalLoaded.reduce((n, i) => n + i.frames.length, 0);
+    const baseRun = runEvaluation(loaded, profile.params, { confusion: false });
+    resampleBase = {
+      fps: args.resample, framesBefore, framesAfter,
+      baseSummary: summarize(baseRun.clips),
+    };
+  }
+
+  const run = runEvaluation(evalLoaded, profile.params);
   const gatesWanted = args.minRecall !== null || args.minPrecision !== null
     || args.maxCountErr !== null || !!args.baseline
-    || args.minGestureRecall !== null || args.maxGestureAbstain !== null;
+    || args.minGestureRecall !== null || args.maxGestureAbstain !== null
+    || args.maxLosoDrop !== null;
   // 空素材 + 门槛 = 假通过。宁可报错，也不要让 CI 在"什么都没测"时给绿灯。
   if (gatesWanted && !run.clips.length) throw new Error('门槛需要带 labels 的素材');
   if (args.sweep && !run.clips.length) throw new Error('--sweep 需要带 labels 的素材');
@@ -2038,6 +2422,35 @@ async function runSingle(args, loaded, profile) {
   if (args.baseline) baseline = JSON.parse(await readFile(args.baseline, 'utf8'));
 
   const summary = summarize(run.clips);
+  const loso = args.loso ? runLoso(evalLoaded, profile, args) : null;
+  const resample = resampleBase
+    ? {
+      fps: resampleBase.fps,
+      framesBefore: resampleBase.framesBefore,
+      framesAfter: resampleBase.framesAfter,
+      deltas: compareSummaries(resampleBase.baseSummary, summary),
+    }
+    : null;
+
+  const fit = args.fit ? fitThresholds(run.clipLabels, run.timelines, run.clipFrames) : null;
+  const converted = fit ? fitToParams(fit, { margin: args.margin }) : null;
+  const fitProfile = converted ? {
+    name: 'fitness-fit',
+    model: models.length === 1 ? models[0].split('/')[0] : null,
+    note: `自动拟合（margin=${args.margin}）；只翻译有信号来源的阈值，写入前请对分位表复核（PLAN §13 R4）`,
+    params: converted.params,
+    warnings: converted.warnings,
+    sources: converted.sources,
+  } : null;
+  if (args.fitOut) {
+    if (!fitProfile) throw new Error('--fit-out 需要配合 --fit');
+    const written = {
+      name: fitProfile.name, model: fitProfile.model, note: fitProfile.note, params: fitProfile.params,
+    };
+    await writeFile(args.fitOut, JSON.stringify(written, null, 2), 'utf8');
+    if (!args.quiet) console.error(`已写入拟合 profile：${args.fitOut}`);
+  }
+
   const report = {
     mode: 'single',
     profile: profile.label,
@@ -2064,9 +2477,15 @@ async function runSingle(args, loaded, profile) {
       gestureRows: run.gestures,
       minGestureRecall: args.minGestureRecall,
       maxGestureAbstain: args.maxGestureAbstain,
+      loso,
+      maxLosoDrop: args.maxLosoDrop,
     }),
-    sweep: args.sweep ? runSweep(loaded, profile, args, summary) : null,
-    fit: args.fit ? fitThresholds(run.clipLabels, run.timelines, run.clipFrames) : null,
+    sweep: args.sweep ? runSweep(evalLoaded, profile, args, summary) : null,
+    loso,
+    resample,
+    fit,
+    fitProfile,
+    fitWarnings: converted ? converted.warnings : null,
   };
 
   if (args.json) {
@@ -2133,6 +2552,11 @@ async function main() {
   }
   if (args.out && !args.autolabel) throw new Error('--out 只用于 --autolabel');
   if (args.sweepActions && !args.sweep) throw new Error('--sweep-actions 需要配合 --sweep');
+  if (args.fitOut && !args.fit) throw new Error('--fit-out 需要配合 --fit');
+  if (args.maxLosoDrop !== null && !args.loso) throw new Error('--max-loso-drop 需要配合 --loso');
+  if (args.resample !== null && (args.timeline || args.autolabel)) {
+    throw new Error('--resample 只用于评估，不能与 --timeline / --autolabel 同用');
+  }
   if (args.compare) {
     const unsupported = [
       args.profile && '--profile',
@@ -2140,6 +2564,10 @@ async function main() {
       args.sweepActions && '--sweep-actions',
       args.baseline && '--baseline',
       args.fit && '--fit',
+      args.fitOut && '--fit-out',
+      args.loso && '--loso',
+      args.maxLosoDrop !== null && '--max-loso-drop',
+      args.resample !== null && '--resample',
       args.minRecall !== null && '--min-recall',
       args.minPrecision !== null && '--min-precision',
       args.maxCountErr !== null && '--max-count-err',

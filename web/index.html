@@ -126,7 +126,7 @@
   .badge.warn { background: rgba(178,59,46,.75); color: #fff; }
   .badge[hidden] { display: none; }
 
-  .placeholder { position: relative; z-index: 2; text-align: center; color: #9a9aa0; padding: 24px; }
+  .placeholder { position: relative; z-index: 2; text-align: center; color: #9a9aa0; padding: 24px; cursor: pointer; }
   .placeholder p { margin: 4px 0; }
   .placeholder .hint { font-size: 12px; color: #6e6e73; }
   .placeholder[hidden] { display: none; }
@@ -202,6 +202,51 @@
   .toolbar button.ghost:disabled { color: var(--mute); cursor: default; border-color: var(--line); }
   .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 7px; }
   .hint { font-size: 11px; color: var(--mute); margin-top: 5px; line-height: 1.45; }
+  .hint-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 5px; }
+  .hint-row .hint { margin-top: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button.link {
+    border: 0; background: none; color: var(--sub); font-size: 11px; padding: 0;
+    cursor: pointer; text-decoration: underline; text-underline-offset: 2px; white-space: nowrap;
+  }
+  button.link:hover:not(:disabled) { color: var(--text); }
+  button.link:disabled, button.ghost:disabled { color: var(--mute); cursor: default; text-decoration: none; }
+
+  /* ---------- 播放条 ---------- */
+  .player {
+    position: absolute; left: 12px; right: 12px; bottom: 10px; z-index: 3;
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; border-radius: 10px;
+    background: rgba(16,16,18,.72); backdrop-filter: blur(8px);
+    color: #ebebef; font-size: 12px;
+  }
+  .player[hidden] { display: none; }
+  .pbtn {
+    flex: 0 0 auto; width: 26px; height: 26px; padding: 0;
+    border: 0; border-radius: 7px; cursor: pointer;
+    background: rgba(255,255,255,.14); color: #fff; font-size: 12px; line-height: 1;
+  }
+  .pbtn:hover { background: rgba(255,255,255,.24); }
+  .ptime {
+    flex: 0 0 auto; color: #d7d7dc; font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  }
+  .pseek { flex: 1 1 auto; min-width: 80px; accent-color: #fff; cursor: pointer; }
+  .ploop {
+    flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px;
+    color: #d7d7dc; cursor: pointer; user-select: none;
+  }
+  .ploop input { accent-color: #fff; margin: 0; }
+  .rec { flex: 0 0 auto; color: #9ee0b4; font-size: 11px; }
+  .rec.stopped { color: #e3b74f; }
+
+  /* 拖入视频时的遮罩 */
+  .stage.dragover::after {
+    content: "松手导入视频";
+    position: absolute; inset: 0; z-index: 4;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(16,16,18,.62); color: #fff; font-size: 15px;
+    pointer-events: none;
+  }
 </style>
 </head>
 <body>
@@ -213,6 +258,7 @@
   </div>
   <div class="metrics">
     <span id="status" class="status">初始化…</span>
+    <span>模型 <b id="modelInfo">—</b></span>
     <span>推理 <b id="fps">—</b> fps</span>
   </div>
 </div>
@@ -236,7 +282,12 @@
     <option value="15" selected>15 fps</option>
     <option value="30">30 fps</option>
   </select>
-  <select id="hardcaseSel" title="这条难例应该是什么"></select>
+  <select id="profileSel" title="阈值 profile（切换会清空已记录的帧）">
+    <option value="default">默认阈值</option>
+    <option value="fitness">健身</option>
+  </select>
+  <button id="btnSwitchCam" class="ghost" hidden title="切换前后摄像头或设备">切换摄像头</button>
+  <select id="hardcaseSel" title="选择这条难例「应该是什么」或「不应该出现什么」，再点右侧按钮导出前后 5 秒的帧"></select>
   <button id="btnHardcase" class="ghost" title="导出点击前 3 秒 + 之后 2 秒的帧和草稿 label">判错了</button>
   <span id="profileTag" class="badge-profile" hidden></span>
   <div class="spacer"></div>
@@ -256,9 +307,17 @@
       <span class="badge" id="badgeRes" hidden>—</span>
       <span class="badge warn" id="badgeNoPerson" hidden>未检出人体</span>
     </div>
+    <div class="player" id="player" hidden>
+      <button id="btnPlay" class="pbtn" title="播放/暂停" aria-label="播放/暂停">▶</button>
+      <span class="ptime" id="time">0:00 / 0:00</span>
+      <input id="seek" class="pseek" type="range" min="0" max="1000" step="1" value="0" aria-label="播放进度">
+      <label class="ploop"><input id="chkLoop" type="checkbox">循环</label>
+      <button id="btnReplay" class="pbtn" title="清空记录并从头播放" aria-label="重播">↺</button>
+      <span class="rec" id="recState" title="记录状态">记录中</span>
+    </div>
     <div class="placeholder" id="placeholder">
       <p>还没有输入画面</p>
-      <p class="hint">点「摄像头」开始，或「上传视频」用已有片段</p>
+      <p class="hint">点「摄像头」开始，或「上传视频」/拖入视频文件</p>
     </div>
   </section>
 
@@ -294,7 +353,7 @@
       <table class="kv" id="angles"></table>
       <div class="spark-wrap">
         <canvas id="spark" width="640" height="128"></canvas>
-        <div class="spark-legend"><span>膝角 · 最近 5 秒</span><span>下阈 100° / 上阈 150°</span></div>
+        <div class="spark-legend"><span>膝角 · 最近 5 秒</span><span id="sparkThresh">下阈 100° / 上阈 150°</span></div>
       </div>
     </div>
 
@@ -313,7 +372,10 @@
         <button id="btnReset" class="ghost">重置计数</button>
         <button id="btnExport" class="ghost">导出 JSON</button>
       </div>
-      <div class="hint" id="logInfo">—</div>
+      <div class="hint-row">
+        <div class="hint" id="logInfo">—</div>
+        <button id="btnClearLog" class="link" title="清空已记录的帧、计数与曲线（不改变播放位置）">清空记录</button>
+      </div>
     </div>
   </aside>
 </main>

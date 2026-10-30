@@ -182,6 +182,53 @@ async function main() {
       };
     })()`);
 
+    // 本轮前端：播放条、进度、设置持久化（在难例测试前跑，结束后用重播恢复帧）
+    const frontend = await cdp.eval(`(async () => {
+      const $ = (id) => document.getElementById(id);
+      const video = $('video');
+      const player = $('player');
+      const seek = $('seek');
+      const playBtn = $('btnPlay');
+      const log = $('logInfo');
+      const profile = $('profileSel');
+      const tag = $('profileTag');
+
+      const wasPaused = video.paused;
+      playBtn.click();
+      const afterFirst = video.paused;
+      playBtn.click();
+      const afterSecond = video.paused;
+
+      // 拖动进度：先暂停，避免触发「回绕停止记录」；随后点重播清空并从 0 开始
+      video.pause();
+      seek.value = '500';
+      seek.dispatchEvent(new Event('input', { bubbles: true }));
+      const mid = video.currentTime;
+      const dur = video.duration;
+      $('btnReplay').click();
+      await new Promise((r) => setTimeout(r, 1600));
+
+      // 设置持久化：切换镜像后应写入 localStorage
+      const mirror = $('chkMirror');
+      const beforeMirror = mirror.checked;
+      mirror.click();
+      const saved = JSON.parse(localStorage.getItem('pose-demo.settings.v1') || '{}');
+      mirror.click();
+
+      return {
+        playerVisible: !player.hidden,
+        seekMax: seek.max,
+        wasPaused, afterFirst, afterSecond,
+        mid, dur,
+        framesAfterReplay: window.__pose.state.frames,
+        settingsSaved: saved.mirror === !beforeMirror,
+        profileOptions: profile.options.length,
+        profileTagBefore: tag.textContent,
+        logText: log.textContent,
+        logTitle: log.title,
+      };
+    })()`);
+
     // R6：控件接好没有 + 难例窗口能切出帧和草稿 label
     const hardcase = await cdp.eval(`(() => {
       const sel = document.getElementById('hardcaseSel');
@@ -221,20 +268,62 @@ async function main() {
       };
     })()`);
 
+    // 数据面板：清空记录 + profile 切换
+    const panel = await cdp.eval(`(async () => {
+      const $ = (id) => document.getElementById(id);
+      const tag = $('profileTag');
+      $('btnClearLog').click();
+      const clearedFrames = window.__pose.state.frames;
+
+      const profile = $('profileSel');
+      profile.value = 'fitness';
+      profile.dispatchEvent(new Event('change', { bubbles: true }));
+      for (let i = 0; i < 40; i++) {
+        if (/fitness/.test(tag.textContent || '')) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const profileTagFitness = tag.textContent;
+
+      profile.value = 'default';
+      profile.dispatchEvent(new Event('change', { bubbles: true }));
+      for (let i = 0; i < 40; i++) {
+        if (/默认/.test(tag.textContent || '')) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return {
+        clearedFrames,
+        profileTagFitness,
+        profileTagDefault: tag.textContent,
+      };
+    })()`);
+
     const profileEcho = await cdp.eval(`(() => {
       const el = document.getElementById('status');
       return el ? el.textContent : null;
     })()`);
 
     console.log('页面状态：', JSON.stringify(state, null, 2));
+    console.log('播放/设置：', JSON.stringify(frontend));
     console.log('难例控件：', JSON.stringify(hardcase));
     console.log('难例点击：', JSON.stringify({ clickStart, clickEnd }));
+    console.log('面板/profile：', JSON.stringify(panel));
     console.log('布局：', JSON.stringify(layout));
     console.log('状态栏：', profileEcho);
     console.log('JS 错误：', errors.length ? errors : '无');
 
     const ok = state.hasApi && state.estimatorReady && state.frames > 5
       && state.kpCount === 13 && errors.length === 0
+      && frontend.playerVisible === true
+      && Number(frontend.seekMax) === 1000
+      && frontend.wasPaused !== frontend.afterFirst
+      && frontend.afterSecond === frontend.wasPaused
+      && frontend.dur > 0 && Math.abs(frontend.mid - frontend.dur * 0.5) < 0.6
+      && frontend.framesAfterReplay > 0
+      && frontend.settingsSaved === true
+      && frontend.profileOptions >= 2
+      && /帧/.test(frontend.logText) && /profile=/.test(frontend.logTitle)
+      && panel.clearedFrames === 0
+      && /fitness/.test(panel.profileTagFitness) && /默认/.test(panel.profileTagDefault)
       && hardcase.options >= 10 && hardcase.hasButton && hardcase.frames > 0
       && hardcase.segment && hardcase.action === 'squat'
       && clickStart.disabled === true && clickEnd.disabled === false

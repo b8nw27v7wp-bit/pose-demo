@@ -15,6 +15,16 @@ const ctx = canvas.getContext('2d');
 const stage = $('stage');
 const placeholder = $('placeholder');
 const spark = $('spark');
+const player = $('player');
+const seek = $('seek');
+
+const SETTINGS_KEY = 'pose-demo.settings.v1';
+const CUSTOM_PROFILE = '__custom__';
+// profile 下拉的固定项；自定义 URL 通过 ?profile= 或上次选择恢复
+const PROFILES = [
+  { id: 'default', label: '默认阈值', url: null },
+  { id: 'fitness', label: '健身', url: '/web/profiles/fitness.json' },
+];
 
 const MAX_LOG = 20000;   // 评估需要整段素材，截断会让 recall 失真；20k 帧 ≈ 11 分钟 @30fps
 // 溢出时按块丢弃（一次 splice 掉 10%），而不是每帧 shift()。
@@ -57,6 +67,9 @@ function applyParams(params, name = 'default') {
   signalEngine = new SignalEngine(activeParams);
   actionEngine = new ActionEngine(activeParams);
   shapeStable = makeShapeStable(activeParams);
+  activeParamsHash = paramsHash(activeParams);
+  squatCfg = resolveParams(activeParams).actions.reps.squat;
+  updateSparkLegend();
   resetRuntime();
 }
 
@@ -69,8 +82,10 @@ async function loadProfile(url) {
     applyParams(profileParams(raw), profileNameOf(raw, url));
     // 不要覆盖状态栏的输入状态；profile 名显示在工具条
     updateProfileTag();
+    return true;
   } catch (e) {
     setStatus(`profile 加载失败：${e.message}`, 'err');
+    return false;
   }
 }
 
@@ -81,13 +96,95 @@ async function loadProfile(url) {
 function updateProfileTag() {
   const tag = $('profileTag');
   if (!tag) return;
+  const label = profileName === 'default' ? '默认阈值' : profileName;
   const mismatch = !!(profileModel && activeModel && profileModel !== activeModel);
-  tag.textContent = profileModel ? `${profileName} · ${profileModel}` : profileName;
+  tag.textContent = profileModel ? `${label} · ${profileModel}` : label;
   tag.hidden = false;
   tag.classList.toggle('warn', mismatch);
   tag.title = mismatch
     ? `profile 声明 model=${profileModel}，当前 ${activeModel}；阈值是按另一个档位校准的`
     : profileModel ? `阈值按 model=${profileModel} 校准` : '';
+}
+
+// —— profile 切换 -------------------------------------------------------
+// 默认 + 固定 profile 来自 PROFILES；?profile= 或上次保存的 URL 作为「自定义」项。
+
+function profileEntry(id) {
+  if (id === CUSTOM_PROFILE && customProfileUrl) return { id, label: '自定义', url: customProfileUrl };
+  return PROFILES.find((p) => p.id === id) || null;
+}
+
+function ensureCustomProfileOption(url) {
+  customProfileUrl = url || null;
+  const sel = $('profileSel');
+  let opt = sel.querySelector(`option[value="${CUSTOM_PROFILE}"]`);
+  if (!url) {
+    if (opt) opt.remove();
+    return;
+  }
+  if (!opt) {
+    opt = document.createElement('option');
+    opt.value = CUSTOM_PROFILE;
+    sel.appendChild(opt);
+  }
+  opt.textContent = `自定义（${url.split('/').pop()}）`;
+}
+
+/**
+ * 切换 profile：成功才更新 lastProfileId 并保存；失败恢复上一个选项与参数。
+ * 切换会清空已记录的帧——参数变了，旧帧就不是同一套阈值下的数据了。
+ */
+async function switchProfile(id, { announce = true } = {}) {
+  const sel = $('profileSel');
+  const entry = profileEntry(id);
+  if (!entry) return false;
+  const prev = lastProfileId;
+  if (announce) setStatus(`加载 profile：${entry.label}…`, 'busy');
+  sel.disabled = true;
+  let ok = true;
+  if (entry.url) ok = await loadProfile(entry.url);
+  else { profileModel = null; applyParams({}, 'default'); updateProfileTag(); }
+  sel.disabled = false;
+  if (!ok) {
+    sel.value = prev;
+    updateProfileTag();
+    setStatus(`profile 加载失败，保留「${profileEntry(prev)?.label || prev}」`, 'err');
+    return false;
+  }
+  lastProfileId = id;
+  sel.value = id;
+  saveSettings();
+  if (announce) setStatus(`已切换 profile：${entry.label}（记录已清空）`, 'ok');
+  return true;
+}
+
+/** 启动时决定用哪个 profile：URL 参数 > 上次保存 > 默认 */
+async function initProfile() {
+  const saved = readSettings().profile;
+  const savedProfile = saved && typeof saved === 'object' ? saved : null;
+  let id = 'default';
+  if (profileUrl) {
+    ensureCustomProfileOption(profileUrl);
+    id = CUSTOM_PROFILE;
+  } else if (savedProfile?.id === CUSTOM_PROFILE && savedProfile.url) {
+    ensureCustomProfileOption(savedProfile.url);
+    id = CUSTOM_PROFILE;
+  } else if (savedProfile?.id && PROFILES.some((p) => p.id === savedProfile.id)) {
+    id = savedProfile.id;
+  }
+  $('profileSel').value = id;
+  if (id === 'default') {
+    lastProfileId = 'default';
+    applyParams({}, 'default');
+    updateProfileTag();
+  } else {
+    await switchProfile(id, { announce: false });
+  }
+}
+
+function updateSparkLegend() {
+  const el = $('sparkThresh');
+  if (el) el.textContent = `下阈 ${squatCfg.down}° / 上阈 ${squatCfg.up}°`;
 }
 
 let estimatorReady = false;
@@ -109,9 +206,23 @@ let lastTs = 0;          // MediaPipe 要求时间戳严格递增
 let handFails = 0;       // 手部推理连续失败计数
 let lastLogVideoTime = -1; // 上一次写进 frameLog 的 video_time（秒）
 let videoWrapDetected = false; // 文件模式下检测到 currentTime 回退（循环回绕 / 手动拖回）
+// —— 输入/设置状态 ——
+let cameraFacing = 'user';      // 'user' | 'environment'
+let cameraDeviceId = null;      // enumerateDevices 的 deviceId
+let cameraDevices = [];         // 当前可用的 videoinput
+let customProfileUrl = null;    // ?profile= 或上次保存的自定义 profile
+let lastProfileId = 'default';  // 最近一次成功应用的 profile（失败时回退用）
+let activeParamsHash = paramsHash({});
+let squatCfg = resolveParams({}).actions.reps.squat;
+let logDropped = 0;             // 超过 MAX_LOG 被裁掉的帧数（会话摘要要如实显示）
+let seeking = false;            // 正在拖进度条：syncPlayer 不要覆盖用户拖动
+let resumeAfterSeek = false;
+let dragDepth = 0;
+let profileReady = Promise.resolve(); // 启动时 profile 加载完成前不要开始输入
 
 const show = { skeleton: true, hands: true, points: true, mirror: true };
 const autoSrc = new URLSearchParams(location.search).get('src');
+applyStoredSettings();
 
 const r1 = (v) => (Number.isFinite(v) ? Math.round(v * 10) / 10 : null);
 const r2 = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : null);
@@ -121,6 +232,61 @@ function setStatus(text, kind = '') {
   const el = $('status');
   el.textContent = text;
   el.className = `status ${kind}`;
+}
+
+// —— 设置持久化 ---------------------------------------------------------
+// 刷新页面不该丢掉模型/帧率/开关；隐私模式下 localStorage 可能抛错，读写都要兜底。
+function readSettings() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      model: $('modelSel').value,
+      delegate: $('delegateSel').value,
+      fps: $('fpsCapSel').value,
+      skeleton: $('chkSkeleton').checked,
+      hands: $('chkHands').checked,
+      points: $('chkPoints').checked,
+      mirror: $('chkMirror').checked,
+      loop: $('chkLoop').checked,
+      profile: { id: $('profileSel').value, url: customProfileUrl },
+      cameraFacing,
+      cameraDeviceId,
+    }));
+  } catch { /* 不持久化不影响运行 */ }
+}
+
+/** 把上次的选择写回控件；profile 由 initProfile() 在底部统一处理 */
+function applyStoredSettings() {
+  const s = readSettings();
+  const pick = (id, v) => {
+    const el = $(id);
+    if (!el || v == null) return;
+    const val = String(v);
+    if ([...el.options].some((o) => o.value === val)) el.value = val;
+  };
+  pick('modelSel', s.model);
+  pick('delegateSel', s.delegate);
+  pick('fpsCapSel', s.fps);
+  if (typeof s.skeleton === 'boolean') show.skeleton = s.skeleton;
+  if (typeof s.hands === 'boolean') show.hands = s.hands;
+  if (typeof s.points === 'boolean') show.points = s.points;
+  if (typeof s.mirror === 'boolean') show.mirror = s.mirror;
+  $('chkSkeleton').checked = show.skeleton;
+  $('chkHands').checked = show.hands;
+  $('chkPoints').checked = show.points;
+  $('chkMirror').checked = show.mirror;
+  stage.classList.toggle('mirror', show.mirror);
+  if (typeof s.loop === 'boolean') $('chkLoop').checked = s.loop;
+  if (s.cameraFacing === 'user' || s.cameraFacing === 'environment') cameraFacing = s.cameraFacing;
+  if (typeof s.cameraDeviceId === 'string' && s.cameraDeviceId) cameraDeviceId = s.cameraDeviceId;
 }
 
 // —— 模型 ---------------------------------------------------------------
@@ -145,34 +311,48 @@ async function initEstimator() {
   const numPoses = 1;
   setStatus('模型加载中…', 'busy');
   estimatorReady = false;
+  // 加载期间锁住选择框：换模型/后端会重新建 estimator，连点会互相打架
+  const modelSel = $('modelSel');
+  const delegateSel = $('delegateSel');
+  modelSel.disabled = true;
+  delegateSel.disabled = true;
 
-  const candidates = want === 'GPU' ? ['GPU', 'CPU'] : ['CPU'];
-  let lastErr = null;
-  for (const delegate of candidates) {
-    try {
-      await createEstimator({ model, delegate, runningMode: 'VIDEO', numPoses });
-      estimatorReady = true;
-      activeModel = model;
-      activeDelegate = delegate;
-      const mismatch = !!(profileModel && profileModel !== model);
-      setStatus(
-        `就绪 · ${model}/${delegate}${mismatch ? ` · ⚠ profile 需 ${profileModel}` : ''}`,
-        mismatch ? 'busy' : 'ok',
-      );
-      updateProfileTag();
-      resetRuntime();
-      await initHands(delegate);
-      if (autoSrc && !autoLoaded) {
-        autoLoaded = true;
-        useVideoSource(autoSrc);
+  try {
+    const candidates = want === 'GPU' ? ['GPU', 'CPU'] : ['CPU'];
+    let lastErr = null;
+    for (const delegate of candidates) {
+      try {
+        await createEstimator({ model, delegate, runningMode: 'VIDEO', numPoses });
+        estimatorReady = true;
+        activeModel = model;
+        activeDelegate = delegate;
+        updateModelInfo();
+        const mismatch = !!(profileModel && profileModel !== model);
+        setStatus(
+          `就绪 · ${model}/${delegate}${mismatch ? ` · ⚠ profile 需 ${profileModel}` : ''}`,
+          mismatch ? 'busy' : 'ok',
+        );
+        updateProfileTag();
+        resetRuntime();
+        await initHands(delegate);
+        if (autoSrc && !autoLoaded) {
+          autoLoaded = true;
+          useVideoSource(autoSrc, { loop: $('chkLoop').checked });
+        }
+        return true;
+      } catch (e) {
+        lastErr = e;
       }
-      return true;
-    } catch (e) {
-      lastErr = e;
     }
+    activeModel = null;
+    activeDelegate = null;
+    updateModelInfo();
+    setStatus(`模型加载失败：${lastErr?.message || 'unknown'}`, 'err');
+    return false;
+  } finally {
+    modelSel.disabled = false;
+    delegateSel.disabled = false;
   }
-  setStatus(`模型加载失败：${lastErr?.message || 'unknown'}`, 'err');
-  return false;
 }
 
 async function initHands(delegate) {
@@ -196,6 +376,9 @@ function resetRuntime() {
   lastVideoTime = -1;
   lastLogVideoTime = -1;
   videoWrapDetected = false;
+  logDropped = 0;
+  seeking = false;
+  resumeAfterSeek = false;
   lastInferTs = 0;
   handFails = 0;
   for (const k of Object.keys(shapeStable)) shapeStable[k].reset();
@@ -205,15 +388,58 @@ function resetRuntime() {
 
 // —— 输入源 -------------------------------------------------------------
 
-async function startCamera() {
+async function refreshCameraDevices() {
+  try {
+    const all = await navigator.mediaDevices.enumerateDevices();
+    cameraDevices = all.filter((d) => d.kind === 'videoinput');
+  } catch {
+    cameraDevices = [];
+  }
+  syncPlayer();
+}
+
+/** 有多个摄像头（桌面）或移动端（可切前后）才显示「切换摄像头」 */
+function cameraCanSwitch() {
+  return (!!window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+    || cameraDevices.length > 1;
+}
+
+async function startCamera(opts = {}) {
+  await profileReady;
   stopStream();
   setStatus('摄像头启动中…', 'busy');
-  if (!(await ensureEstimator())) return;
+  const btn = $('btnCamera');
+  btn.disabled = true;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+    if (!(await ensureEstimator())) {
+      stopLoop();
+      videoEl.srcObject = null;
+      mode = 'idle';
+      setActiveInput(null);
+      syncPlayer();
+      return;
+    }
+    const facing = opts.facing || cameraFacing;
+    // 摄像头按钮重开时沿用上次的 deviceId；显式切 facing 时不带 deviceId
+    const deviceId = (opts.deviceId !== undefined && opts.deviceId !== null)
+      ? opts.deviceId
+      : (opts.facing ? null : cameraDeviceId);
+    const base = { width: { ideal: 1280 }, height: { ideal: 720 } };
+    const constraints = (withDevice) => ({
       audio: false,
+      video: withDevice
+        ? { ...base, deviceId: { exact: withDevice } }
+        : { ...base, facingMode: facing },
     });
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia(constraints(deviceId));
+    } catch (e) {
+      // 保存的 deviceId 可能已经不存在（换了设备/权限重置）：退回 facingMode
+      if (!deviceId) throw e;
+      cameraDeviceId = null;
+      stream = await navigator.mediaDevices.getUserMedia(constraints(null));
+    }
     currentStream = stream;
     videoEl.srcObject = stream;
     videoEl.loop = false;
@@ -221,14 +447,41 @@ async function startCamera() {
     mode = 'camera';
     placeholder.hidden = true;
     setActiveInput('camera');
+    const track = stream.getVideoTracks()[0];
+    cameraDeviceId = track?.getSettings?.().deviceId || deviceId || null;
+    cameraFacing = facing;
+    await refreshCameraDevices();
     resetRuntime();
     ensureLoop();
-    setStatus('就绪 · 摄像头', 'ok');
+    setStatus(`就绪 · 摄像头${cameraDevices.length > 1 ? ' · 可切换' : ''}`, 'ok');
+    saveSettings();
+    syncPlayer();
   } catch (e) {
     placeholder.hidden = false;
     placeholder.querySelector('p').textContent = `摄像头不可用（${e.name}）`;
+    placeholder.querySelector('.hint').textContent = '检查浏览器权限后点「摄像头」重试';
     setStatus('摄像头不可用', 'err');
     setActiveInput(null);
+    mode = 'idle';
+    // 旧流已停：停循环、摘掉 srcObject，别让主循环继续拿停掉的流写帧
+    stopLoop();
+    videoEl.srcObject = null;
+    resetRuntime();
+    syncPlayer();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** 多个设备按 deviceId 轮换；单设备/移动端切 facingMode */
+async function switchCamera() {
+  if (mode !== 'camera') return;
+  if (cameraDevices.length > 1) {
+    const idx = cameraDevices.findIndex((d) => d.deviceId === cameraDeviceId);
+    const next = cameraDevices[(idx + 1) % cameraDevices.length];
+    await startCamera({ deviceId: next.deviceId, facing: cameraFacing });
+  } else {
+    await startCamera({ facing: cameraFacing === 'user' ? 'environment' : 'user' });
   }
 }
 
@@ -256,27 +509,35 @@ function waitForVideoReady(el, timeoutMs = 10000) {
 }
 
 async function useVideoSource(src, { loop = false, revoke = null } = {}) {
+  await profileReady;
   stopStream();
-  if (!(await ensureEstimator())) return false;
+  if (!(await ensureEstimator())) {
+    stopLoop();
+    videoEl.srcObject = null;
+    mode = 'idle';
+    setActiveInput(null);
+    syncPlayer();
+    return false;
+  }
   videoEl.srcObject = null;
   if (revoke) {
     videoEl.addEventListener('loadstart', () => setTimeout(() => URL.revokeObjectURL(revoke), 5000), { once: true });
   }
   videoEl.src = src;
   videoEl.loop = loop;
-  videoEl.onerror = () => setStatus(`视频无法解码（code ${videoEl.error?.code ?? '?'}）`, 'err');
+  videoEl.onerror = () => failInput(`视频无法解码（code ${videoEl.error?.code ?? '?'}）`);
 
   // 必须先等元数据/首帧就绪再 play()，否则部分环境下 play() 会被 abort
   try {
     await waitForVideoReady(videoEl);
   } catch (e) {
-    setStatus(`视频加载失败：${e.message}`, 'err');
+    failInput(`视频加载失败：${e.message}`);
     return false;
   }
   try {
     await videoEl.play();
   } catch (e) {
-    setStatus(`视频播放被拒（${e.name}）`, 'err');
+    failInput(`视频播放被拒（${e.name}）`);
     return false;
   }
   mode = 'file';
@@ -284,6 +545,8 @@ async function useVideoSource(src, { loop = false, revoke = null } = {}) {
   setActiveInput('file');
   resetRuntime();
   ensureLoop();
+  $('chkLoop').checked = !!loop;
+  syncPlayer();
   const warmed = await warmUpPlayback();
   // 两种情况都不能用「就绪」盖掉已写好的错误状态：
   // 预热期间推理出错会 stopLoop()（rafId 变 null）；恢复播放被拒时 warmUpPlayback 返回 false。
@@ -320,10 +583,13 @@ async function warmUpPlayback(timeoutMs = 6000) {
 }
 
 async function useVideoFile(file) {
+  await profileReady;
   const url = URL.createObjectURL(file);
-  // 单次播放：一次导出只对应一遍视频，video_time 单调，秒数标注才唯一。
-  // 回绕检测仍然保留，覆盖用户手动拖回进度条的情况。
-  return useVideoSource(url, { loop: false, revoke: url });
+  // 默认单次播放：一次导出只对应一遍视频，video_time 单调，秒数标注才唯一。
+  // 用户可在播放条勾选循环；回绕后记录会停止（已有行为，播放条会显示状态）。
+  const ok = await useVideoSource(url, { loop: $('chkLoop').checked, revoke: url });
+  if (ok) setStatus(`就绪 · 视频文件 · ${file.name}`, 'ok');
+  return ok;
 }
 
 function stopAll() {
@@ -339,6 +605,10 @@ function stopAll() {
   }
   videoEl.srcObject = null;
   mode = 'idle';
+  activeModel = null;
+  activeDelegate = null;
+  updateModelInfo();
+  resetPlaceholder();
   placeholder.hidden = false;
   $('badgeNoPerson').hidden = true;
   $('badgeRes').hidden = true;
@@ -347,6 +617,7 @@ function stopAll() {
   // 清掉上一帧的判定结果，否则面板会一直显示停止前的姿态
   lastResult = null;
   updateUI();
+  syncPlayer();
   // 释放模型，别让关掉的页面继续占显存/内存
   closeEstimator();
   closeHandEstimator();
@@ -592,7 +863,10 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
     })),
   });
   // 溢出时一次丢一批，摊薄成本（每帧 shift 会变成 O(n)）
-  if (frameLog.length > MAX_LOG) frameLog.splice(0, LOG_TRIM);
+  if (frameLog.length > MAX_LOG) {
+    const removed = frameLog.splice(0, LOG_TRIM);
+    logDropped += removed.length;
+  }
 }
 
 /**
@@ -653,8 +927,12 @@ function exportJSON() {
     setStatus('没有可导出的帧', 'busy');
     return;
   }
+  const span = frameLog.length > 1
+    ? (frameLog[frameLog.length - 1].ts - frameLog[0].ts) / 1000
+    : 0;
   downloadJsonl(`pose-frames-${Date.now()}.jsonl`,
     { ...baseExportMeta(), frame_count: frameLog.length }, frameLog);
+  setStatus(`已导出 ${frameLog.length} 帧 / ${span.toFixed(1)}s`, 'ok');
 }
 
 // —— 难例闭环（R6）--------------------------------------------------------
@@ -815,7 +1093,8 @@ function drawSpark(now) {
 
   g.strokeStyle = '#d9d9de';
   g.setLineDash([6, 6]);
-  for (const v of [100, 150]) {
+  for (const v of [squatCfg.down, squatCfg.up]) {
+    if (!Number.isFinite(v)) continue;
     const y = yOf(v);
     g.beginPath(); g.moveTo(padL, y); g.lineTo(W, y); g.stroke();
   }
@@ -845,6 +1124,92 @@ function drawSpark(now) {
     g.arc(xOf(last[0]), yOf(last[1]), 4, 0, Math.PI * 2);
     g.fill();
   }
+}
+
+// —— 播放控制与输入状态 ------------------------------------------------
+
+const fmtTime = (s) => {
+  if (!Number.isFinite(s) || s < 0) return '0:00';
+  return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+};
+
+/** 播放条/记录状态：只在文件模式显示；拖动进度时不要覆盖用户的滑块位置 */
+function syncPlayer() {
+  player.hidden = mode !== 'file';
+  const switchBtn = $('btnSwitchCam');
+  if (switchBtn) switchBtn.hidden = mode !== 'camera' || !cameraCanSwitch();
+  if (mode !== 'file') return;
+
+  const dur = Number.isFinite(videoEl.duration) ? videoEl.duration : 0;
+  const cur = Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : 0;
+  const playBtn = $('btnPlay');
+  playBtn.textContent = videoEl.paused ? '▶' : '❚❚';
+  playBtn.title = videoEl.paused ? '播放' : '暂停';
+  if (!seeking) seek.value = dur > 0 ? String(Math.round((cur / dur) * 1000)) : '0';
+  $('time').textContent = `${fmtTime(cur)} / ${fmtTime(dur)}`;
+
+  const rec = $('recState');
+  rec.textContent = videoWrapDetected ? '记录已停止' : '记录中';
+  rec.classList.toggle('stopped', videoWrapDetected);
+  rec.title = videoWrapDetected
+    ? '时间回退（循环/拖动）后已停止记录；点 ↺ 清空记录并从头播放'
+    : '这一遍播放的每一帧都会写入导出记录';
+}
+
+async function togglePlay() {
+  if (mode !== 'file') return;
+  try {
+    if (videoEl.paused) await videoEl.play();
+    else videoEl.pause();
+  } catch (e) {
+    setStatus(`播放被拒（${e.name}）`, 'err');
+  }
+  syncPlayer();
+}
+
+/** 清空记录并从头播放：同时清掉回绕标记，让记录重新开始 */
+function replayVideo() {
+  if (mode !== 'file') return;
+  resetRuntime();
+  try { videoEl.currentTime = 0; } catch { /* metadata 还没就绪 */ }
+  videoEl.play().catch((e) => setStatus(`播放被拒（${e.name}）`, 'err'));
+  setStatus('已清空记录，从头播放', 'busy');
+  syncPlayer();
+}
+
+function clearLog() {
+  if (!frameLog.length && !sparkSamples.length) {
+    setStatus('没有可清空的记录', 'busy');
+    return;
+  }
+  resetRuntime();
+  setStatus('已清空记录（计数与曲线一起重置）', 'ok');
+}
+
+function resetPlaceholder() {
+  const p = placeholder.querySelector('p');
+  const hint = placeholder.querySelector('.hint');
+  if (p) p.textContent = '还没有输入画面';
+  if (hint) hint.textContent = '点「摄像头」开始，或「上传视频」/拖入视频文件';
+}
+
+/** 输入失败：停循环、摘掉源、清空本次记录，回到空闲（状态栏保留具体错误） */
+function failInput(message) {
+  setStatus(message, 'err');
+  stopLoop();
+  videoEl.removeAttribute('src');
+  videoEl.srcObject = null;
+  mode = 'idle';
+  lastResult = null;
+  setActiveInput(null);
+  resetPlaceholder();
+  placeholder.hidden = false;
+  resetRuntime();
+}
+
+function updateModelInfo() {
+  const el = $('modelInfo');
+  if (el) el.textContent = activeModel ? `${activeModel}/${activeDelegate || '?'}` : '—';
 }
 
 // —— UI -----------------------------------------------------------------
@@ -932,10 +1297,25 @@ function updateUI() {
   const span = frameLog.length > 1
     ? (frameLog[frameLog.length - 1].ts - frameLog[0].ts) / 1000
     : 0;
+  const recState = mode === 'idle' ? '未开始'
+    : videoWrapDetected ? '记录已停止（时间回退）'
+      : mode === 'camera' ? '记录中'
+        : (videoEl.paused ? '已暂停' : '记录中');
+  const dropped = logDropped ? ` · 已丢弃 ${logDropped} 帧（上限 ${MAX_LOG}）` : '';
   $('logInfo').textContent = frameLog.length
-    ? `${frameLog.length} 帧 / ${span.toFixed(1)}s`
-    : '—';
+    ? `${frameLog.length} 帧 / ${span.toFixed(1)}s · ${recState}${dropped}`
+    : (mode === 'idle' ? '—' : `0 帧 · ${recState}${dropped}`);
+  $('logInfo').title = `profile=${profileName} · ${activeParamsHash} · 模型 ${activeModel ? `${activeModel}/${activeDelegate || '?'}` : '—'} · 上限 ${MAX_LOG} 帧`;
 
+  // 无帧时导出/清空/难例都不该可点；难例采样中保持禁用直到 finishHardcase 复位
+  $('btnExport').disabled = !frameLog.length;
+  $('btnClearLog').disabled = !frameLog.length;
+  $('btnHardcase').disabled = !frameLog.length || !!hardcasePending;
+
+  // 曲线图例已有数值，这里给悬停说明当前门限与参数指纹
+  $('signalMeta').title = `深蹲门限 下阈 ${squatCfg.down}° / 上阈 ${squatCfg.up}° · ${activeParamsHash}`;
+
+  syncPlayer();
   drawSpark(performance.now());
 }
 
@@ -943,30 +1323,124 @@ function updateUI() {
 
 buildGrids();
 
-$('btnCamera').addEventListener('click', startCamera);
+function hasFileDrag(e) {
+  return Array.from(e.dataTransfer?.types || []).includes('Files');
+}
+
+function isVideoFile(file) {
+  return !!file && ((file.type && file.type.startsWith('video/'))
+    || /\.(mp4|webm|mov|m4v|ogv|ogg)$/i.test(file.name || ''));
+}
+
+$('btnCamera').addEventListener('click', () => startCamera());
+$('btnSwitchCam').addEventListener('click', switchCamera);
 $('btnStop').addEventListener('click', stopAll);
 $('fileInput').addEventListener('change', async (ev) => {
   const f = ev.target.files?.[0];
+  // 清空 value：否则连续选同一个文件不会再触发 change
+  ev.target.value = '';
   if (f) await useVideoFile(f);
 });
-$('modelSel').addEventListener('change', () => { if (mode !== 'idle') initEstimator(); });
-$('delegateSel').addEventListener('change', () => { if (mode !== 'idle') initEstimator(); });
-$('fpsCapSel').addEventListener('change', () => { lastInferTs = 0; });
-$('chkSkeleton').addEventListener('change', (e) => { show.skeleton = e.target.checked; });
+
+// 拖拽上传：整个画面区域都可以接收视频
+stage.addEventListener('dragenter', (e) => {
+  if (!hasFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  stage.classList.add('dragover');
+});
+stage.addEventListener('dragover', (e) => {
+  if (!hasFileDrag(e)) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+});
+stage.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) stage.classList.remove('dragover');
+});
+stage.addEventListener('drop', async (e) => {
+  if (!hasFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  stage.classList.remove('dragover');
+  const file = e.dataTransfer?.files?.[0];
+  if (!isVideoFile(file)) {
+    setStatus('只支持视频文件', 'err');
+    return;
+  }
+  await useVideoFile(file);
+});
+placeholder.addEventListener('click', () => $('fileInput').click());
+
+// 播放条：视频事件 + 拖动进度（拖动时先暂停，松开后按原状态恢复）
+for (const ev of ['play', 'pause', 'timeupdate', 'loadedmetadata', 'durationchange', 'ended']) {
+  videoEl.addEventListener(ev, syncPlayer);
+}
+$('btnPlay').addEventListener('click', togglePlay);
+$('btnReplay').addEventListener('click', replayVideo);
+$('chkLoop').addEventListener('change', () => {
+  videoEl.loop = $('chkLoop').checked;
+  saveSettings();
+  syncPlayer();
+});
+seek.addEventListener('pointerdown', () => {
+  if (mode !== 'file') return;
+  seeking = true;
+  resumeAfterSeek = !videoEl.paused;
+  videoEl.pause();
+});
+seek.addEventListener('input', () => {
+  if (mode !== 'file' || !Number.isFinite(videoEl.duration)) return;
+  videoEl.currentTime = (Number(seek.value) / 1000) * videoEl.duration;
+  syncPlayer();
+});
+const endSeek = () => {
+  if (!seeking) return;
+  seeking = false;
+  syncPlayer();
+  if (resumeAfterSeek) {
+    resumeAfterSeek = false;
+    videoEl.play().catch((e) => setStatus(`播放被拒（${e.name}）`, 'err'));
+  }
+};
+seek.addEventListener('pointerup', endSeek);
+seek.addEventListener('pointercancel', endSeek);
+seek.addEventListener('change', endSeek);
+
+$('modelSel').addEventListener('change', () => {
+  saveSettings();
+  if (mode !== 'idle') initEstimator();
+});
+$('delegateSel').addEventListener('change', () => {
+  saveSettings();
+  if (mode !== 'idle') initEstimator();
+});
+$('fpsCapSel').addEventListener('change', () => { lastInferTs = 0; saveSettings(); });
+$('profileSel').addEventListener('change', (e) => switchProfile(e.target.value));
+$('chkSkeleton').addEventListener('change', (e) => {
+  show.skeleton = e.target.checked;
+  saveSettings();
+});
 $('chkHands').addEventListener('change', async (e) => {
   show.hands = e.target.checked;
+  saveSettings();
   if (show.hands && !handsReady()) await initHands($('delegateSel').value);
   updateUI();
 });
-$('chkPoints').addEventListener('change', (e) => { show.points = e.target.checked; });
+$('chkPoints').addEventListener('change', (e) => {
+  show.points = e.target.checked;
+  saveSettings();
+});
 $('chkMirror').addEventListener('change', (e) => {
   show.mirror = e.target.checked;
   stage.classList.toggle('mirror', show.mirror);
+  saveSettings();
 });
 $('btnReset').addEventListener('click', () => {
   actionEngine.reset();
   renderReps({ squat: 0, pushup: 0, clap: 0, grasp: 0 });
 });
+$('btnClearLog').addEventListener('click', clearLog);
 $('btnExport').addEventListener('click', exportJSON);
 $('btnHardcase').addEventListener('click', startHardcase);
 initHardcaseSelect();
@@ -1026,5 +1500,8 @@ window.__pose = {
 
 // 懒加载：页面打开不建模型，点「摄像头」或「上传视频」时才加载（省内存，多开标签页也不炸）
 setStatus('待启动 · 点摄像头或上传视频', '');
-if (profileUrl) loadProfile(profileUrl);
-if (autoSrc) ensureEstimator();
+// profile 先就绪再允许输入：参数变过之后记录才属于同一套阈值
+profileReady = initProfile().catch((e) => {
+  setStatus(`profile 初始化失败：${e.message}`, 'err');
+});
+profileReady.then(() => { if (autoSrc) ensureEstimator(); });

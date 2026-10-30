@@ -54,16 +54,19 @@ node web/test/evaluate.mjs --dir eval-data
 按顺序：
 
 1. **按动作汇总**：TP / FN / FP、recall 与 precision（Wilson 95% 区间 + n）、计数误差（每 20 次的绝对误差）
-2. **门槛**：配置了 `--min-recall` / `--min-precision` / `--max-count-err` / `--min-gesture-recall` / `--max-gesture-abstain` / `--baseline` 时
-3. **手势（帧级）**：每种手势的 recall / precision、弃权原因（unknown / 侧对 / 未归属 / 未检出）与手-人归属率；标了手势段，或 `none` 段窗口里判出了手势时才出现
-4. **姿态混淆矩阵** + **手臂共现矩阵**
-5. **分组统计**（按 `camera` / `subject`）与跨组退化
-6. **事件时延与抖动**
-7. **逐段明细与失败区间**
-8. **灵敏度扫描**（`--sweep`）
-9. **信号分位**（`--fit`）
+2. **门槛**：配置了 `--min-recall` / `--min-precision` / `--max-count-err` / `--min-gesture-recall` / `--max-gesture-abstain` / `--max-loso-drop` / `--baseline` 时
+3. **留一人验证（LOSO）**（`--loso`）：每人留出一轮，报训练集 → 留出者的退化
+4. **帧率敏感性**（`--resample`）：重采样后的帧数与指标变化
+5. **手势（帧级）**：每种手势的 recall / precision、弃权原因（unknown / 侧对 / 未归属 / 未检出）与手-人归属率；标了手势段，或 `none` 段窗口里判出了手势时才出现
+6. **姿态混淆矩阵** + **手臂共现矩阵**
+7. **分组统计**（按 `camera` / `subject`）与跨组退化
+8. **事件时延与抖动**
+9. **逐段明细与失败区间**
+10. **灵敏度扫描**（`--sweep`）
+11. **建议 profile 覆盖**（`--fit` 的自动转换结果，需人工复核）
+12. **信号分位**（`--fit`）
 
-只想看汇总和失败段时，前 7 项就是一轮完整评估的全部输出；后两项按需开启。
+只想看汇总和失败段时，前 9 项就是一轮完整评估的全部输出；后三项按需开启。
 
 ## 自动生成标注草稿
 
@@ -281,6 +284,62 @@ node web/test/evaluate.mjs --dir eval-data --fit --report eval-data/report.md
 
 拟合出来的值写进 profile（`web/profiles/*.json` 的 `params` 段），不要改源码。
 
+### 自动转换成 profile（`--fit-out`）
+
+```bash
+node web/test/evaluate.mjs --dir eval-data --fit --fit-out /tmp/fitness-fit.json
+```
+
+- `--margin R`（默认 `0.1`）是余量比例：角度按分位值 × R 留余量，比例类同理。
+- 只翻译**有信号来源、方向明确**的阈值；`--fit-out` 写出的文件与 profile 同格式，可直接用 `--profile` 加载。
+- 不会自动决定的：`onHips` / `head` / `carry` 的距离阈值、有符号方位角、2D/3D 分支开关。
+  这些仍要看分位表人工定（报告里会列出建议值与来源分位）。
+- **`--fit-out` 的文件不要放进 `--dir` 目录**：目录扫描会把任何 `.json` 当成帧文件。
+
+自动转换的映射（v1）：
+
+| 目标 | 来源 | 规则 |
+|---|---|---|
+| `stand.kneeGt` / `sit.kneeGt` | 对应 `knee.p5` | P5 − margin |
+| `squat.kneeLt` / `sit.kneeLt` / `lying.uprightnessLt` / `sit.legVerticalLt` | 对应 `p95` | P95 + margin |
+| `stand/squat/sit.uprightnessGt`、`stand.legVerticalGt` | 对应 `p5` | P5 − margin |
+| `reps.squat.down` | `squat_baseline`（或 `squat_static`）`/knee.p95` | P95 + margin |
+| `reps.squat.up` | `stand/knee.p5` | P5 − margin |
+| `reps.pushup.down/up` | `pushup_baseline/elbow.p5/p95` | P5 − / P95 + margin（up 夹在 175°） |
+| `reps.clap.down/up` | `clap_baseline/hands_close.p5/p95` | P5 − / P95 + margin |
+| `gates.squat.*` | 同 `stand` 的 `leg_vertical` / `uprightness` | P5 − margin |
+| `gates.pushup.uprightnessLt` | `pushup_baseline/uprightness.p95` | P95 + margin |
+| `signals.arm.elevTorso.raised` | `armRaised/elev_torso_L/R.p95` | 取两侧**较低** P95 + margin（上限型） |
+| `signals.arm.extend.minReach` | `reaching/reach_L/R.p5` | 取两侧**较高** P5 − margin（下限型） |
+
+每个来源至少要 `10` 个样本；`down >= up` 或 `kneeGt >= kneeLt` 时整对跳过并在 `fitWarnings` 里告警。
+单臂动作时另一侧是放下/未伸出：`raised` 取较低 P95、`minReach` 取较高 P5，才能排除那一侧；
+取反会让未抬起/未伸出的手臂也满足阈值。
+
+### 留一人验证（LOSO）
+
+```bash
+node web/test/evaluate.mjs --dir eval-data --loso --max-loso-drop 0.1
+```
+
+- 要求每份 labels 都填 `subject`，且至少有 **2 个受试**；缺 `subject` 的素材不参与 fold 并会告警。
+- 每个 fold：用其余人的素材拟合阈值（同 `--margin`），在留出者上重放，报 `训练 recall/precision`、
+  `留出 recall/precision` 与 **Δ = 留出 − 训练**（负数才是退化）。
+- `--max-loso-drop R`：Δ 低于 `−R` 即门槛失败、退出码 2（PLAN §13.4 的「留一人退化 ≤10 个百分点」）。
+- 每折拟合出的覆盖项在 `--json` 的 `loso.folds[].fitted` 里，带参数指纹。
+- 单人的数据做不了 LOSO——这正是 `docs/data-collection.md` 要求 ≥2 人的原因。
+
+### 帧率敏感性
+
+```bash
+node web/test/evaluate.mjs --dir eval-data --resample 15
+```
+
+- 按目标 fps 等间隔抽帧后重放；报告给出 `帧数 before → after` 与相对原始帧的指标 Δ。
+- 目标 fps 等于源 fps 时是 no-op；5% 的间隔容差吸收 `video_time` 三位小数与时间戳取整造成的抖动。
+- 15 fps 下 120 ms 只有 2 帧，`minHalfMs` / Hold 会先失效；这正是 R4 要看的。
+- 重采样会改变帧序号，`startFrame/endFrame` 标注会被拒绝，请改用 `start/end` 或 `startSec`。
+
 ## 用 profile 跑
 
 ```bash
@@ -321,6 +380,7 @@ node web/test/evaluate.mjs --dir eval-data --baseline base.json --max-drop 0.05
 - `--max-count-err` 的单位是**每 20 次**（PLAN §13.4）：20 次里错 1 次记 1；多算一倍或完全漏数是 20。
 - `--min-gesture-recall` / `--max-gesture-abstain`：手势门槛。只在**有手势段**的素材上判定；
   配了门槛却没有任何手势标注时直接报「缺少数据」，不会空素材绿灯。
+- `--max-loso-drop R`：留一人退化门槛，需要配合 `--loso`；Δ 低于 `−R` 即失败。
 - 只判定**有数据**的动作（recall/precision 为 null 的跳过），否则只有误报、没有正例的动作会永远失败。
 - 未达标：报告里列出门槛表，进程退出码 **2**（和「有段没通过」一致）。
 - `--baseline` 读的是 `--json` 导出的报告（需要 `summary` 数组）。
@@ -337,7 +397,7 @@ node web/test/evaluate.mjs --dir eval-data \
 - 同一批帧只读一次，换参数重放两遍；**Δ = B − A**。
 - 报告含两套参数指纹、每动作指标差、以及**判定发生变化的段**（哪一段从通过变失败）。
 - 这是信息性对比，不设退出码门槛；要卡门槛请对选定 profile 用上面的单次评估。
-- `--compare` 不接受 `--profile` / `--fit` / `--sweep` / 门槛参数，避免「以为生效了其实没生效」。
+- `--compare` 不接受 `--profile` / `--fit` / `--fit-out` / `--sweep` / `--loso` / `--max-loso-drop` / `--resample` / 门槛参数，避免「以为生效了其实没生效」。
 
 ## 灵敏度扫描
 

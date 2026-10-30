@@ -85,9 +85,9 @@ serve.py                本地静态服务器
 ## 验证
 
 ```bash
-npm test                            # 180 逻辑 + 224 评估器 + 46 难例 + 17 自动标注 + 21 清单 = 488 项
+npm test                            # 180 逻辑 + 257 评估器 + 46 难例 + 17 自动标注 + 21 清单 = 521 项
 node web/test/logic-test.mjs        # 180 项：角度/滤波/滞回/计数门控/姿态互斥/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 退回/骨骼一致性/外推/自适应周期/统计/拿取阶段机/注册表 flag 一致
-node web/test/eval-test.mjs         # 224 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报）
+node web/test/eval-test.mjs         # 257 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样）
 node web/test/hardcase-test.mjs     # 46 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口、!动作/noArm 反例导出、尾部锚点（区分播完与暂停）
 node web/test/autolabel-test.mjs    # 17 项：区间合并/丢弃、计数周期、草稿内容与自评全通过、注册表覆盖
 node web/test/manifest-test.mjs     # 21 项：清单字段与文件校验、覆盖度、计数与反例、清单骨架、注册表覆盖
@@ -128,8 +128,12 @@ node web/test/manifest-check.mjs --init --dir eval-data
 node web/test/manifest-check.mjs --manifest eval-data/manifest.json
 # 4. 打分
 node web/test/evaluate.mjs --dir eval-data --report eval-data/report.md
-# 5. 拟合阈值（按标注动作段分组给分位）
-node web/test/evaluate.mjs --dir eval-data --fit --profile web/profiles/fitness.json
+# 5. 拟合阈值（按标注动作段分组给分位；--fit-out 直接写成 profile）
+node web/test/evaluate.mjs --dir eval-data --fit --margin 0.1 --fit-out web/profiles/fitness-fit.json
+# 5b. 留一人验证（labels 必须填 subject，至少 2 人；退化超限退出码 2）
+node web/test/evaluate.mjs --dir eval-data --loso --max-loso-drop 0.1
+# 5c. 帧率敏感性（15 fps 验收：看 Hold / 最短半程是否失效）
+node web/test/evaluate.mjs --dir eval-data --resample 15
 # 6. 门槛（可选，未达标退出码 2，可直接进 CI）
 node web/test/evaluate.mjs --dir eval-data --min-recall 0.9 --min-precision 0.85 --max-count-err 1
 # 7. 两套 profile 对比 / 单参数灵敏度
@@ -142,9 +146,14 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.squat.down
 `--max-count-err` 的单位是**每 20 次的绝对误差**（PLAN §13.4）：20 次里错 1 次记 1，多算一倍或完全漏数是 20。
 
 报告按顺序包含：每动作 recall/precision（带 **Wilson 95% 区间和样本量 n**）、门槛、
-**姿态混淆矩阵**、**手臂共现矩阵**、**按机位/受试分组与跨组退化**、**事件时延与抖动**、
-失败区间、灵敏度扫描、阈值分位。只有一行数字的报告没有用——先看 n，再看比例。
+**留一人验证（LOSO）**、**帧率敏感性**、**姿态混淆矩阵**、**手臂共现矩阵**、
+**按机位/受试分组与跨组退化**、**事件时延与抖动**、失败区间、灵敏度扫描、
+**建议 profile 覆盖（`--fit-out`）**、阈值分位。只有一行数字的报告没有用——先看 n，再看比例。
 
+- `--loso` 用训练集拟合阈值、测留出者，报 Δ = 留出 − 训练；`--max-loso-drop` 可卡门槛。
+- `--fit-out` 只翻译有信号来源的阈值（姿态门限、squat/clap/pushup 计数、抬臂/伸手），
+  `onHips/head/carry` 与方位角仍需人工复核；输出文件不要放进 `--dir` 目录。
+- `--resample <fps>` 会改变帧序号，`startFrame/endFrame` 标注会被拒绝。
 - `--compare` 是信息性对比（Δ = B − A），会列出判定发生变化的段，不设退出码门槛。
 - `--sweep` 会把参数扰动 ±10%/±20% 后完整重放，代价约为 5 倍评估时间。
 - `--baseline <旧报告.json>` 可以卡「比上次不准就失败」，`--max-drop` 默认 0.05。
@@ -259,9 +268,9 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 - 参数层：默认值参数化后单测全绿（当时 78 项，现在 180 项），说明行为未变
 - R3 信号改造：3D 角度/直立度、2D 退回、骨骼长度一致性、角速度、遮挡外推、自适应周期均有单测；
   但**没有实拍素材验证过 3D 是否真的更好**（这正是 `signal-compare.mjs` + R2 要做的事）
-- R1 评估扩展：混淆矩阵 / Wilson 区间 / 分组退化 / 时延与抖动 / 灵敏度扫描 / A-B 对比，评估器单测 224 项
+- R1 评估扩展：混淆矩阵 / Wilson 区间 / 分组退化 / 时延与抖动 / 灵敏度扫描 / A-B 对比，评估器单测 257 项
 - profile 生效：无头 Chrome 加载 `?profile=...`，把站立门控膝角抬到 200° 后姿态变 null，恢复后为「站立」
-- 评估器：合成样例 4/4 段通过；故意标错时正确判失败；反例语法（`!动作` / `noArm`）、计数误报归因、失败区间、自动标注、混淆矩阵、分组退化、Wilson 区间、门槛、灵敏度扫描、A/B 对比、时延与抖动均有单测（自测 220/220）
+- 评估器：合成样例 4/4 段通过；故意标错时正确判失败；反例语法（`!动作` / `noArm`）、计数误报归因、失败区间、自动标注、混淆矩阵、分组退化、Wilson 区间、门槛、灵敏度扫描、A/B 对比、时延与抖动、手势帧级指标、分位→profile、LOSO、帧率重采样均有单测（自测 257/257）
 - 评估器 replay 带 `hands`：`reaching` / `carrying` / `pointing` / `grasp` 与拿取计数可被离线度量（之前恒为 false）
 - 动作清单统一由 `js/actions.js` 注册表派生：评估器、自动标注、清单覆盖度、难例下拉、`--timeline` 列一致，新增动作不会再漏
 - 计数误差按**每 20 次**计（PLAN §13.4），多算一倍/完全漏数不会再以 1.0 通过门槛
