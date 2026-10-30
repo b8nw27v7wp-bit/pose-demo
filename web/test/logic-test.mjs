@@ -5,7 +5,7 @@
 // 用人工构造的骨架/信号序列，不代表真实场景精度。真实精度必须用实拍素材校准。
 
 import { angleDeg, angleDeg3, OneEuro, Hold, RepCounter, PhaseSequence, SignalEngine, KpFilter, BoneLengthGuard } from '../js/signals.js';
-import { ActionEngine } from '../js/actions.js';
+import { ActionEngine, ARM_ACTIONS } from '../js/actions.js';
 import { classifyHand, HandShapeStabilizer } from '../js/handshape.js';
 import { toHands, handOrientation, spreadRatio } from '../js/handformat.js';
 import { summarize, quantile, overlapCoefficient } from '../js/stats.js';
@@ -155,6 +155,19 @@ console.log('\n[6] 姿态判定');
   let act2 = null;
   for (let i = 0; i <= 10; i++) act2 = ae2.update(se2.update(person(lieKp), 1000 + i * 100), 1000 + i * 100);
   check('卧姿 → 躺卧', act2.postureId === 'lying', `posture=${act2.posture}`);
+
+  // 注册表一致性：ARM_ACTIONS.flag 是页面、评估器、难例导出共用的键名。
+  // 写错一个字母不会报错，只会让这个动作在 UI/评估里永远为 false——手抄时代就这么漏过。
+  // 这里直接对着 ActionEngine 的真实输出校验；冻结分支用的是另一份 flags 字面量，一并覆盖。
+  const seFlag = new SignalEngine();
+  const live = new ActionEngine().update(seFlag.update(person(standKp), 5000), 5000);
+  const frozen = new ActionEngine()
+    .update(seFlag.update(person(standKp, 0.2), 5200), 5200);
+  const missingFlag = ARM_ACTIONS
+    .filter((a) => !(a.flag in live.flags) || !(a.flag in frozen.flags))
+    .map((a) => a.flag);
+  check('每个 ARM_ACTIONS.flag 都是 act.flags 的键（含冻结分支）',
+    missingFlag.length === 0, `missing=${missingFlag}`);
 }
 
 // —— 7. 计数门控：坐下不能被记成深蹲 ——

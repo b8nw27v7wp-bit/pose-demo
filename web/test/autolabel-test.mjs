@@ -7,7 +7,8 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { rangesFrom, repSessions, autolabelFrames } from './autolabel.mjs';
+import { rangesFrom, repSessions, autolabelFrames, ARM_FLAGS, REPS } from './autolabel.mjs';
+import { ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
 import { replay, evaluateClip } from './evaluate.mjs';
 import { loadFrames } from './frame-io.mjs';
 
@@ -82,6 +83,14 @@ console.log('\n[3] sample.frames.json');
   const bad = res.segments.filter((s) => !s.pass);
   check('草稿自评全通过', bad.length === 0, bad.length ? JSON.stringify(bad.slice(0, 3)) : `${res.segments.length} 段`);
   check('timeline 与帧数一致', timeline.length === frames.length);
+  // 动作清单必须从注册表派生：§12.7 新增的 5 个手臂动作与 grasp 曾在这里漏掉，
+  // 导致 `npm run autolabel` 的草稿和 `evaluate --autolabel` 不是同一套动作。
+  check('自动标注覆盖注册表里的每个手臂动作',
+    ARM_ACTIONS.every((a) => ARM_FLAGS.includes(a.flag)),
+    `missing=${ARM_ACTIONS.map((a) => a.flag).filter((f) => !ARM_FLAGS.includes(f))}`);
+  check('自动标注覆盖注册表里的每个计数动作',
+    REP_ACTIONS.every((r) => REPS.includes(r.id)),
+    `missing=${REP_ACTIONS.map((r) => r.id).filter((id) => !REPS.includes(id))}`);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

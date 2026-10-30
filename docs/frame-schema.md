@@ -8,6 +8,7 @@
 ```jsonc
 {
   "ts": 1585,                       // 毫秒，单调递增（浏览器用 performance.now，服务端用单调时钟）
+  "video_time": 0.93,               // 媒体播放秒数；摄像头为 null。单次播放内单调，用于写 labels 的 startSec/endSec
   "persons": [
     {
       "track_id": 0,                // 无人跟踪时恒为 0
@@ -37,20 +38,35 @@
   },
   "actions": {                      // 规则层输出
     "posture": "stand",
-    "flags": { "armRaised": false, "waving": false, "crossed": false, "onHips": false, "armsOpen": false },
-    "reps": { "squat": 0, "pushup": 0, "clap": 0 }
+    "flags": {
+      "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
+      "onHips": false, "armsOpen": false, "handAtHead": false,
+      "reaching": false, "carrying": false, "pointing": false,
+      "armFront": false, "armSide": false
+    },
+    "reps": { "squat": 0, "pushup": 0, "clap": 0, "grasp": 0 }
   },
   "hands": [                        // 手部（可选，独立模型）
     {
       "handedness": "Left",         // 被识别者自己的左右手
-      "shape": "open",              // fist|open|victory|pointing|thumbs_up|ok|unknown
+      "shape": "open",              // 稳定后的手势（见 handshape.js）：
+                                    // fist|open|victory|pointing|thumbs_up|ok|gun|rock|unknown
+      "shape_raw": "open",          // 本帧原始分类，未过 HandShapeStabilizer
       "score": 0.96,
+      "orient": { "side": 0.1, "flat": 0.7, "facing": "front" },  // facing: front|edge|unknown
+      "spread": 42.5,               // 食指-小指扇开角（度），只作辅助
       "bbox": [222, 114, 264, 150],
       "kp": [[x, y], ...]           // 21 点，mediapipe21
     }
   ]
 }
 ```
+
+> `hands[].shape` 是**稳定后**的结果，动作层（以及离线 `replay`）看到的就是它；
+> `shape_raw` 保留逐帧分类，用于复查稳定器是否把结果拖慢。
+> `unknown` 表示判不出来，不是「张开」——但动作层目前只区分「闭合/非闭合」，这一点见已知限制。
+> 离线评估器的手势指标（`action:"gesture"`）读的也是 `shape`；`orient.facing === "edge"`（手掌侧对）
+> 的帧会被当作弃权，不计入手势 recall 的分母（`docs/eval.md`）。
 
 ## 三条硬规矩
 
@@ -102,10 +118,14 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
   "click_ts": 123456.7,       // performance.now，与帧 ts 同基准
   "before_ms": 3000,          // 窗口 = 点击前 3s + 之后 2s
   "after_ms": 2000,
-  "action": "squat",          // 草稿 label 的期望动作；none = 不应出现
+  "action": "squat",          // 用户选的动作：正例动作 id/flag、none、noArm、或 !动作（反例）
   "detected": { "posture": "stand", "flags": {...}, "reps": {...} }  // 点击时的判定快照
 }
 ```
+
+> `action` 原样写进草稿 label 的 `segments[].action`。`none` = 整帧空镜（姿态和手臂都不许有）；
+> `!onHips` = 只是不应出现叉腰（站着是允许的）；`noArm` = 姿态不限但不能有手臂动作。
+> 三种反例的差别见 `docs/eval.md`。
 
 配套的 `hardcase-*.labels.json` 与普通 labels 相同（`startSec/endSec` 或 `start/end`），
 可直接被 `evaluate.mjs` 读取。
@@ -133,6 +153,11 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
 `evaluate.mjs` 直接读这个格式：首行 meta 会被收进 `frames.meta`（不参与信号复算），
 报告里回显 `model`/`delegate`，并在 `profile_model` 与数据实际模型不一致时警告。
 也兼容旧版 `{frames:[...]}` 与裸数组。
+
+**`video_time` 必须单调**（单次播放内）：labels 的 `startSec/endSec` 按它映射到帧。
+页面检测到回绕（循环播放或手动拖回）会停止继续记录；旧的多圈导出里 `evaluate.resolveRange`
+会拒绝秒数标注，要求改用 `start/end`（ts），自动标注也会在回绕素材上退回 `ts`。
+摄像头录制的 `video_time` 为 `null`，标注一律用 `ts`。
 
 引擎侧落盘格式相同，一行一条（JSONL），便于 `jq` 与逐帧回放。
 

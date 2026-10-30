@@ -16,16 +16,16 @@ import { readFile, writeFile, readdir, access } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadLabels } from './frame-io.mjs';
-import { ACTION_CATALOG } from '../js/actions.js';
+import { ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS as REP_REGISTRY } from '../js/actions.js';
 
 export const CAMERAS = ['front', 'side', 'oblique', 'close'];
 export const LIGHTING = ['front', 'back', 'low', 'side', 'mixed', 'unknown'];
 export const MODELS = ['full', 'lite'];
+// 动作清单从 js/actions.js 的注册表派生。手抄过一次：§12.7 的 5 个手臂动作与 grasp
+// 在这里被漏掉，标注它们会被当成「未知动作」、覆盖度也能在零数据时报达标。
 export const POSTURES = ACTION_CATALOG.map((a) => a.id);
-export const ARM_LABEL_ACTIONS = [
-  'armRaised', 'waving', 'crossed', 'onHips', 'armsOpen', 'bothHandsUp', 'handAtHead',
-];
-export const REP_ACTIONS = ['squat', 'pushup', 'clap'];
+export const ARM_LABEL_ACTIONS = ARM_ACTIONS.map((a) => a.flag);
+export const REP_ACTIONS = REP_REGISTRY.map((r) => r.id);
 export const ACTIONS = [...POSTURES, ...ARM_LABEL_ACTIONS, ...REP_ACTIONS];
 
 export const DEFAULT_THRESHOLDS = {

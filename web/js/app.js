@@ -3,9 +3,9 @@ import { createEstimator, detectVideo, toPersons, closeEstimator } from './pose.
 import { createHandEstimator, detectHandsVideo, toHands, classifyHand, handsReady, closeHandEstimator } from './hands.js';
 import { HandShapeStabilizer, SHAPE_LABELS } from './handshape.js';
 import { SignalEngine } from './signals.js';
-import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS } from './actions.js';
+import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from './actions.js';
 import { resolveParams, profileParams, profileName as profileNameOf, paramsHash } from './params.js';
-import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS } from './hardcase.js';
+import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS, HARDCASE_BEFORE_MS } from './hardcase.js';
 import { drawSkeleton, drawHand, clearCanvas } from './draw.js';
 
 const $ = (id) => document.getElementById(id);
@@ -107,6 +107,8 @@ let currentStream = null;
 let autoLoaded = false;
 let lastTs = 0;          // MediaPipe 要求时间戳严格递增
 let handFails = 0;       // 手部推理连续失败计数
+let lastLogVideoTime = -1; // 上一次写进 frameLog 的 video_time（秒）
+let videoWrapDetected = false; // 文件模式下检测到 currentTime 回退（循环回绕 / 手动拖回）
 
 const show = { skeleton: true, hands: true, points: true, mirror: true };
 const autoSrc = new URLSearchParams(location.search).get('src');
@@ -192,6 +194,8 @@ function resetRuntime() {
   frameLog = [];
   sparkSamples = [];
   lastVideoTime = -1;
+  lastLogVideoTime = -1;
+  videoWrapDetected = false;
   lastInferTs = 0;
   handFails = 0;
   for (const k of Object.keys(shapeStable)) shapeStable[k].reset();
@@ -251,7 +255,7 @@ function waitForVideoReady(el, timeoutMs = 10000) {
   });
 }
 
-async function useVideoSource(src, { loop = true, revoke = null } = {}) {
+async function useVideoSource(src, { loop = false, revoke = null } = {}) {
   stopStream();
   if (!(await ensureEstimator())) return false;
   videoEl.srcObject = null;
@@ -280,13 +284,46 @@ async function useVideoSource(src, { loop = true, revoke = null } = {}) {
   setActiveInput('file');
   resetRuntime();
   ensureLoop();
-  setStatus('就绪 · 视频文件', 'ok');
+  const warmed = await warmUpPlayback();
+  // 两种情况都不能用「就绪」盖掉已写好的错误状态：
+  // 预热期间推理出错会 stopLoop()（rafId 变 null）；恢复播放被拒时 warmUpPlayback 返回 false。
+  if (rafId !== null && warmed) setStatus('就绪 · 视频文件', 'ok');
   return true;
+}
+
+/**
+ * 首帧预热：先停住播放，等第一帧推理出结果再放行。
+ *
+ * 单次播放 + 冷启动时第一帧推理要 1~2 秒（wasm/着色器编译），
+ * 视频会在这段时间里自己跑到后半段：3 秒素材实测只记到 2~23 帧，
+ * 帧数不够做任何按时间窗的分析，难例窗口也很快就过期（见 hardcaseAnchorTs）。
+ * 暂停在首帧等结果，等于把预热挪到视频之外——素材一帧不少。
+ * 推理挂了（超时 / loop 已停）就照常播放，不阻塞入口。
+ * @returns {Promise<boolean>} false = 恢复播放被拒（状态栏已写错误，调用方别再覆盖）
+ */
+async function warmUpPlayback(timeoutMs = 6000) {
+  if (videoEl.paused || videoEl.ended) return true;
+  videoEl.pause();
+  setStatus('视频已暂停，等第一帧分析完成…', 'busy');
+  const t0 = performance.now();
+  while (!frameLog.length && performance.now() - t0 < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (videoEl.ended) return true;
+  try {
+    await videoEl.play();
+    return true;
+  } catch (e) {
+    setStatus(`视频播放被拒（${e.name}）`, 'err');
+    return false;
+  }
 }
 
 async function useVideoFile(file) {
   const url = URL.createObjectURL(file);
-  return useVideoSource(url, { loop: true, revoke: url });
+  // 单次播放：一次导出只对应一遍视频，video_time 单调，秒数标注才唯一。
+  // 回绕检测仍然保留，覆盖用户手动拖回进度条的情况。
+  return useVideoSource(url, { loop: false, revoke: url });
 }
 
 function stopAll() {
@@ -334,6 +371,29 @@ function ensureLoop() {
 }
 
 // —— 主循环 -------------------------------------------------------------
+
+/**
+ * 是否继续把这一帧写进 frameLog。
+ *
+ * 文件模式下 currentTime 一旦回退（循环播放回绕，或用户把进度条拖回去），
+ * 同一份导出里就会出现多段 video_time，秒数不再能唯一映射到某一帧
+ * （evaluate.resolveRange 会直接拒绝 startSec/endSec）。这时立刻停止记录：
+ * 保留已经记录的那一遍（单调、可评估），不清空、不静默改写；
+ * 状态栏提示用户导出当前素材或重新录制单次播放。
+ * 摄像头模式没有稳定的媒体时间，不适用。
+ */
+function mayLogFrame() {
+  if (videoWrapDetected) return false;
+  if (mode !== 'file') return true;
+  const t = videoEl.currentTime;
+  if (lastLogVideoTime >= 0 && t < lastLogVideoTime) {
+    videoWrapDetected = true;
+    setStatus('检测到视频回绕，已停止记录；请导出当前素材或重新录制单次播放', 'busy');
+    return false;
+  }
+  lastLogVideoTime = t;
+  return true;
+}
 
 function loop() {
   rafId = requestAnimationFrame(loop);
@@ -430,7 +490,7 @@ function loop() {
 
   for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
 
-  pushLog(ts, target, sig, act, persons.length, hands);
+  if (mayLogFrame()) pushLog(ts, target, sig, act, persons.length, hands);
   pushSpark(ts, sig ? sig.knee_pick : null);
 
   lastResult = { ts, persons, sig, act, hands };
@@ -627,6 +687,25 @@ function resetHardcaseButton() {
   if (btn) { btn.disabled = false; btn.textContent = '判错了'; }
 }
 
+/**
+ * 难例窗口的锚点。
+ *
+ * 默认就是点击时刻。但单次播放结束后帧不再增加，而窗口是 [点击−3s, 点击+2s]：
+ * 播放结束 3 秒后再点「判错了」，窗口里一帧都没有，只能报「难例窗口内没有帧」。
+ * 这时锚到最后记录的那帧，导出刚播完的一段——反例仍然落在它真正发生的时间上。
+ * 返回 { ts, tail, ended }：
+ *   tail=true 表示锚到了最后记录帧（不一定是播放结束——暂停、后台标签页停推理也会）；
+ *   ended 只表示媒体真的播完了，用来决定提示语，不参与锚点选择。
+ */
+function hardcaseAnchorTs() {
+  const now = performance.now();
+  const last = frameLog[frameLog.length - 1];
+  const ended = videoEl.ended
+    || (Number.isFinite(videoEl.duration) && videoEl.currentTime >= videoEl.duration - 0.05);
+  if (!last || now - last.ts <= HARDCASE_BEFORE_MS) return { ts: now, tail: false, ended };
+  return { ts: last.ts, tail: true, ended };
+}
+
 function startHardcase() {
   if (hardcasePending) {
     setStatus('难例采样中，请稍候…', 'busy');
@@ -644,9 +723,12 @@ function startHardcase() {
     flags: last.actions.flags,
     reps: last.actions.reps,
   } : null;
-  const clickTs = performance.now();
+  const anchor = hardcaseAnchorTs();
   hardcasePending = {
-    clickTs,
+    clickTs: anchor.ts,
+    clickedAt: performance.now(),
+    tail: anchor.tail,
+    videoEnded: anchor.ended,
     action,
     detected,
     timer: setTimeout(finishHardcase, HARDCASE_AFTER_MS),
@@ -665,6 +747,8 @@ function finishHardcase() {
     action: p.action,
     detected: p.detected,
     baseMeta: baseExportMeta(),
+    anchoredFrom: p.tail ? p.clickedAt : null,
+    ended: p.videoEnded,
   });
   if (!frames.length) {
     setStatus('难例窗口内没有帧', 'busy');
@@ -673,7 +757,17 @@ function finishHardcase() {
   const base = `hardcase-${Date.now()}`;
   downloadJsonl(`${base}.jsonl`, meta, frames);
   downloadJson(`${base}.labels.json`, labels);
-  setStatus(`已导出难例 ${frames.length} 帧 · 期望「${p.action}」`, 'ok');
+  // 反例读起来别像正例：「期望「!onHips」」会被误解；动作名按下拉里的中文回显
+  const expect = p.action === 'none' ? '不应出现（none）'
+    : p.action === 'noArm' ? '不应出现任何手臂动作'
+      : p.action.startsWith('!') ? `不应出现「${hardcaseActionName(p.action.slice(1))}」`
+        : `期望「${hardcaseActionName(p.action)}」`;
+  // 锚到尾部时要说清楚，否则用户会以为导出的是点击那一刻；
+  // 只有媒体真的播完才说「视频已结束」，暂停/后台停推理时只说说锚到了最后记录帧
+  const tail = p.tail
+    ? (p.videoEnded ? '（视频已结束，导出最后一段）' : '（窗口锚到最后记录帧）')
+    : '';
+  setStatus(`已导出难例 ${frames.length} 帧 · ${expect}${tail}`, 'ok');
 }
 
 function cancelHardcase() {
@@ -681,6 +775,14 @@ function cancelHardcase() {
   clearTimeout(hardcasePending.timer);
   hardcasePending = null;
   resetHardcaseButton();
+}
+
+/** 难例动作的中文名：下拉里选的是中文，状态栏回显也应该用中文，而不是裸 flag。 */
+function hardcaseActionName(id) {
+  const hit = ARM_ACTIONS.find((a) => a.flag === id)
+    || ACTION_CATALOG.find((a) => a.id === id)
+    || REP_ACTIONS.find((r) => r.id === id);
+  return hit ? hit.name : id;
 }
 
 // —— 角度曲线（校准阈值用）---------------------------------------------
@@ -763,21 +865,6 @@ function buildGrids() {
     .join('');
 }
 
-const ARM_FLAG = {
-  arm_raised: 'armRaised',
-  both_up: 'bothHandsUp',
-  wave: 'waving',
-  crossed: 'crossed',
-  hips: 'onHips',
-  arms_open: 'armsOpen',
-  hand_head: 'handAtHead',
-  reach: 'reaching',
-  carry: 'carrying',
-  point: 'pointing',
-  arm_front: 'armFront',
-  arm_side: 'armSide',
-};
-
 function updateUI() {
   const { sig, act, hands } = lastResult || {};
 
@@ -799,7 +886,7 @@ function updateUI() {
 
   for (const a of ARM_ACTIONS) {
     const el = document.querySelector(`#armGrid .act[data-id="${a.id}"]`);
-    if (el) el.classList.toggle('on', !!act?.flags?.[ARM_FLAG[a.id]]);
+    if (el) el.classList.toggle('on', !!act?.flags?.[a.flag]);
   }
 
   // 手部：按 handedness 取（镜像只影响画面，不影响模型输出的左右手）
@@ -927,7 +1014,7 @@ window.__pose = {
       flags: last.actions.flags,
       reps: last.actions.reps,
     } : null;
-    const r = buildHardcase(frameLog, performance.now(), { action, detected });
+    const r = buildHardcase(frameLog, hardcaseAnchorTs().ts, { action, detected });
     return {
       frames: r.frames.length,
       frameCount: r.meta.frame_count,

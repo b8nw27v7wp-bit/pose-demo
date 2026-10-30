@@ -27,6 +27,11 @@
 - 人必须**完整入画**：头顶留一点空间，脚不能出画；距离见下表。
 - 一次只录一个动作序列，动作之间留 **1~2 秒纯站姿**。
 - 整段一口气录完，中途不要点「停止」：停止会重置滤波，后续帧的起止时间会偏（`docs/eval.md`）。
+- **一段素材只播放一遍**：页面上传视频已改为单次播放；检测到 `video_time` 回绕（循环或拖回）
+  会停止继续记录。循环素材的秒数不唯一，`evaluate` 会拒绝 `startSec/endSec` 标注。
+- 上传后视频会**先停住、等第一帧分析完再播放**（约 1~2 秒，冷启动时更久）。
+  这是故意的：否则预热时间会被算进视频里，开头几秒的帧直接丢失。
+- 播完再点「判错了」也可以，窗口会锚到最后一段（`docs/eval.md` 难例闭环）。
 
 ## 三、机位
 
@@ -58,8 +63,24 @@
 | 类别 | 动作 | 标注 action | 备注 |
 |---|---|---|---|
 | 姿态 | 站立 / 坐 / 下蹲 / 躺卧 | `stand` / `sit` / `squat_static` / `lying` | 每个姿态保持 2 s 以上 |
-| 手臂 | 举手 / 挥手 / 抱臂 / 叉腰 / 张开双臂 / 双手高举 / 手在头部 | `armRaised` / `waving` / `crossed` / `onHips` / `armsOpen` / `bothHandsUp` / `handAtHead` | 每个动作做 2~3 s |
-| 计数 | 深蹲 / 俯卧撑 / 鼓掌 | `squat` / `pushup` / `clap` | 一次一段，段内 `count` 写实际次数 |
+| 手臂 | 举手 / 挥手 / 抱臂 / 叉腰 / 张开双臂 / 双手高举 / 手在头部 / 前平举 / 侧平举 | `armRaised` / `waving` / `crossed` / `onHips` / `armsOpen` / `bothHandsUp` / `handAtHead` / `armFront` / `armSide` | 每个动作做 2~3 s；前/侧平举需要 world 坐标（3D 方位角） |
+| 手臂（需手部模型） | 伸手 / 持物 / 指向 | `reaching` / `carrying` / `pointing` | 依赖手部开合；手部关掉或未检出时恒为 false |
+| 计数 | 深蹲 / 俯卧撑 / 鼓掌 / 拿取 | `squat` / `pushup` / `clap` / `grasp` | 一次一段，段内 `count` 写实际次数；拿取需要手部模型（伸手→合手） |
+| 手势（需手部模型） | 握拳 / 张开 / 剪刀手 / 指方向 / 竖拇指 / OK / 手枪 / 摇滚 | `gesture` + `hand` + `shape`（见下） | 每只手单独标；手掌侧对镜头（`orient.facing === "edge"`）的帧不要标，评估器会把它们算作弃权 |
+
+手势段的写法（每次只标**一只手**、一种手势，保持 2~3 s）：
+
+```jsonc
+{ "action": "gesture", "hand": "L", "shape": "fist", "startSec": 1.0, "endSec": 3.0 }
+{ "action": "gesture", "hand": "R", "shape": "ok", "startSec": 4.0, "endSec": 5.0, "expect": false }
+```
+
+反例（「这只手这段时间没有做 OK」）也是靠 `expect:false`：precision 只能从反例来。
+`unknown`（判不出）不是一种可标的手势——它是评估器里的弃权，报告会单独给出弃权率。
+
+动作清单的**唯一来源**是 `web/js/actions.js` 的 `ACTION_CATALOG` / `ARM_ACTIONS` / `REP_ACTIONS`，
+手势清单来自 `web/js/handshape.js` 的 `SHAPE_LABELS`；
+`manifest-check`、自动标注、评估器都从那里派生。新增动作后先跑 `npm test` 的一致性断言，再采数据。
 
 **变形执行**（每个动作 5~10 次）也要录，并在 labels 里如实标：幅度更小、速度更快/更慢、手臂换一侧。
 它们决定阈值留多少余量，不是"脏数据"。
@@ -70,13 +91,19 @@
 
 | 正例 | 容易混淆的反例 | 反例怎么标 |
 |---|---|---|
-| 举手 | 伸手拿高处东西 | `!armRaised` 或 `none` |
+| 举手 | 伸手拿高处东西 | `!armRaised`（不要用 `none`：站着会被判成 `stand`，`none` 段必然失败） |
 | 手在头部 | 摸头发 / 扶眼镜 / 走路手臂前摆 | `!handAtHead` |
 | 叉腰 | 手插口袋 / 手自然下垂 | `!onHips` |
 | 抱臂 | 抱文件夹 / 双手交叉放在身前 | `!crossed` |
 | 鼓掌 | 双手合十 / 抱臂 | `!clap` |
 | 深蹲 | 坐下 / 弯腰捡东西 / 单膝跪地 | `!squat` |
 | 挥手 | 走路摆臂 / 整理头发 | `!waving` |
+| 伸手 | 手没伸出但握着东西 | `!reaching` |
+| 持物 | 空手自然下垂 | `!carrying` |
+| 指向 | 前平举 / 侧平举（方向不对） | `!pointing` |
+| 前平举 | 侧平举 | `!armFront` |
+| 侧平举 | 前平举 | `!armSide` |
+| 拿取 | 只伸手不合手 / 握着东西不动 | `!grasp` |
 | 站立 | 靠墙 / 一只手撑桌 | `none`（如果连姿态也不该成立） |
 
 标注语法（与 `docs/eval.md` 一致）：
@@ -85,8 +112,8 @@
 - `!动作` 或 `expect: false`：这段该动作**不应成立**，其他动作不限；
 - `noArm`：姿态不限，但不许有手臂动作（用于坐着但没叉腰）。
 
-> 当前分支的评估器只原生支持 `none`、`!动作`、`expect:false`；`noArm` 的完整统计在 R1 合并后生效，
-> manifest 校验器已经能识别并按手臂动作计反例。
+> 评估器原生支持 `none`、`!动作`、`expect:false`、`noArm`；manifest 校验器按手臂动作计 `noArm` 反例。
+> 单动作误报（例如站着但被误判叉腰）用 `!onHips`，不要用 `none`——`none` 还要求姿态也不出现。
 
 ## 七、文件命名与目录
 
@@ -151,8 +178,9 @@ node web/test/manifest-check.mjs --manifest eval-data/manifest.json
 node web/test/evaluate.mjs --dir eval-data --report eval-data/report.md
 ```
 
-`--autolabel` 只生成正例，**不会生成 `none`**；反例必须人工补。草稿的 `count` 默认是实际计到的次数，
-仍需按视频核对。
+`--autolabel` 只生成正例，**不会生成 `none`**；反例必须人工补。两个入口的动作清单相同，
+但计数段的合并方式不同：独立工具 `web/test/autolabel.mjs` 会把相邻计数并成一段并累加 `count`，
+内置的 `evaluate.mjs --autolabel` 逐次输出 `count: 1`。两种都要按视频核对实际次数。
 
 ## 十、常见错误
 
@@ -163,6 +191,7 @@ node web/test/evaluate.mjs --dir eval-data --report eval-data/report.md
 | 只用一个机位 | 侧视/正视的差异被掩盖 | 正面 + 侧面各一组 |
 | 动作之间不停顿 | 无法区分"漏判"和"没复位" | 每次动作后 1~2 s 纯站姿 |
 | 录制中途点停止 | 滤波重置，起止时间偏 | 一口气录完 |
+| 用循环播放的素材 | `video_time` 回绕，秒数不唯一；评估器拒绝秒数标注 | 单次播放；或改用 `start/end`（ts）标注 |
 | 用 lite 录、用 full 调阈值 | 两档噪声不同，阈值不通用 | manifest 记录 model/fps，两个档位都跑 |
 | 用合成样例定阈值 | `sample.*` 是链路自检，不是实拍 | 只用来验证工具，不产出准确率结论 |
 | 帧文件被截断 | 长视频尾部缺帧，recall 失真 | 当前上限 20000 帧（约 11 分钟 @30fps），分段录 |

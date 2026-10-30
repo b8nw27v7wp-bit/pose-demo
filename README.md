@@ -32,7 +32,7 @@ web/                    浏览器 Demo（纯静态，无构建链）
   js/handshape.js       手势分类（纯函数，可单测）
   js/signals.js         L2 信号层：One Euro、2D/3D 角度、Hold、RepCounter、骨骼一致性、遮挡外推
   js/stats.js           分布统计（分位 / 重合度，只给评估工具用）
-  js/hardcase.js        难例窗口切分与草稿 label（纯函数）
+  js/hardcase.js        难例窗口切分与草稿 label（纯函数；含 !动作 / noArm 反例选项）
   js/actions.js         动作字典（原语组合）
   js/draw.js            骨架 / 手部绘制
   js/app.js             组装：输入源 → 感知 → 信号 → 动作 → UI/导出
@@ -63,12 +63,12 @@ serve.py                本地静态服务器
 **手势**（每只手单独识别）：握拳 / 张开 / 剪刀手 / 指方向 / 竖拇指 / OK / 手枪 / 摇滚
 **计数**：深蹲 / 俯卧撑 / 鼓掌 / 拿取
 
-手臂动作只用姿态骨架就能判（肩、肘、腕三点 + 归一化位置），不需要手部模型；
+手臂动作大多只用姿态骨架就能判（肩、肘、腕三点 + 归一化位置）；
+**伸手 / 持物 / 指向 / 拿取例外**：它们需要「手是张开还是握紧」，依赖手部模型。
+手部关掉或没检出时，这 4 个动作恒为 `false` —— 宁可漏判，也不把「没检出」当成「手是空的」。
 手势需要手部 21 点，所以「手部」开关关掉时手势面板会显示「已关闭」。
 
-**拿取（伸开手 → 握紧）和持物需要手部模型**：姿态层只有腕的位置，没有手的开合。
-手部关掉或没检出时，这两个动作恒为 `false` —— 宁可漏判，也不把「没检出」当成「手是空的」。
-拿取是**有序阶段**（`PhaseSequence`）：先伸手、再合手才计一次；没先伸手就合手、或伸手后
+**拿取（伸开手 → 握紧）是有序阶段**（`PhaseSequence`）：先伸手、再合手才计一次；没先伸手就合手、或伸手后
 超时没合手，都不计数。
 
 手臂判定有两处细节值得知道：
@@ -85,19 +85,24 @@ serve.py                本地静态服务器
 ## 验证
 
 ```bash
-npm test                            # 179 逻辑 + 168 评估器 + 18 难例 + 15 自动标注 + 19 清单 = 399 项
-node web/test/logic-test.mjs        # 179 项：角度/滤波/滞回/计数门控/姿态互斥/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 退回/骨骼一致性/外推/自适应周期/统计/拿取阶段机
-node web/test/eval-test.mjs         # 168 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对）
-node web/test/hardcase-test.mjs     # 18 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口
-node web/test/autolabel-test.mjs    # 15 项：区间合并/丢弃、计数周期、草稿内容与自评全通过
-node web/test/manifest-test.mjs     # 19 项：清单字段与文件校验、覆盖度、计数与反例、清单骨架
+npm test                            # 180 逻辑 + 224 评估器 + 46 难例 + 17 自动标注 + 21 清单 = 488 项
+node web/test/logic-test.mjs        # 180 项：角度/滤波/滞回/计数门控/姿态互斥/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 退回/骨骼一致性/外推/自适应周期/统计/拿取阶段机/注册表 flag 一致
+node web/test/eval-test.mjs         # 224 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报）
+node web/test/hardcase-test.mjs     # 46 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口、!动作/noArm 反例导出、尾部锚点（区分播完与暂停）
+node web/test/autolabel-test.mjs    # 17 项：区间合并/丢弃、计数周期、草稿内容与自评全通过、注册表覆盖
+node web/test/manifest-test.mjs     # 21 项：清单字段与文件校验、覆盖度、计数与反例、清单骨架、注册表覆盖
 ```
 
 页面级（需要 serve.py 已启动）：
 
 ```bash
 node web/test/headless-check.mjs    # 无头 Chrome 真加载页面：模型就绪、跑到帧、13 关键点、零 JS 错误
+node web/test/headless-check.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-vp8.webm"   # worktree/多开：显式换端口
 ```
+
+> 端口冲突：`serve.py` 默认 8765，Windows 允许第二个进程静默绑定同一端口，
+> 后起的那个收不到请求——页面测试会打到**别的 checkout 的旧代码**。多开时务必用 `py serve.py 8799`
+> 并把 URL 传给 headless-check。
 
 浏览器自检（参数见 `web/test/verify.html`）：
 
@@ -113,10 +118,11 @@ node web/test/headless-check.mjs    # 无头 Chrome 真加载页面：模型就�
 ```bash
 # 1. Demo 里录一段视频并点「导出」，得到 .jsonl（一行一帧），放到 eval-data/a.jsonl
 # 2. 生成标注草稿（只含正例，反例仍需人工补）
-node web/test/autolabel.mjs --input eval-data/a.jsonl        # 独立工具，写 a.labels.draft.json
-node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data/a.labels.draft.json   # 等价的内置开关
+node web/test/autolabel.mjs --input eval-data/a.jsonl        # 独立工具，写 a.labels.draft.json（相邻计数并成一段并累加 count）
+node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data/a.labels.draft.json   # 内置开关（动作清单相同，计数段逐次输出 count:1）
 # 3. 对着时间线改边界，补 none / !动作 / noArm 反例段，另存为 a.labels.json
 node web/test/evaluate.mjs --input eval-data/a.jsonl --timeline --every 5
+#    手势段写法见 docs/eval.md §手势段：{"action":"gesture","hand":"L","shape":"fist",...}
 # 4. 生成清单并填元数据，检查是否采够
 node web/test/manifest-check.mjs --init --dir eval-data
 node web/test/manifest-check.mjs --manifest eval-data/manifest.json
@@ -133,6 +139,7 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.squat.down
 
 `autolabel` 只生成正例；反例必须人工补，否则 precision 恒为 1（见 `docs/data-collection.md` §六）。
 清单校验的退出码：0 达标 / 2 覆盖不足 / 1 清单有错，可直接进 CI。
+`--max-count-err` 的单位是**每 20 次的绝对误差**（PLAN §13.4）：20 次里错 1 次记 1，多算一倍或完全漏数是 20。
 
 报告按顺序包含：每动作 recall/precision（带 **Wilson 95% 区间和样本量 n**）、门槛、
 **姿态混淆矩阵**、**手臂共现矩阵**、**按机位/受试分组与跨组退化**、**事件时延与抖动**、
@@ -142,7 +149,9 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.squat.down
 - `--sweep` 会把参数扰动 ±10%/±20% 后完整重放，代价约为 5 倍评估时间。
 - `--baseline <旧报告.json>` 可以卡「比上次不准就失败」，`--max-drop` 默认 0.05。
 
-导出帧带 `video_time`（视频播放秒数），所以标注直接写视频里看到的秒数，不用换算 `performance.now`。
+导出帧带 `video_time`（视频播放秒数），单次播放时标注直接写视频里看到的秒数，不用换算 `performance.now`。
+页面检测到 `video_time` 回绕（循环播放或手动拖回）会**停止继续记录**并提示；旧的多圈导出里秒数不唯一，
+评估器会要求改用 `start/end`（ts）或重新录制单次播放的素材。
 报告里的失败段会带起止秒、帧号、关键信号的 min/中位/max，以及漏判时"实际判成了什么"。
 
 没有实拍素材时，可以用合成样例先把链路跑通（**合成数据不能用来定阈值**）：
@@ -166,11 +175,18 @@ node web/test/signal-compare.mjs --a eval-data/front.frames.json --b eval-data/s
 
 ### 难例闭环（R6）
 
-页面上判错时，先在工具条的下拉里选“应该是什么”（或“不应出现”），再点 **判错了**：
+页面上判错时，先在工具条的下拉里选“应该是什么”，或从「反例」里选“不应该出现”，再点 **判错了**：
+
+- 正例（姿态/手臂/计数）：导出正例段；
+- `!动作`（如「不应出现：叉腰」）：只否定这一个动作，站立不受影响——**单动作误报用这个**；
+- `none`：整帧空镜（姿态和手臂都不许有），人站着时必然失败，不要拿它表达单动作误报；
+- `noArm`：姿态不限，但任何手臂动作都不应出现。
 
 1. 继续录 2 秒（点击前 3 秒的帧本来就在缓存里）；
-2. 自动下载两个文件：`hardcase-<ts>.jsonl`（帧）和 `hardcase-<ts>.labels.json`（草稿 label）；
-3. 把这两个文件放进 `eval-data/`，先按 `docs/eval.md` 改一下草稿边界，再跑全量报告。
+2. 视频已经播完（或点击时距离最后一帧超过 3 秒）也没关系：窗口自动锚到**最后记录的那一段**，
+   状态栏会写「视频已结束，导出最后一段」，草稿 `labels.note` 里也记着实际点击时刻；
+3. 自动下载两个文件：`hardcase-<ts>.jsonl`（帧）和 `hardcase-<ts>.labels.json`（草稿 label）；
+4. 把这两个文件放进 `eval-data/`，先按 `docs/eval.md` 改一下草稿边界，再跑全量报告。
 
 只导出帧不导出视频：可离线复现、体积小、不保存人像。导出帧保留原始 `ts` / `video_time`，
 所以草稿 label 直接就是评估器认识的格式。
@@ -195,9 +211,14 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 ## 加一个动作
 
 能用已有原语表达的动作，**不需要写代码**（引擎侧加一个 YAML）。Demo 侧在 `js/actions.js` 的
-`buildPostures()` 或 `ActionEngine.update()` 里加一条判定，然后在 `ACTION_CATALOG` / `ARM_ACTIONS`
-里登记以便显示。**登记后还要在 `web/test/evaluate.mjs` 的 `ARM_ID_TO_FLAG` 里加映射**，
-否则这个动作无法被评估器标注（`FLAG_IDS` 从那里派生）。
+`buildPostures()` 或 `ActionEngine.update()` 里加一条判定，然后登记到**唯一注册表**：
+
+- 姿态 → `ACTION_CATALOG`（`{id, name, kind}`）
+- 手臂 → `ARM_ACTIONS`（必须带 `flag`，即 `ActionEngine.update()` 输出里的布尔字段名）
+- 计数 → `REP_ACTIONS`（`{id, name}`）
+
+评估器的 `FLAG_IDS` / `REP_IDS`、自动标注、清单覆盖度、难例下拉、`--timeline` 列都从注册表派生，
+不需要再改任何工具。登记后跑 `npm test`，一致性断言会检查每个动作都被评估/采集/难例覆盖。
 阈值一律用角度和比值，不要用像素，并且写进 `js/params.js` 而不是直接写在判定里。
 
 ## 性能与资源（默认就是省电档）
@@ -226,7 +247,7 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 
 ## 已验证 / 未验证
 
-已验证（2026-10-28 实测）：
+已验证（2026-10-28 / 10-29 实测）：
 
 - 图片模式：单张真人全身照 → 33 关键点，置信度 0.935，膝角 163.1°、直立度 1.000、腿竖直比 1.33
 - 视频模式：146 帧连续推理，姿态判定「站立」，无 JS 报错，帧记录符合 `docs/frame-schema.md`（`scale` 127.22px 与信号面板一致）
@@ -235,12 +256,24 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 - 手部扩展：3D 抬臂角（含 world 与无 world 两条路径）、手在头部（含走路前摆反例）、手势去抖、手枪/摇滚、朝向与张开度
 - 手臂扩展：双手高举与单臂举手的区分、自然下垂不算叉腰、肘外张才算叉腰、伸手/持物/指向/前平举/侧平举
 - 多人：IMAGE 模式 `poses=2` 在双人图上返回 2 个框；**VIDEO 模式恒为 1 人**（模型限制，已写进 `docs/signals.md`）
-- 参数层：默认值参数化后单测全绿（当时 78 项，现在 179 项），说明行为未变
+- 参数层：默认值参数化后单测全绿（当时 78 项，现在 180 项），说明行为未变
 - R3 信号改造：3D 角度/直立度、2D 退回、骨骼长度一致性、角速度、遮挡外推、自适应周期均有单测；
   但**没有实拍素材验证过 3D 是否真的更好**（这正是 `signal-compare.mjs` + R2 要做的事）
-- R1 评估扩展：混淆矩阵 / Wilson 区间 / 分组退化 / 时延与抖动 / 灵敏度扫描 / A-B 对比，评估器单测 168 项
+- R1 评估扩展：混淆矩阵 / Wilson 区间 / 分组退化 / 时延与抖动 / 灵敏度扫描 / A-B 对比，评估器单测 224 项
 - profile 生效：无头 Chrome 加载 `?profile=...`，把站立门控膝角抬到 200° 后姿态变 null，恢复后为「站立」
-- 评估器：合成样例 4/4 段通过；故意标错时正确判失败；反例语法（`!动作` / `noArm`）、计数误报归因、失败区间、自动标注、混淆矩阵、分组退化、Wilson 区间、门槛、灵敏度扫描、A/B 对比、时延与抖动均有单测（自测 141/141）
+- 评估器：合成样例 4/4 段通过；故意标错时正确判失败；反例语法（`!动作` / `noArm`）、计数误报归因、失败区间、自动标注、混淆矩阵、分组退化、Wilson 区间、门槛、灵敏度扫描、A/B 对比、时延与抖动均有单测（自测 220/220）
+- 评估器 replay 带 `hands`：`reaching` / `carrying` / `pointing` / `grasp` 与拿取计数可被离线度量（之前恒为 false）
+- 动作清单统一由 `js/actions.js` 注册表派生：评估器、自动标注、清单覆盖度、难例下拉、`--timeline` 列一致，新增动作不会再漏
+- 计数误差按**每 20 次**计（PLAN §13.4），多算一倍/完全漏数不会再以 1.0 通过门槛
+- `video_time` 回绕：页面检测到回绕停止记录；评估器拒绝秒数标注并提示改用 `start/end`；自动标注在回绕素材上退回 `ts`
+- 难例下拉支持 `!动作` / `noArm`：单个动作的误报（如「不应出现叉腰」）可以直接回流
+- R7 手势评估（**只有口径与工具，没有实拍数字**）：labels 支持 `gesture` 段，报告给出每种手势的帧级
+  recall/precision、`unknown`/侧对/未归属/未检出的弃权率与手-人归属率；`none` 段里的手势误报计入 FP
+- 单次播放不再丢开头：视频先暂停等第一帧推理完成再播放（冷启动首帧要 1~2 秒）。
+  3 秒测试素材实测从「只记到 2~23 帧」变为 44 帧，`--timeline`/难例/评估都能拿到整段
+- 视频播完后仍可导出难例：点击窗口为空时锚到最后记录帧，状态栏与 `labels.note` 都会注明
+- 页面级无头回归（`headless-check.mjs`，8799 端口）：模型就绪、44 帧、3D 分支、42 项难例下拉、
+  「判错了」导出、1440×900 无滚动、零 JS 错误全部通过；手动拖回进度条会提示回绕并停止记录
 - 导出帧带 `video_time`（实测视频 3 秒、帧上 0.93s，与 `ts` 确实是不同基准）
 - 布局：1440×900 下 `scrollHeight=900`、无滚动、无卡片截断，profile 标签正常
 
@@ -250,7 +283,11 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 - **真实深蹲/俯卧撑/挥手/躺卧的识别率与计数准确性**：目前只有合成信号单测和评估器的自测，
   **没有任何实拍素材跑过** —— 这正是 `docs/eval.md` 要做的事，也是当前最大的空白
 - 帧率：无头环境测得的数字不代表真机，请在自己机器上开 DevTools 看
+- **手势准确率**：R7 只交付了度量的口径与工具（合成帧自测覆盖），8 种手势在实拍上的 recall/precision
+  仍是 0 个数字；侧对帧占比多少也不知道
 - 跨机位阈值漂移幅度
+- 真机 / 非 Chrome 浏览器：页面级回归只在无头 Chrome + 1440×900 下跑过；
+  摄像头实时路径、低帧率设备上的首帧预热时长都没有实测
 
 ## 插图
 

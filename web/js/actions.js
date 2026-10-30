@@ -266,24 +266,42 @@ export class ActionEngine {
   }
 }
 
+// —— 动作注册表（唯一来源）——————————————————————————————————————————
+// 页面、评估器、自动标注、清单校验、难例导出都从这里派生，不许各自再抄一份。
+// 之前 evaluate/app/autolabel/manifest/hardcase 各抄了一份动作列表，
+// 结果 §12.7 新增的 5 个手臂动作和 grasp 在 3 个工具里被漏掉（评估/采集/难例都看不到它们）。
+// 新增动作：在 ARM_ACTIONS 里加一条（含 flag）或在 REP_ACTIONS 里加一条，其余自动生效。
 export const ACTION_CATALOG = [
   { id: 'stand', name: '站立', kind: '姿态' },
   { id: 'sit', name: '坐', kind: '姿态' },
   { id: 'squat_static', name: '下蹲', kind: '姿态' },
   { id: 'lying', name: '躺卧', kind: '姿态' },
 ];
+export const POSTURE_IDS = ACTION_CATALOG.map((a) => a.id);
 
+// flag = ActionEngine.update() 输出里的布尔字段名；labels/评估器用这个键。
 export const ARM_ACTIONS = [
-  { id: 'arm_raised', name: '举手' },
-  { id: 'both_up', name: '双手高举' },
-  { id: 'wave', name: '挥手' },
-  { id: 'crossed', name: '抱臂' },
-  { id: 'hips', name: '叉腰' },
-  { id: 'arms_open', name: '张开双臂' },
-  { id: 'hand_head', name: '手在头部' },
-  { id: 'reach', name: '伸手' },
-  { id: 'carry', name: '持物' },
-  { id: 'point', name: '指向' },
-  { id: 'arm_front', name: '前平举' },
-  { id: 'arm_side', name: '侧平举' },
+  { id: 'arm_raised', name: '举手', flag: 'armRaised' },
+  { id: 'both_up', name: '双手高举', flag: 'bothHandsUp' },
+  { id: 'wave', name: '挥手', flag: 'waving' },
+  { id: 'crossed', name: '抱臂', flag: 'crossed' },
+  { id: 'hips', name: '叉腰', flag: 'onHips' },
+  { id: 'arms_open', name: '张开双臂', flag: 'armsOpen' },
+  { id: 'hand_head', name: '手在头部', flag: 'handAtHead' },
+  { id: 'reach', name: '伸手', flag: 'reaching' },
+  { id: 'carry', name: '持物', flag: 'carrying' },
+  { id: 'point', name: '指向', flag: 'pointing' },
+  { id: 'arm_front', name: '前平举', flag: 'armFront' },
+  { id: 'arm_side', name: '侧平举', flag: 'armSide' },
 ];
+export const ARM_FLAG_IDS = ARM_ACTIONS.map((a) => a.flag);
+export const ARM_ID_TO_FLAG = Object.fromEntries(ARM_ACTIONS.map((a) => [a.id, a.flag]));
+
+// 计数类：RepCounter（或 PhaseSequence）维护计数，labels 用 id + count。
+export const REP_ACTIONS = [
+  { id: 'squat', name: '深蹲' },
+  { id: 'pushup', name: '俯卧撑' },
+  { id: 'clap', name: '鼓掌' },
+  { id: 'grasp', name: '拿取' },
+];
+export const REP_IDS = REP_ACTIONS.map((r) => r.id);

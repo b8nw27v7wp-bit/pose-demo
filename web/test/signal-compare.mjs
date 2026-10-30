@@ -19,7 +19,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { SignalEngine } from '../js/signals.js';
 import { profileParams } from '../js/params.js';
 import { summarize, overlapCoefficient } from '../js/stats.js';
-import { loadFrames, loadLabels as readLabels, frameTs } from './frame-io.mjs';
+import { loadFrames, loadLabels as readLabels, frameTs, videoTimeMonotonic } from './frame-io.mjs';
 
 const loadLabels = async (p) => (p ? readLabels(p) : null);
 
@@ -97,14 +97,17 @@ function fmtStats(s, digits = 2) {
  * 把 labels 段换成可比较的区间。
  * 三种时间写法必须分开处理：
  *  - startSec/endSec：视频秒。导出里 ts 是 performance.now（不是从 0 开始），
- *    不能直接乘 1000 去和 ts 比；有 video_time 时按 video_time 比，否则按相对首帧的 ts。
+ *    不能直接乘 1000 去和 ts 比；有 video_time 且单次播放（单调）时按 video_time 比，
+ *    否则按相对首帧的 ts（循环素材的 video_time 会回绕，见 frame-io.videoTimeMonotonic）。
  *  - start/end：毫秒，与 ts 同基准。
  *  - startFrame/endFrame：帧序号。
  */
 function buildRanges(labels, action, frames) {
   const ranges = [];
   if (!labels || !action) return ranges;
-  const hasVideo = frames.some((f) => Number.isFinite(f.video_time));
+  // 循环素材的 video_time 会回绕：同一秒数对应多帧，不能拿 video_time 比。
+  // 这种情况退回「相对首帧的 ts」（t0 + sec*1000），与无 video_time 时的口径一致。
+  const hasVideo = frames.some((f) => Number.isFinite(f.video_time)) && videoTimeMonotonic(frames);
   const t0 = frameTs(frames[0]);
   for (const seg of labels) {
     if (seg.action !== action) continue;

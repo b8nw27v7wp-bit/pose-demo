@@ -11,19 +11,19 @@
 //   node web/test/autolabel.mjs --input a.jsonl --profile web/profiles/fitness.json
 //
 // 与 R1 的 `evaluate.mjs --autolabel` 口径一致：合并 500ms 内的同动作命中，丢弃 <300ms 的碎片。
-// 当前分支尚未合并 R1，所以先做成独立工具，不修改 evaluate.mjs。
+// 动作清单从 js/actions.js 的注册表派生，不在这里手抄（§12.7 新增动作曾在这里漏掉）。
 
 import { readFile, writeFile, access } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { replay } from './evaluate.mjs';
 import { profileParams } from '../js/params.js';
-import { ACTION_CATALOG } from '../js/actions.js';
-import { loadFrames } from './frame-io.mjs';
+import { ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
+import { loadFrames, videoTimeMonotonic } from './frame-io.mjs';
 
-const POSTURES = ACTION_CATALOG.map((a) => a.id);
-const ARM_FLAGS = ['armRaised', 'waving', 'crossed', 'onHips', 'armsOpen', 'bothHandsUp', 'handAtHead'];
-const REPS = ['squat', 'pushup', 'clap'];
+export const POSTURES = ACTION_CATALOG.map((a) => a.id);
+export const ARM_FLAGS = ARM_ACTIONS.map((a) => a.flag);
+export const REPS = REP_ACTIONS.map((r) => r.id);
 
 const round3 = (v) => Math.round(v * 1000) / 1000;
 
@@ -99,8 +99,7 @@ function segmentForRange(frames, hasVideo, action, t0, t1, extra = {}) {
     last = f;
   }
   if (!first) return null;
-  if (hasVideo && Number.isFinite(first.video_time) && Number.isFinite(last.video_time)
-    && last.video_time >= first.video_time) {
+  if (hasVideo && Number.isFinite(first.video_time) && Number.isFinite(last.video_time)) {
     return { action, startSec: round3(first.video_time), endSec: round3(last.video_time), ...extra };
   }
   return { action, start: first.ts, end: last.ts, ...extra };
@@ -112,7 +111,9 @@ function segmentForRange(frames, hasVideo, action, t0, t1, extra = {}) {
  */
 export function autolabelFrames(frames, params = {}, { mergeMs = 500, minMs = 300 } = {}) {
   const timeline = replay(frames, params);
-  const hasVideo = frames.length > 0 && frames.every((f) => Number.isFinite(f.video_time));
+  // 循环素材的 video_time 会回绕，秒数无法唯一映射 → 整份素材统一退回 ts。
+  const hasVideo = frames.length > 0 && frames.every((f) => Number.isFinite(f.video_time))
+    && videoTimeMonotonic(frames);
   const segments = [];
   const push = (action, t0, t1, extra) => {
     const seg = segmentForRange(frames, hasVideo, action, t0, t1, extra);

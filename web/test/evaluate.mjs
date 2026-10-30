@@ -19,8 +19,10 @@ import { readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { SignalEngine } from '../js/signals.js';
-import { ActionEngine, ARM_ACTIONS } from '../js/actions.js';
+import { ActionEngine, ARM_FLAG_IDS, ARM_ID_TO_FLAG, POSTURE_IDS, REP_IDS } from '../js/actions.js';
+import { SHAPE_IDS } from '../js/handshape.js';
 import { resolveParams, profileParams, profileName, paramsHash } from '../js/params.js';
+import { videoTimeMonotonic } from './frame-io.mjs';
 
 // —— 参数 ---------------------------------------------------------------
 
@@ -29,6 +31,7 @@ function parseArgs(argv) {
     dir: null, input: null, labels: null, report: null, profile: null, out: null,
     compare: null, baseline: null, sweep: null, sweepActions: null,
     minRecall: null, minPrecision: null, maxCountErr: null, maxDrop: 0.05,
+    minGestureRecall: null, maxGestureAbstain: null,
     fit: false, json: false, quiet: false, timeline: false, autolabel: false, every: 1,
   };
   const num = (v, name) => {
@@ -52,6 +55,8 @@ function parseArgs(argv) {
     else if (a === '--min-recall') out.minRecall = num(next(), '--min-recall');
     else if (a === '--min-precision') out.minPrecision = num(next(), '--min-precision');
     else if (a === '--max-count-err') out.maxCountErr = num(next(), '--max-count-err');
+    else if (a === '--min-gesture-recall') out.minGestureRecall = num(next(), '--min-gesture-recall');
+    else if (a === '--max-gesture-abstain') out.maxGestureAbstain = num(next(), '--max-gesture-abstain');
     else if (a === '--max-drop') out.maxDrop = num(next(), '--max-drop');
     else if (a === '--fit') out.fit = true;
     else if (a === '--json') out.json = true;
@@ -62,8 +67,11 @@ function parseArgs(argv) {
     else if (a === '-h' || a === '--help') out.help = true;
     else throw new Error(`未知参数 ${a}`);
   }
-  for (const k of ['minRecall', 'minPrecision']) {
-    if (out[k] !== null && (out[k] < 0 || out[k] > 1)) throw new Error(`--${k === 'minRecall' ? 'min-recall' : 'min-precision'} 必须在 0~1 之间`);
+  for (const [k, flag] of [
+    ['minRecall', '--min-recall'], ['minPrecision', '--min-precision'],
+    ['minGestureRecall', '--min-gesture-recall'], ['maxGestureAbstain', '--max-gesture-abstain'],
+  ]) {
+    if (out[k] !== null && (out[k] < 0 || out[k] > 1)) throw new Error(`${flag} 必须在 0~1 之间`);
   }
   if (out.maxCountErr !== null && out.maxCountErr < 0) throw new Error('--max-count-err 不能为负');
   return out;
@@ -86,11 +94,15 @@ const USAGE = `用法:
   --sweep-actions   只列出这几个动作的扫描结果（默认只列发生变化的）
   --min-recall R    每个有数据的动作 recall 下限（0~1），未达标退出码 2
   --min-precision P 同上，precision 下限
-  --max-count-err E 计数误差上限（每 N 次）
+  --max-count-err E 计数误差上限（每 20 次的绝对误差）
+  --min-gesture-recall R   每种手势的 recall 下限（0~1，帧级）
+  --max-gesture-abstain P  手势弃权率上限（unknown / 侧对 / 未检出，0~1）
   --baseline <报告> 用 --json 导出的旧报告做基线，下降超过 --max-drop（默认 0.05）即失败
 
 labels 文件格式见 docs/eval.md。反例写法：{\"action\":\"onHips\",\"expect\":false} 或 \"!onHips\"；
-\"none\" = 姿态和手臂都不许出现；\"noArm\" = 姿态不限，但不许有手臂动作。`;
+\"none\" = 姿态和手臂都不许出现；\"noArm\" = 姿态不限，但不许有手臂动作。
+手势段：{\"action\":\"gesture\",\"hand\":\"L\",\"shape\":\"fist\",\"startSec\":1,\"endSec\":3}；
+\"!gesture\" 或 expect:false 是反例，shape 仍写在段里。`;
 
 // —— 输入读取 -----------------------------------------------------------
 
@@ -176,9 +188,24 @@ async function loadLabels(file) {
 // —— 复算：帧记录 → 信号 → 动作 -----------------------------------------
 
 /**
+ * 每帧的手部状态，口径与 app.js 的 handState 完全一致：
+ * 按 handedness 取稳定后的 shape，未知手不参与，未检出给 null。
+ *
+ * 导出的 hands[].shape 已经是 HandShapeStabilizer 的输出，动作层当时看到的就是它。
+ * 这里不把 hands 传下去，reaching/carrying/pointing/grasp 在离线评估里会恒为 false
+ * （PLAN §12.7 的动作无法度量，正例必然 FN、反例必然通过）。
+ * 旧导出没有 hands 字段 → null，与页面「手部未加载」一致。
+ */
+function handStateFromFrame(frame) {
+  if (!Array.isArray(frame.hands)) return null;
+  const shape = (side) => frame.hands.find((h) => h && h.handedness === side)?.shape ?? null;
+  return { L: shape('Left'), R: shape('Right') };
+}
+
+/**
  * 导出记录里的 persons[0] 已经是统一契约，直接喂给信号层（从 kp 重算，不用 export 里的 signals）。
- * kp_world 必须一起带上：动作层用 has_world 在 2D/3D 之间选，漏了它评估就永远走 2D，
- * 和页面上的判定不是同一套规则。
+ * kp_world 与 hands 必须一起带上：动作层用 has_world 在 2D/3D 之间选、用 hands 判手部动作，
+ * 漏了任何一个，评估就与页面不是同一套规则。
  */
 function personFromFrame(frame) {
   const p = frame.persons && frame.persons[0];
@@ -188,6 +215,7 @@ function personFromFrame(frame) {
     bbox: p.bbox,
     kp: p.kp,
     kp_world: Array.isArray(p.kp_world) && p.kp_world.length >= 33 ? p.kp_world : null,
+    hands: handStateFromFrame(frame),
     scale: p.scale,
     score: p.score,
     kp_format: p.kp_format,
@@ -209,7 +237,7 @@ export function replay(frames, params = {}) {
       continue;
     }
     const sig = se.update(person, f.ts);
-    const act = ae.update(sig, f.ts);
+    const act = ae.update(sig, f.ts, person.hands);
     out.push({ ts: f.ts, empty: false, sig, act });
   }
   return out;
@@ -231,6 +259,15 @@ function resolveRange(seg, frames) {
     // 优先用视频时间；没有 video_time 时退回 ts 相对首帧的偏移
     const hasVideo = frames.some((f) => Number.isFinite(f.video_time));
     if (hasVideo) {
+      // 循环播放会把多次循环写进同一份导出：video_time 从 0 重来，秒数不再唯一。
+      // 以前用 frames.find(video_time >= sec) 静默取第一次循环——评估区间错了却看不出来。
+      if (!videoTimeMonotonic(frames)) {
+        throw new Error(
+          `label 段用 startSec/endSec（${seg.startSec}~${seg.endSec}s），`
+          + '但这份导出包含多次视频循环（video_time 回绕），秒数无法唯一映射到某一帧。'
+          + '请改用 start/end（ts 毫秒，与 frames.ts 同基准），或重新录制单次播放的素材。',
+        );
+      }
       const t0 = frames[0].ts;
       const toTs = (sec) => {
         const hit = frames.find((f) => Number.isFinite(f.video_time) && f.video_time >= sec);
@@ -286,20 +323,9 @@ function activeRanges(series, mergeMs = 0) {
 
 // —— 评估单段素材 -------------------------------------------------------
 
-const POSTURE_IDS = ['stand', 'sit', 'squat_static', 'lying'];
-const REP_IDS = ['squat', 'pushup', 'clap', 'grasp'];
-/**
- * 手臂 flag 列表**从 ARM_ACTIONS 派生**，不手抄。
- * 手抄过一次，新增 bothHandsUp/handAtHead 时就漏了——标注这两个动作会得到「未知动作名」，
- * 而这正是本轮新增、最需要被度量的两个。
- */
-const ARM_ID_TO_FLAG = {
-  arm_raised: 'armRaised', both_up: 'bothHandsUp', wave: 'waving',
-  crossed: 'crossed', hips: 'onHips', arms_open: 'armsOpen', hand_head: 'handAtHead',
-  reach: 'reaching', carry: 'carrying', point: 'pointing',
-  arm_front: 'armFront', arm_side: 'armSide',
-};
-const FLAG_IDS = ARM_ACTIONS.map((a) => ARM_ID_TO_FLAG[a.id]).filter(Boolean);
+// 动作清单全部来自 js/actions.js 的注册表，这里不再手抄。
+// 手抄过一次：新增 bothHandsUp/handAtHead 时漏了，标注它们会得到「未知动作名」。
+const FLAG_IDS = ARM_FLAG_IDS;
 
 // —— 段语义：正例 / 反例 -------------------------------------------------
 // PLAN §13 R1：没有反例语法，「站着没叉腰」就写不出来，手臂的 precision 永远测不了。
@@ -307,6 +333,7 @@ const FLAG_IDS = ARM_ACTIONS.map((a) => ARM_ID_TO_FLAG[a.id]).filter(Boolean);
 const NEG_PREFIX = '!';
 const NO_ACTIVITY = 'none';
 const NO_ARM = 'noArm';
+const GESTURE = 'gesture';
 
 /**
  * 解析段的语义：
@@ -346,6 +373,173 @@ function seriesOf(timeline, action) {
   }
   return null;
 }
+
+// —— 手势（R7）：labels 认 gesture 段，指标按帧算 ---------------------------
+// 为什么不走 seriesOf：手势不是动作层的布尔 flag，而是「这一帧这只手被判成什么」，
+// 而且要先做归属与侧对门控，所以指标只能在帧上算，单独出一节，不混进按段汇总的表。
+
+/** hand 写法宽松一点：L/Left/left、R/Right、any/空 */
+function normGestureHand(h) {
+  const s = String(h ?? 'any').trim().toLowerCase();
+  if (s === '' || s === 'any') return 'ANY';
+  if (s === 'l' || s === 'left') return 'L';
+  if (s === 'r' || s === 'right') return 'R';
+  return null;
+}
+
+function personBoxes(frame) {
+  return (frame && Array.isArray(frame.persons) ? frame.persons : [])
+    .map((p) => (p && Array.isArray(p.bbox) && p.bbox.length >= 4 ? p.bbox : null))
+    .filter(Boolean);
+}
+
+/** 手-人归属：手 bbox 中心落在 person bbox（各边留 5% 余量）内，才算这个人的手。 */
+function insideBox(box, [x, y]) {
+  const padX = (box[2] - box[0]) * 0.05;
+  const padY = (box[3] - box[1]) * 0.05;
+  return x >= box[0] - padX && x <= box[2] + padX && y >= box[1] - padY && y <= box[3] + padY;
+}
+
+/**
+ * 只手 → 可判定状态。优先级：未归属 > 侧对 > unknown > decided。
+ *
+ * 侧对（`orient.facing === 'edge'`）整帧不计入分母：手掌侧对镜头时手势分类本来就不可信，
+ * 模型给没给答案都不该算对或算错（PLAN §R7 的「朝向门控」）。
+ */
+function handState(h, boxes, stats) {
+  const b = Array.isArray(h.bbox) && h.bbox.length >= 4 ? h.bbox : null;
+  const center = b ? [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] : null;
+  const target = !!(center && boxes.length && insideBox(boxes[0], center));
+  if (!target) { stats.unattributed++; return { status: 'unattributed', shapes: [] }; }
+  stats.attributed++;
+  if (h.orient && h.orient.facing === 'edge') return { status: 'edge', shapes: [] };
+  const shape = typeof h.shape === 'string' ? h.shape : null;
+  if (!shape || shape === 'unknown' || !SHAPE_IDS.includes(shape)) {
+    return { status: 'unknown', shapes: [] };
+  }
+  return { status: 'decided', shapes: [shape] };
+}
+
+const noHandState = () => ({ status: 'noHand', shapes: [] });
+
+/** any = 任一侧；两侧都判不出时按 edge > unknown > unattributed > noHand 取原因 */
+function mergeGestureSides(a, b) {
+  if (a.status === 'decided' || b.status === 'decided') {
+    const shapes = [...new Set([
+      ...(a.status === 'decided' ? a.shapes : []),
+      ...(b.status === 'decided' ? b.shapes : []),
+    ])];
+    return { status: 'decided', shapes };
+  }
+  for (const s of ['edge', 'unknown', 'unattributed']) {
+    if (a.status === s || b.status === s) return { status: s, shapes: [] };
+  }
+  return noHandState();
+}
+
+/**
+ * 整份素材的逐帧手势状态 + 归属统计。
+ * 选边规则与 app.js 的 handState 完全一致：未知 handedness 不参与 L/R，同一侧取第一只。
+ * `hasHands=false` 表示整份导出没有 hands 字段（旧版导出/手部模型没开）。
+ */
+export function gestureFrames(frames) {
+  const states = [];
+  const stats = {
+    hands: 0, attributed: 0, unattributed: 0, multiPersonFrames: 0, noPersonFrames: 0,
+  };
+  let hasHands = false;
+  for (const f of frames || []) {
+    const boxes = personBoxes(f);
+    if (boxes.length > 1) stats.multiPersonFrames++;
+    if (!boxes.length) stats.noPersonFrames++;
+    const list = Array.isArray(f && f.hands) ? f.hands : null;
+    if (list) hasHands = true;
+    let L = noHandState();
+    let R = noHandState();
+    for (const h of list || []) {
+      if (!h) continue;
+      stats.hands++;
+      const st = handState(h, boxes, stats);
+      if (h.handedness === 'Left') { if (L.status === 'noHand') L = st; }
+      else if (h.handedness === 'Right') { if (R.status === 'noHand') R = st; }
+    }
+    states.push({ L, R, any: mergeGestureSides(L, R) });
+  }
+  return { states, stats, hasHands };
+}
+
+function gestureState(frameState, hand) {
+  if (!frameState) return noHandState();
+  if (hand === 'L') return frameState.L;
+  if (hand === 'R') return frameState.R;
+  return frameState.any;
+}
+
+/** none 段里的手势激活：按 shape 记帧数（一帧可以同时算两个 shape）。 */
+function gestureActivations(frames, gf, range) {
+  const out = {};
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    if (!(f && f.ts >= range[0] && f.ts <= range[1])) continue;
+    if (!f.persons || !f.persons.length) continue;
+    const st = gf.states[i];
+    if (!st || st.any.status !== 'decided') continue;
+    for (const shape of st.any.shapes) out[shape] = (out[shape] || 0) + 1;
+  }
+  return out;
+}
+
+/**
+ * 单个手势段。
+ * 正例：分母是「有可用判定」的帧（decided），段内命中率 ≥ minRatio（默认 0.5）算通过；
+ * 反例：窗口内出现被否定的手势即 FP。
+ * unknown / 侧对 / 未归属 / 未检出都是**弃权**，不进分母，但单独计数。
+ */
+function evalGestureSegment(seg, expect, range, frames, gf, ctx) {
+  const hand = normGestureHand(seg.hand);
+  const shape = typeof seg.shape === 'string' ? seg.shape : null;
+  const minRatio = Number.isFinite(seg.minRatio) ? seg.minRatio : 0.5;
+  const base = {
+    type: 'gesture', action: GESTURE, hand: hand || String(seg.hand ?? 'any'),
+    shape, expect, range, minRatio,
+  };
+  const failWith = (error) => ({ ...base, pass: false, error, fail: ctx });
+  if (!hand) return failWith(`非法 hand：${seg.hand}（应为 L / R / any）`);
+  if (!shape || !SHAPE_IDS.includes(shape)) {
+    return failWith(`未知手势 shape：${seg.shape ?? '(缺失)'}（可用：${SHAPE_IDS.join(' / ')}）`);
+  }
+  if (!gf.hasHands) {
+    return failWith('这份导出没有 hands 字段（手部模型未开或旧版导出），无法评估手势');
+  }
+  const stats = {
+    decided: 0, hits: 0, active: 0, unknown: 0, edge: 0, unattributed: 0, noHand: 0,
+  };
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    if (!(f && f.ts >= range[0] && f.ts <= range[1])) continue;
+    if (!f.persons || !f.persons.length) continue;   // 没有人就没有「这个人的手」
+    const st = gestureState(gf.states[i], hand);
+    if (st.status === 'decided') {
+      stats.decided++;
+      if (st.shapes.includes(shape)) {
+        if (expect) stats.hits++;
+        else stats.active++;
+      }
+    } else {
+      stats[st.status]++;
+    }
+  }
+  const pass = expect
+    ? stats.decided > 0 && stats.hits / stats.decided >= minRatio
+    : stats.active === 0;
+  const r = {
+    ...base, stats, want: expect ? shape : 0, got: expect ? stats.hits : stats.active, pass,
+  };
+  if (!pass) r.fail = ctx;
+  if (expect && stats.decided === 0) r.reason = '段内没有可用的手部判定（unknown / 侧对 / 未归属 / 未检出）';
+  return r;
+}
+
 
 /** 某计数动作在时间窗内的增量（用窗口前一帧做基线，避免跨段算错）。 */
 function repDelta(timeline, action, range) {
@@ -399,6 +593,8 @@ const SIGNAL_GETTERS = {
   reach_R: (s) => s.armPose.reach_R,
   reach_head_L: (s) => s.armPose.reach_head_L,
   reach_head_R: (s) => s.armPose.reach_head_R,
+  azimuth_L: (s) => s.armPose.azimuth_L,
+  azimuth_R: (s) => s.armPose.azimuth_R,
   hands_close: (s) => s.armPose.hands_close,
   wave_flips: (s) => Math.max(s.wave.L, s.wave.R),
   wave_amp: (s) => s.wave.amp,
@@ -417,6 +613,14 @@ const SIGNALS_FOR = {
   onHips: ['reach_L', 'reach_R', 'hands_close'],
   armsOpen: ['elev_L', 'elev_R', 'reach_L', 'reach_R'],
   handAtHead: ['reach_head_L', 'reach_head_R'],
+  // §12.7：这 5 个动作靠「臂是否伸出 + 抬臂角/方位角」判定；手部开合状态不在信号层，
+  // 但漏判时看这几列仍能判断是信号没到阈值还是手部没检出。
+  reaching: ['reach_L', 'reach_R', 'elev_L', 'elev_R'],
+  carrying: ['reach_L', 'reach_R'],
+  pointing: ['reach_L', 'reach_R', 'elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
+  armFront: ['elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
+  armSide: ['elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
+  grasp: ['reach_L', 'reach_R', 'elev_L', 'elev_R'],
   squat: ['knee'],
   pushup: ['elbow', 'uprightness'],
   clap: ['hands_close'],
@@ -473,10 +677,17 @@ export function evaluateClip(frames, labels, timeline) {
   const span = frames.length ? frames[frames.length - 1].ts - frames[0].ts : 0;
 
   const results = [];
+  let gf = null;                       // 逐帧手势状态：只在这份素材真的标了手势/none 时才算
+  const gestures = () => (gf ||= gestureFrames(frames));
   for (const seg of segments) {
     const range = resolveRange(seg, frames);
     const { action, expect } = parseSegment(seg);
     const ctx = rangeContext(frames, range);
+
+    if (action === GESTURE) {
+      results.push(evalGestureSegment(seg, expect, range, frames, gestures(), ctx));
+      continue;
+    }
 
     if (REP_IDS.includes(action)) {
       // 计数类：正例比较增量与期望次数；反例（!squat）期望 0，多出来的都算 FP
@@ -509,6 +720,12 @@ export function evaluateClip(frames, labels, timeline) {
     const pass = expect ? hit : (!hit && !repViolated);
     const r = { type: 'state', action, expect, range, want: expect, got: hit, pass };
     if (repFalseAlarms) r.repFalseAlarms = repFalseAlarms;
+    // none 声称「什么都不该发生」：窗口里被判定出来的手势也算误报。
+    // 只记 FP、不改变 none 段本身的通过条件——手势的 precision 才是它的归宿。
+    if (action === NO_ACTIVITY) {
+      const g = gestureActivations(frames, gestures(), range);
+      if (Object.keys(g).length) r.gestureFalseAlarms = g;
+    }
     // 事件时延：标签起点 → 该动作在段内第一次为真。段开始时已经为真则记 0。
     // 只对通过的正例有意义：漏判没有"首次为真"，反例不设起点。
     if (expect && hit) r.latencyMs = Math.max(0, hits[0][0] - range[0]);
@@ -553,11 +770,94 @@ export function evaluateClip(frames, labels, timeline) {
     frames: frames.length,
     duration_s: +(span / 1000).toFixed(2),
     activity,
+    // 只有在标了手势 / none 段时才算过逐帧手势状态；没有就不带这个字段
+    ...(gf ? { gestureAttr: gf.stats } : {}),
     segments: results,
   };
 }
 
 // —— 汇总 ---------------------------------------------------------------
+
+/**
+ * 手势汇总（帧级）：每个 shape 一行。
+ * recall 的分母是「正例段里有可用判定」的帧；precision 的 FP 来自反例段与 none 段。
+ * unknown / 侧对 / 未归属 / 未检出是**弃权**：不进分母，但单独列出来——
+ * 否则「判不出」会被悄悄算成「没做错」，这正是 §12.1 里「手势偶尔串」看不见的原因。
+ */
+export function gestureSummary(clips) {
+  const byShape = new Map();
+  const attr = {
+    hands: 0, attributed: 0, unattributed: 0, multiPersonFrames: 0, noPersonFrames: 0,
+  };
+  let segments = 0;
+  const bump = (shape) => {
+    if (!shape || !SHAPE_IDS.includes(shape)) return null;
+    if (!byShape.has(shape)) {
+      byShape.set(shape, {
+        shape, decidedPos: 0, decidedNeg: 0, hits: 0, fp: 0,
+        unknown: 0, edge: 0, unattributed: 0, noHand: 0,
+      });
+    }
+    return byShape.get(shape);
+  };
+  for (const c of clips) {
+    // 归属率只在真的标了手势段的素材上统计；只标了 none 的素材不该稀释它
+    if (c.gestureAttr && (c.segments || []).some((s) => s.type === 'gesture')) {
+      for (const k of Object.keys(attr)) attr[k] += c.gestureAttr[k] || 0;
+    }
+    for (const s of c.segments || []) {
+      if (s.type === 'gesture') {
+        segments++;
+        if (!s.stats || !s.shape) continue;   // hand/shape 写错的段不计入指标，只算失败段
+        const b = bump(s.shape);
+        if (!b) continue;
+        // 反例段的「已判定」帧也要进弃权率的分母：它们同样做了判定（只是没命中目标手势），
+        // 只把弃权帧算进分子、判定帧不算分母，会让有反例段的素材弃权率虚高。
+        if (s.expect) { b.decidedPos += s.stats.decided; b.hits += s.stats.hits; }
+        else { b.decidedNeg += s.stats.decided; b.fp += s.stats.active; }
+        for (const k of ['unknown', 'edge', 'unattributed', 'noHand']) b[k] += s.stats[k] || 0;
+      } else if (s.type === 'state' && s.action === NO_ACTIVITY && s.gestureFalseAlarms) {
+        for (const [shape, n] of Object.entries(s.gestureFalseAlarms)) {
+          const b = bump(shape);
+          if (b) b.fp += n;
+        }
+      }
+    }
+  }
+  const shapes = [...byShape.values()].map(({ decidedNeg, ...b }) => {
+    const abstain = b.unknown + b.edge + b.unattributed + b.noHand;
+    // 分母 = 所有已判定帧（正例 + 反例）+ 弃权帧；decidedNeg 只用于这里，不进报告行
+    const denom = b.decidedPos + decidedNeg + abstain;
+    return {
+      ...b,
+      recall: b.decidedPos ? +(b.hits / b.decidedPos).toFixed(3) : null,
+      precision: (b.hits + b.fp) ? +(b.hits / (b.hits + b.fp)).toFixed(3) : null,
+      abstain,
+      abstainRate: denom ? +(abstain / denom).toFixed(3) : null,
+    };
+  }).sort((a, b) => a.shape.localeCompare(b.shape));
+  return {
+    shapes,
+    attribution: {
+      ...attr,
+      rate: attr.hands ? +(attr.attributed / attr.hands).toFixed(3) : null,
+    },
+    segments,
+  };
+}
+
+/**
+ * 只有真的有手势数据才返回汇总，否则 null——报告里不出现空小节。
+ * `none` 段窗口里被判出的手势也是数据（已经计进 FP）；
+ * 只看 gesture 段会把「只标了 none 的素材」里的误报连同整个小节一起丢掉。
+ */
+export function gestureSummaryIfAny(clips) {
+  const has = clips.some((c) => (c.segments || []).some(
+    (s) => s.type === 'gesture'
+      || (s.type === 'state' && s.action === NO_ACTIVITY && s.gestureFalseAlarms),
+  ));
+  return has ? gestureSummary(clips) : null;
+}
 
 /**
  * Wilson 95% 置信区间（比例）。为什么不用 ±1.96·√(p(1-p)/n)：
@@ -591,6 +891,7 @@ export function summarize(clipResults) {
   for (const c of clipResults) {
     for (const s of c.segments) {
       if (s.type === 'unknown') continue;   // 标错动作名不算漏判，单独由报告列出
+      if (s.type === 'gesture') continue;   // 手势是帧级指标，单独汇总（gestureSummary）
       if (s.type === 'rep') {
         if (s.expect) {
           const b = bump(s.action);
@@ -632,7 +933,10 @@ export function summarize(clipResults) {
       nRecall, nPrecision,
       recall, recallCI: recall === null ? null : wilson(b.tp, nRecall),
       precision, precisionCI: precision === null ? null : wilson(b.tp, nPrecision),
-      countErr: b.repN ? +(b.repAbs / b.repN).toFixed(2) : null,
+      // PLAN §13.4 的口径是「每 20 次的绝对误差」，不是「每次的平均误差」：
+      // 每次平均会让 want 10/got 20（多算一倍）和 want 3/got 0（完全漏数）都只记 1.0，
+      // --max-count-err 1 就把这两种灾难放过去了。按 20 次折算后它们都是 20。
+      countErr: b.repN ? +((b.repAbs / b.repN) * 20).toFixed(2) : null,
     });
   }
   return rows;
@@ -855,16 +1159,27 @@ export function temporalStats(clips) {
 /** 逐帧表：标注时对着视频看，比凭空猜时间点可靠得多 */
 export function toTimeline(frames, timeline, every = 1) {
   const lines = [];
-  lines.push('| 视频秒 | 帧 | 膝角 | 肘角 | 直立 | 腿竖 | 抬臂L/R | 抬臂3D | 姿态 | 计数(蹲/俯/掌) | 手臂 |');
-  lines.push('|---|---|---|---|---|---|---|---|---|---|---|');
-  const flagNames = ['armRaised', 'waving', 'crossed', 'onHips', 'armsOpen', 'bothHandsUp', 'handAtHead'];
+  lines.push('| 视频秒 | 帧 | 膝角 | 肘角 | 直立 | 腿竖 | 抬臂L/R | 抬臂3D | 姿态 | 计数(蹲/俯/掌/拿) | 手臂 | 手L | 手R |');
+  lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|');
+  if (!videoTimeMonotonic(frames)) {
+    lines.push('', '> ⚠ 这份导出包含多次视频循环，`video_time` 会回绕；「视频秒」列只用于定位，'
+      + '标注请用 `start/end`（ts 毫秒），否则 `evaluate` 会拒绝 `startSec/endSec`。', '');
+  }
+  // 手臂列直接列注册表里的全部 flag（§12.7 新增的 reach/carry/point/平举也要能看见，
+  // 否则人工标注时根本不知道它们什么时候成立）。
+  const flagNames = [...FLAG_IDS];
+  // 手势标注要看导出里的稳定结果（与评估器同一列），侧对帧也照原样显示，标的人自己判断
+  const handShape = (f, side) => {
+    const list = Array.isArray(f?.hands) ? f.hands : [];
+    return list.find((h) => h && h.handedness === side)?.shape ?? '—';
+  };
   for (let i = 0; i < timeline.length; i += every) {
     const r = timeline[i];
     const f = frames[i];
     const sec = Number.isFinite(f?.video_time) ? f.video_time.toFixed(2)
       : f ? ((f.ts - frames[0].ts) / 1000).toFixed(2) : '—';
     if (r.empty) {
-      lines.push(`| ${sec} | ${i} | — | — | — | — | — | (未检出) | — | — |`);
+      lines.push(`| ${sec} | ${i} | — | — | — | — | — | (未检出) | — | — | — | ${handShape(f, 'Left')} | ${handShape(f, 'Right')} |`);
       continue;
     }
     const s = r.sig;
@@ -874,7 +1189,8 @@ export function toTimeline(frames, timeline, every = 1) {
       + ` | ${n(s.leg_vertical, 2)} | ${n(s.armPose.elev_L)}/${n(s.armPose.elev_R)}`
       + ` | ${s.armPose.has_world ? `${n(s.armPose.elev_torso_L)}/${n(s.armPose.elev_torso_R)}` : '无'}`
       + ` | ${r.act.postureId || '—'}`
-      + ` | ${r.act.reps.squat}/${r.act.reps.pushup}/${r.act.reps.clap} | ${on} |`);
+      + ` | ${r.act.reps.squat}/${r.act.reps.pushup}/${r.act.reps.clap}/${r.act.reps.grasp} | ${on}`
+      + ` | ${handShape(f, 'Left')} | ${handShape(f, 'Right')} |`);
   }
   return lines.join('\n');
 }
@@ -908,6 +1224,9 @@ function fitThresholds(labelsByClip, timelines, framesByClip) {
     reach_head_R: (s) => s.armPose.reach_head_R,
     reach_L: (s) => s.armPose.reach_L,
     reach_R: (s) => s.armPose.reach_R,
+    // §12.7：前/侧平举的方位角阈值靠这一列拟合（只在手臂接近水平时有意义）
+    azimuth_L: (s) => s.armPose.azimuth_L,
+    azimuth_R: (s) => s.armPose.azimuth_R,
     hands_close: (s) => s.armPose.hands_close,
   };
 
@@ -928,6 +1247,8 @@ function fitThresholds(labelsByClip, timelines, framesByClip) {
       // 混进来会把 P5/P95 拉向反例（例如 `!onHips` 里自然下垂的臂距）。
       const parsed = parseSegment(seg);
       if (!parsed.expect) continue;
+      // 手势段与信号分位无关（它度量的是手型判定，不是姿态信号），跳过以免混进 gesture/… 桶
+      if (parsed.action === GESTURE) continue;
       let range;
       try { range = resolveRange(seg, frames); } catch { continue; }
       // 计数段的分位同样要统计：深蹲下阈就看这一段里膝角的低分位
@@ -970,6 +1291,7 @@ function baselineRows(raw) {
 export function evaluateGates(summary, opts = {}) {
   const {
     minRecall = null, minPrecision = null, maxCountErr = null, maxDrop = 0.05, baseline = null,
+    gestureRows = null, minGestureRecall = null, maxGestureAbstain = null,
   } = opts;
   const violations = [];
   for (const row of summary || []) {
@@ -981,6 +1303,31 @@ export function evaluateGates(summary, opts = {}) {
     }
     if (row.countErr !== null && Number.isFinite(maxCountErr) && row.countErr > maxCountErr) {
       violations.push({ action: row.action, metric: 'countErr', value: row.countErr, threshold: maxCountErr, kind: 'max' });
+    }
+  }
+  // 手势门槛只有在数据里真的标了手势段时才判；否则空素材会「全绿」——那是最坏的绿灯
+  const gestureGate = Number.isFinite(minGestureRecall) || Number.isFinite(maxGestureAbstain);
+  if (gestureGate) {
+    const rows = (gestureRows && gestureRows.shapes) || [];
+    if (!rows.length) {
+      violations.push({
+        action: GESTURE, metric: 'gestureRecall', kind: 'missing',
+        threshold: minGestureRecall, message: '门槛需要带手势标注的素材',
+      });
+    }
+    for (const row of rows) {
+      if (Number.isFinite(minGestureRecall) && row.recall !== null && row.recall < minGestureRecall) {
+        violations.push({
+          action: row.shape, metric: 'gestureRecall', value: row.recall,
+          threshold: minGestureRecall, kind: 'min',
+        });
+      }
+      if (Number.isFinite(maxGestureAbstain) && row.abstainRate !== null && row.abstainRate > maxGestureAbstain) {
+        violations.push({
+          action: row.shape, metric: 'gestureAbstain', value: row.abstainRate,
+          threshold: maxGestureAbstain, kind: 'max',
+        });
+      }
     }
   }
   if (baseline) {
@@ -1001,11 +1348,14 @@ export function evaluateGates(summary, opts = {}) {
     }
   }
   const configured = Number.isFinite(minRecall) || Number.isFinite(minPrecision)
-    || Number.isFinite(maxCountErr) || !!baseline;
+    || Number.isFinite(maxCountErr) || !!baseline || gestureGate;
   return {
     configured,
     passed: violations.length === 0,
-    thresholds: { minRecall, minPrecision, maxCountErr, maxDrop, baseline: !!baseline },
+    thresholds: {
+      minRecall, minPrecision, maxCountErr, maxDrop, baseline: !!baseline,
+      minGestureRecall, maxGestureAbstain,
+    },
     violations,
   };
 }
@@ -1151,10 +1501,26 @@ function signalLabel(signals) {
 function expectationText(s) {
   if (s.type === 'rep') return `期望 ${s.want} 次，实测 ${s.got} 次`;
   if (s.type === 'unknown') return `未知动作名 ${s.action}`;
+  if (s.type === 'gesture') {
+    if (s.error) return s.error;
+    const hand = s.hand === 'ANY' ? '任意手' : s.hand;
+    return s.expect
+      ? `期望 ${s.shape}（${hand}）：${s.stats.decided} 帧可判定，命中 ${s.stats.hits}，需 ≥${(s.minRatio * 100).toFixed(0)}%`
+      : `不应出现 ${s.shape}（${hand}），实测 ${s.stats.active} 帧`;
+  }
   return s.expect ? '期望出现，实测未出现' : '期望不出现，实测出现';
 }
 
 function evidenceText(s) {
+  if (s.type === 'gesture' && !s.error) {
+    const st = s.stats;
+    const parts = [];
+    if (st.unknown) parts.push(`unknown×${st.unknown}`);
+    if (st.edge) parts.push(`侧对×${st.edge}`);
+    if (st.unattributed) parts.push(`未归属×${st.unattributed}`);
+    if (st.noHand) parts.push(`未检出×${st.noHand}`);
+    return parts.length ? parts.join(', ') : (s.reason || '—');
+  }
   if (!s.expect) {
     const parts = [];
     if (s.fail?.falseAlarms?.length) parts.push(s.fail.falseAlarms.join(', '));
@@ -1176,13 +1542,44 @@ const fmtRate = (p, ci, n) => {
 const fmtDelta = (d) => (d === null || d === undefined ? '—' : (d > 0 ? `+${d}` : `${d}`));
 const fmtPct = (f) => `${f > 0 ? '+' : ''}${(f * 100).toFixed(0)}%`;
 
+/**
+ * 手势（帧级）。与按段汇总分开：分母是「有可用判定的帧」，
+ * unknown / 侧对 / 未归属 / 未检出是弃权——不进分母，但必须列出来。
+ * 帧与帧高度相关，所以只报点估计和样本量，不报置信区间（报了会假装独立）。
+ */
+function renderGestures(g, lines) {
+  if (!g || !g.shapes.length) return;
+  lines.push('## 手势（帧级）', '');
+  lines.push('| 手势 | 判定帧 | 命中 | recall | 误报帧 | precision | unknown | 侧对排除 | 未归属 | 未检出 |');
+  lines.push('|---|---|---|---|---|---|---|---|---|---|');
+  for (const r of g.shapes) {
+    lines.push(`| ${r.shape} | ${r.decidedPos} | ${r.hits} | ${r.recall ?? '—'} | ${r.fp} | ${r.precision ?? '—'}`
+      + ` | ${r.unknown} | ${r.edge} | ${r.unattributed} | ${r.noHand} |`);
+  }
+  const a = g.attribution;
+  const notes = [];
+  // 只标了 none 的素材没有手势段，归属统计全是 0；那条 0/0 的行只会误导
+  if (a.hands) {
+    notes.push(`- 手-人归属：只手实例 ${a.hands}，归属目标人 ${a.attributed}`
+      + `${a.rate === null ? '' : `（${(a.rate * 100).toFixed(0)}%）`}，未归属 ${a.unattributed}`
+      + `${a.multiPersonFrames ? `；多人帧 ${a.multiPersonFrames}` : ''}`);
+  }
+  notes.push(g.segments
+    ? `- 共 ${g.segments} 个手势段；分母是「有可用判定」的帧，弃权不算错。`
+    : '- 没有 gesture 段；本节只统计 none 段窗口内被判出的手势（误报）。');
+  notes.push('- 帧与帧高度相关，这里只报点估计与样本量，不报置信区间。');
+  lines.push('', ...notes, '');
+}
+
 function renderGates(gates, lines) {
   if (!gates?.configured) return;
   const t = gates.thresholds;
   const rules = [];
   if (Number.isFinite(t.minRecall)) rules.push(`recall ≥ ${t.minRecall}`);
   if (Number.isFinite(t.minPrecision)) rules.push(`precision ≥ ${t.minPrecision}`);
-  if (Number.isFinite(t.maxCountErr)) rules.push(`计数误差 ≤ ${t.maxCountErr}`);
+  if (Number.isFinite(t.maxCountErr)) rules.push(`计数误差（每 20 次） ≤ ${t.maxCountErr}`);
+  if (Number.isFinite(t.minGestureRecall)) rules.push(`手势 recall ≥ ${t.minGestureRecall}`);
+  if (Number.isFinite(t.maxGestureAbstain)) rules.push(`手势弃权率 ≤ ${t.maxGestureAbstain}`);
   if (t.baseline) rules.push(`相对 baseline 下降 ≤ ${t.maxDrop}`);
   lines.push('## 门槛', '', `- ${rules.join('；')}`);
   lines.push(gates.passed ? '- ✅ 全部达标' : `- ❌ ${gates.violations.length} 项未达标`, '');
@@ -1190,8 +1587,10 @@ function renderGates(gates, lines) {
     lines.push('| 动作 | 指标 | 实测 | 门槛 | 来源 |');
     lines.push('|---|---|---|---|---|');
     for (const v of gates.violations) {
-      const src = v.kind === 'baseline' ? `baseline ${v.baseline}` : v.kind === 'min' ? '绝对门槛' : '上限';
-      lines.push(`| ${v.action} | ${v.metric} | ${v.value} | ${v.threshold} | ${src} |`);
+      const src = v.kind === 'baseline' ? `baseline ${v.baseline}`
+        : v.kind === 'missing' ? '缺少数据'
+          : v.kind === 'min' ? '绝对门槛' : '上限';
+      lines.push(`| ${v.action} | ${v.metric} | ${v.value ?? '—'} | ${v.threshold ?? '—'} | ${src} |`);
     }
     lines.push('');
   }
@@ -1241,7 +1640,7 @@ function renderGroups(groups, lines) {
     lines.push(`## 分组统计 · 按${title}`, '');
     for (const group of g.groups) {
       lines.push(`### ${group.name}（${group.clips} 段）`, '');
-      lines.push('| 动作 | recall [95%CI] (n) | precision [95%CI] (n) | 计数误差 |');
+      lines.push('| 动作 | recall [95%CI] (n) | precision [95%CI] (n) | 计数误差/20次 |');
       lines.push('|---|---|---|---|');
       for (const r of group.summary) {
         lines.push(`| ${r.action} | ${fmtRate(r.recall, r.recallCI, r.nRecall)}`
@@ -1304,7 +1703,7 @@ function renderSweep(sweep, lines) {
     lines.push('±20% 内没有任何动作的指标发生变化。', '');
     return;
   }
-  lines.push('| 值 | 倍率 | 动作 | recall | Δ | precision | Δ | 计数误差 | Δ |');
+  lines.push('| 值 | 倍率 | 动作 | recall | Δ | precision | Δ | 计数误差/20次 | Δ |');
   lines.push('|---|---|---|---|---|---|---|---|---|');
   for (const { v, d } of rows) {
     const action = d.removed ? `${d.action}（消失）` : d.action;
@@ -1329,7 +1728,7 @@ export function toMarkdown(report) {
   lines.push(`- 生成时间：${new Date().toISOString()}`, '');
 
   lines.push('## 按动作汇总', '');
-  lines.push('| 动作 | TP | FN | FP | recall [95%CI] (n) | precision [95%CI] (n) | 计数误差/次 |');
+  lines.push('| 动作 | TP | FN | FP | recall [95%CI] (n) | precision [95%CI] (n) | 计数误差/20次 |');
   lines.push('|---|---|---|---|---|---|---|');
   for (const r of report.summary) {
     lines.push(`| ${r.action} | ${r.tp} | ${r.fn} | ${r.fp}`
@@ -1341,6 +1740,7 @@ export function toMarkdown(report) {
     '> 区间是 Wilson 95%，段之间并不独立，所以是近似——但 n=3 时它不会让你以为 100% 是真的。', '');
 
   renderGates(report.gates, lines);
+  renderGestures(report.gestures, lines);
   renderConfusion(report.confusion, lines);
   renderGroups(report.groups, lines);
   renderTemporal(report.temporal, lines);
@@ -1399,7 +1799,7 @@ export function toCompareMarkdown(report) {
   lines.push(`- 生成时间：${new Date().toISOString()}`, '');
 
   lines.push('## 指标差异（Δ = B − A）', '');
-  lines.push('| 动作 | recall A | B | Δ | precision A | B | Δ | 计数误差 A | B | Δ |');
+  lines.push('| 动作 | recall A | B | Δ | precision A | B | Δ | 计数误差/20次 A | B | Δ |');
   lines.push('|---|---|---|---|---|---|---|---|---|---|');
   for (const d of report.deltas) {
     lines.push(`| ${d.action} | ${d.recallA ?? '—'} | ${d.recallB ?? '—'} | ${fmtDelta(d.recallDelta)}`
@@ -1428,10 +1828,14 @@ export function toCompareMarkdown(report) {
 // 人工标注最贵的部分不是判断对错，而是「在时间轴上把起止秒数写出来」。
 // 这一步交给当前规则生成，人只改边界、删误报、补反例。
 
-/** 区间 → labels 的时间写法：有 video_time 用秒（对着播放器好读），否则用 ts 毫秒。 */
+/**
+ * 区间 → labels 的时间写法：有 video_time 用秒（对着播放器好读），否则用 ts 毫秒。
+ * 循环素材的 video_time 会回绕，秒数无法唯一映射 → 一律退回 ts，
+ * 这样 evaluate.resolveRange 才能用 start/end 正确解析草稿。
+ */
 function timeFields(frames, startTs, endTs) {
   const withVideo = frames.filter((f) => Number.isFinite(f.video_time));
-  if (withVideo.length) {
+  if (withVideo.length && videoTimeMonotonic(frames)) {
     const secAt = (ts) => {
       const hit = withVideo.find((f) => f.ts >= ts) || withVideo[withVideo.length - 1];
       return Math.round(hit.video_time * 100) / 100;
@@ -1589,6 +1993,7 @@ function runEvaluation(loaded, params, { confusion = true } = {}) {
     clips, timelines, clipLabels, clipFrames, totalFrames,
     confusion: confusion ? { postures: mergeConfusions(confusions), arms: mergeArms(arms) } : null,
     temporal: temporalStats(clips),
+    gestures: gestureSummaryIfAny(clips),
   };
 }
 
@@ -1621,7 +2026,8 @@ function runSweep(loaded, profile, args, baseSummary = null) {
 async function runSingle(args, loaded, profile) {
   const run = runEvaluation(loaded, profile.params);
   const gatesWanted = args.minRecall !== null || args.minPrecision !== null
-    || args.maxCountErr !== null || !!args.baseline;
+    || args.maxCountErr !== null || !!args.baseline
+    || args.minGestureRecall !== null || args.maxGestureAbstain !== null;
   // 空素材 + 门槛 = 假通过。宁可报错，也不要让 CI 在"什么都没测"时给绿灯。
   if (gatesWanted && !run.clips.length) throw new Error('门槛需要带 labels 的素材');
   if (args.sweep && !run.clips.length) throw new Error('--sweep 需要带 labels 的素材');
@@ -1644,6 +2050,7 @@ async function runSingle(args, loaded, profile) {
     summary,
     confusion: run.confusion,
     temporal: run.temporal,
+    gestures: run.gestures,
     groups: {
       camera: groupSummaries(run.clips, 'camera'),
       subject: groupSummaries(run.clips, 'subject'),
@@ -1654,6 +2061,9 @@ async function runSingle(args, loaded, profile) {
       maxCountErr: args.maxCountErr,
       maxDrop: args.maxDrop,
       baseline,
+      gestureRows: run.gestures,
+      minGestureRecall: args.minGestureRecall,
+      maxGestureAbstain: args.maxGestureAbstain,
     }),
     sweep: args.sweep ? runSweep(loaded, profile, args, summary) : null,
     fit: args.fit ? fitThresholds(run.clipLabels, run.timelines, run.clipFrames) : null,
@@ -1733,6 +2143,8 @@ async function main() {
       args.minRecall !== null && '--min-recall',
       args.minPrecision !== null && '--min-precision',
       args.maxCountErr !== null && '--max-count-err',
+      args.minGestureRecall !== null && '--min-gesture-recall',
+      args.maxGestureAbstain !== null && '--max-gesture-abstain',
     ].filter(Boolean);
     if (unsupported.length) {
       throw new Error(`--compare 是信息性的对比，不支持：${unsupported.join('、')}`);

@@ -5,8 +5,9 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  validateManifest, coverageReport, buildManifestSkeleton, DEFAULT_THRESHOLDS,
+  validateManifest, coverageReport, buildManifestSkeleton, DEFAULT_THRESHOLDS, ACTIONS,
 } from './manifest-check.mjs';
+import { ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
 
 let pass = 0;
 let fail = 0;
@@ -69,6 +70,15 @@ console.log('\n[1] validateManifest');
   check('默认门槛是 40/20/2/2',
     DEFAULT_THRESHOLDS.minPos === 40 && DEFAULT_THRESHOLDS.minNeg === 20
     && DEFAULT_THRESHOLDS.minSubjects === 2 && DEFAULT_THRESHOLDS.minCameras === 2);
+
+  // 覆盖度报表的动作清单必须覆盖注册表：§12.7 新增的 5 个手臂动作与 grasp
+  // 曾在 manifest-check 里漏掉，标注它们会被当成「未知动作」。
+  check('覆盖度清单包含每个手臂动作',
+    ARM_ACTIONS.every((a) => ACTIONS.includes(a.flag)),
+    `missing=${ARM_ACTIONS.map((a) => a.flag).filter((f) => !ACTIONS.includes(f))}`);
+  check('覆盖度清单包含每个计数动作',
+    REP_ACTIONS.every((r) => ACTIONS.includes(r.id)),
+    `missing=${REP_ACTIONS.map((r) => r.id).filter((id) => !ACTIONS.includes(id))}`);
 }
 
 // —— 2. 覆盖度 ——

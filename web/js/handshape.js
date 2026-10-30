@@ -24,6 +24,10 @@ export const SHAPE_LABELS = {
   unknown: '—',
 };
 
+// 可被标注/评估的手势（去掉表示「判不出」的 unknown）。
+// 评估器的 labels 校验从这里派生，新增手势只需改 SHAPE_LABELS。
+export const SHAPE_IDS = Object.keys(SHAPE_LABELS).filter((k) => k !== 'unknown');
+
 /**
  * 手势去抖：连续 N 帧命中同一手势才切换。
  * 没有它，「张开」和「剪刀手」在阈值附近会来回闪（PLAN §12.1 的「手势偶尔串」就是它）。
