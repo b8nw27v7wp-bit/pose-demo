@@ -8,6 +8,7 @@ import { angleDeg, angleDeg3, OneEuro, Hold, RepCounter, PhaseSequence, SignalEn
 import { ActionEngine, ARM_ACTIONS } from '../js/actions.js';
 import { classifyHand, HandShapeStabilizer } from '../js/handshape.js';
 import { toHands, handOrientation, spreadRatio } from '../js/handformat.js';
+import { wristRoiBox, offsetHand, wristsToRetry, nearestWristSide } from '../js/handroi.js';
 import { summarize, quantile, overlapCoefficient } from '../js/stats.js';
 
 let pass = 0;
@@ -942,9 +943,16 @@ console.log('\n[22] 拿取与手臂扩展');
   });
   const ae9 = new ActionEngine();
   let t9 = 0; let r9;
-  for (let i = 0; i < 3; i++) r9 = ae9.update(frontSig, t9 += 100, hands('open', null));
+  for (let i = 0; i < 5; i++) r9 = ae9.update(frontSig, t9 += 100, hands('open', null));
   check('方位角在正前方 → 前平举', r9.flags.armFront === true);
   check('方位角在正前方 → 不是侧平举', r9.flags.armSide === false);
+
+  // 走路摆臂的瞬时命中：一帧真、随后恢复，不能闪出「前平举」
+  const ae10 = new ActionEngine();
+  let t10 = 0; let r10;
+  r10 = ae10.update(frontSig, t10 += 100, hands('open', null));
+  r10 = ae10.update(mkSig(), t10 += 100, hands('open', null));
+  check('前平举瞬时命中不输出（需保持 300ms）', r10.flags.armFront === false);
 }
 
 // —— 23. PhaseSequence 原语（拿取状态机的地基）——
@@ -977,11 +985,13 @@ console.log('\n[23] PhaseSequence');
 // —— 24. 前平举 / 侧平举：方位角必须配「手臂接近水平」——
 console.log('\n[24] 平举方位');
 {
+  // 2D 腕点放在肩高度：平举时腕与肩同高，这是真实投影的几何关系；
+  // 旧的合成数据把腕放在 y=200（髋旁），和 world 里「水平前伸」自相矛盾。
   const kp = [
     [100, 50, 1],
     [90, 100, 1], [110, 100, 1],
     [85, 150, 1], [115, 150, 1],
-    [80, 200, 1], [120, 200, 1],
+    [80, 100, 1], [120, 100, 1],
     [92, 220, 1], [108, 220, 1],
     [90, 300, 1], [110, 300, 1],
     [88, 380, 1], [112, 380, 1],
@@ -1013,6 +1023,15 @@ console.log('\n[24] 平举方位');
   const front = new SignalEngine().update(person2(mkWorld([-0.16, -0.48, -0.5], [0.16, -0.8, -0.5])), 1000);
   check('水平前伸 → 前平举', front.armPose.arm_front_L === true,
     `azim=${front.armPose.azimuth_L?.toFixed(0)} elev=${front.armPose.elev_torso_L?.toFixed(0)}`);
+
+  // 3D 方位角说「水平前伸」、2D 腕却垂在髋旁：走路摆臂的真实形态，不能判成前平举
+  const kpHang = kp.map((p, i) => (i === 5 ? [80, 200, 1] : i === 6 ? [120, 200, 1] : p));
+  const hang2 = new SignalEngine().update({
+    kp: kpHang, kp_world: mkWorld([-0.16, -0.48, -0.5], [0.16, -0.8, -0.5]),
+    kp_raw: [], bbox: [0, 0, 1, 1], scale: 120, score: 0.92,
+  }, 1000);
+  check('3D 说水平但 2D 腕在髋旁 → 不算前平举', hang2.armPose.arm_front_L === false,
+    `elev_torso=${hang2.armPose.elev_torso_L?.toFixed(0)} wristY=${hang2.kp[5][1]}`);
 }
 
 // —— 22. R3：3D 信号（角度 / 直立度 / 腿竖直 / 比值）与 2D 退回 ——
@@ -1186,6 +1205,142 @@ console.log('\n[25] 分布统计');
   check('完全分离分布重合度 ≈ 0', overlapCoefficient([0, 1], [100, 101]) < 0.2);
   const st = summarize([1, 2, 3, 4]);
   check('summarize n / 均值 / 分位', st.n === 4 && near(st.mean, 2.5, 1e-9) && near(st.p50, 2.5, 1e-9));
+}
+
+// —— 26. 上半身构图（髋/腿在画面外）——
+// 桌面摄像头最常见的就是这种画面：头、肩、手臂可见，髋以下出画。
+// 旧逻辑里 visTorso 取肩/髋四点 min，髋≈0.05 → ok=false → 动作层整段冻结，
+// 连举手/挥手都输出不了；姿态也因为没有膝/踝信号永远为 null。
+console.log('\n[26] 上半身构图');
+{
+  const upperKp = [
+    [320, 80, 0.95],                     // nose
+    [250, 160, 0.95], [390, 160, 0.95],  // shoulders：宽 140px
+    [230, 260, 0.9], [410, 260, 0.9],    // elbows
+    [220, 360, 0.9], [420, 360, 0.9],    // wrists
+    [270, 420, 0.05], [370, 420, 0.05],  // hips：模型猜的，几乎不可见
+    [265, 700, 0.02], [375, 700, 0.02],  // knees
+    [260, 900, 0.01], [380, 900, 0.01],  // ankles
+  ];
+  const se = new SignalEngine();
+  const s = se.update(person(upperKp, 0.9), 1000);
+  check('上半身构图 ok=true（髋不可见不再冻结整帧）', s.ok === true, `ok=${s.ok}`);
+  check('直立度退回鼻→肩轴',
+    s.uprightness_source === 'head' && near(s.uprightness, 1, 0.05),
+    `src=${s.uprightness_source} up=${s.uprightness?.toFixed(3)}`);
+  check('尺度改用肩宽×1.4', near(s.scale, 140 * 1.4, 8), `scale=${s.scale.toFixed(1)}`);
+  check('腿竖直比仍是 NaN（没有腿）', Number.isNaN(s.leg_vertical),
+    `leg_v=${s.leg_vertical}`);
+  check('髋不可见时不判叉腰（腕贴"猜出来的髋"不算）', s.armPose.on_hips === false);
+  check('胸前高度仍可用（髋按肩下方一个躯干长补）', s.armPose.chest_height === true);
+
+  // 同一构图下举手也要成立——这是这类机位最常用的动作
+  const raisedKp = upperKp.map((p, i) => (i === 5 ? [220, 60, 0.9] : p));
+  const se2 = new SignalEngine();
+  const ae = new ActionEngine();
+  let act = null;
+  for (let i = 0; i <= 6; i++) {
+    act = ae.update(se2.update(person(raisedKp, 0.9), 1000 + i * 100), 1000 + i * 100);
+  }
+  check('上半身构图能判举手', act.flags.armRaised === true);
+  check('上半身构图不硬凑站/坐姿态', act.postureId === null, `posture=${act.postureId}`);
+}
+
+// —— 27. 腕部 ROI 补检的几何 ——
+// 全身构图里整帧手部检测 0 命中（实测），靠这两个纯函数把裁图和坐标回映射做对。
+console.log('\n[27] 腕部 ROI');
+{
+  const b = wristRoiBox({ x: 200, y: 200, scale: 100 }, { mul: 1.8 }, { w: 500, h: 500 });
+  check('框以腕点为中心，边长 = 躯干长×1.8',
+    near(b.w, 180, 1e-9) && near(b.x, 110, 1e-9) && near(b.y, 110, 1e-9),
+    JSON.stringify(b));
+  const edge = wristRoiBox({ x: 5, y: 495, scale: 100 }, { mul: 1.8 }, { w: 500, h: 500 });
+  check('贴边时整体挪进画面（大小不变）',
+    edge.w === 180 && edge.x === 0 && edge.y === 320, JSON.stringify(edge));
+  const capped = wristRoiBox({ x: 2000, y: 2000, scale: 4000 }, { mul: 1.8, maxPx: 480 }, { w: 300, h: 300 });
+  check('不超出画面，也不超过 maxPx', capped.w === 300 && capped.x === 0 && capped.y === 0, JSON.stringify(capped));
+  const small = wristRoiBox({ x: 200, y: 200, scale: 10 }, { mul: 1.8, minPx: 64 }, { w: 500, h: 500 });
+  check('小手（远景）抬到 minPx，放大后模型才看得清', small.w === 64, JSON.stringify(small));
+  check('没有尺度 → null（不瞎裁）', wristRoiBox({ x: 1, y: 1, scale: NaN }) === null);
+
+  const hand = {
+    kp: [[0, 0, 0], [10, 20, 0]], bbox: [0, 0, 10, 20], scale: 25,
+    orient: { facing: 'front' }, spread: 42,
+  };
+  const moved = offsetHand(hand, 100, 50);
+  check('裁剪坐标回映射到整帧',
+    moved.kp[0][0] === 100 && moved.kp[0][1] === 50
+    && moved.kp[1][0] === 110 && moved.kp[1][1] === 70
+    && moved.bbox[0] === 100 && moved.bbox[3] === 70,
+    JSON.stringify({ kp: moved.kp, bbox: moved.bbox }));
+  check('回映射不动尺度与朝向字段', moved.scale === 25 && moved.orient === hand.orient && moved.spread === hand.spread);
+
+  const wrists = [
+    { side: 'L', vis: 0.9 }, { side: 'R', vis: 0.1 },
+  ];
+  const retry = wristsToRetry(wrists, new Set(['L']), 0.3);
+  check('只补检「没检出且可见」的手', retry.length === 0, `n=${retry.length}`);
+  const retry2 = wristsToRetry(wrists, new Set(), 0.3);
+  check('腕点可见性不足不补检', retry2.length === 1 && retry2[0].side === 'L', JSON.stringify(retry2));
+
+  // 双手靠得近时，裁右腕的框里可能只检出左手：归属判据必须能识破
+  const wristPts = [
+    { side: 'L', x: 270, y: 142 },
+    { side: 'R', x: 232, y: 186 },
+  ];
+  check('检出腕点靠近左腕 → 左', nearestWristSide(263, 140, wristPts) === 'L');
+  check('检出腕点靠近右腕 → 右', nearestWristSide(240, 190, wristPts) === 'R');
+  check('没有腕点 → null', nearestWristSide(1, 1, []) === null);
+}
+
+// —— 28. 稳健性：角度突变剔除 / 换侧滞回 / 换侧中止计数 / 不可靠原因 ——
+console.log('\n[28] 稳健性');
+{
+  // 单帧坏点：角速度 > 1500°/s 且间隔 ≤ 250ms → 本帧不给角度
+  const seJump = new SignalEngine();
+  seJump._smoothAngle('t', 170, 1.0);
+  check('单帧角度突变被剔除（33ms 内跳 110° ≈ 3333°/s）',
+    Number.isNaN(seJump._smoothAngle('t', 60, 1.033)), '3300°/s 的跳变没有被拦');
+  check('被剔除的角度进入本帧坏点清单', seJump.angleRejected.includes('t'));
+  check('持续超过 250ms 后接受新值',
+    Number.isFinite(seJump._smoothAngle('t', 60, 1.4)));
+  const seSmall = new SignalEngine();
+  seSmall._smoothAngle('t', 170, 1.0);
+  check('真实快速变化照常滤波（33ms 内 20° ≈ 606°/s）',
+    Number.isFinite(seSmall._smoothAngle('t', 150, 1.033)));
+
+  // 换侧滞回：两侧可见性小幅抖动时不换腿；差距明显才换
+  const setLegVis = (kp, l, r) => kp.map((p, i) => (
+    i === 7 || i === 9 || i === 11 ? [p[0], p[1], l]
+      : i === 8 || i === 10 || i === 12 ? [p[0], p[1], r] : p));
+  const seSide = new SignalEngine();
+  const pickSide1 = seSide.update(person(setLegVis(standKp, 0.70, 0.75)), 1000).knee_side;
+  const pickSide2 = seSide.update(person(setLegVis(standKp, 0.75, 0.70)), 1100).knee_side;
+  const pickSide3 = seSide.update(person(setLegVis(standKp, 0.95, 0.50)), 1200).knee_side;
+  check('初始选更可信的一侧', pickSide1 === 'R', `side=${pickSide1}`);
+  check('小幅反转不换侧（滞回）', pickSide2 === 'R', `side=${pickSide2}`);
+  check('差距明显才换侧', pickSide3 === 'L', `side=${pickSide3}`);
+
+  // 换侧中止计数：不允许拿两条腿拼起来的角度序列数周期
+  const aeSide = new ActionEngine();
+  let ts2 = 0;
+  aeSide.update(mkSig({ knee_side: 'L', knee_pick: 170 }), ts2);
+  aeSide.update(mkSig({ knee_side: 'L', knee_pick: 80 }), ts2 += 300);
+  const rSide = aeSide.update(mkSig({ knee_side: 'R', knee_pick: 165 }), ts2 += 700);
+  check('换侧时不凭空计一次深蹲',
+    rSide.reps.squat === 0 && rSide.unreliable.includes('side_switched'),
+    `squat=${rSide.reps.squat} unrel=${rSide.unreliable.join(',')}`);
+
+  // 不可靠原因：冻结帧与低置信都能被识别出来
+  const aeBad = new ActionEngine();
+  const rBad = aeBad.update(mkSig({ ok: false }), 1000);
+  check('冻结帧标注 low_confidence', rBad.unreliable.includes('low_confidence'));
+  const aeExt = new ActionEngine();
+  const rExt = aeExt.update(mkSig({ extrapolated_any: true }), 1000);
+  check('外推帧标注 extrapolated', rExt.unreliable.includes('extrapolated'), rExt.unreliable.join(','));
+  const aeOut = new ActionEngine();
+  const rOut = aeOut.update(mkSig({ angle_outliers: ['2d:knee_L'] }), 1000);
+  check('角度坏点帧标注 angle_outlier', rOut.unreliable.includes('angle_outlier'), rOut.unreliable.join(','));
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

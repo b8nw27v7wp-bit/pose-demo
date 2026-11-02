@@ -69,6 +69,8 @@ export class ActionEngine {
     this.reachHold = new Hold(this.cfg.holds.reach);
     this.carryHold = new Hold(this.cfg.holds.carry);
     this.pointHold = new Hold(this.cfg.holds.point);
+    this.frontHold = new Hold(this.cfg.holds.front);
+    this.sideHold = new Hold(this.cfg.holds.side);
     // 拿取 = 伸手 → 合手 → 收回/抬起。手部状态由调用方逐帧传入（见 update 的 hands 参数）
     this.graspSeq = new PhaseSequence(['reach', 'grasp'], {
       minPhaseMs: this.graspCfg.minPhaseMs,
@@ -84,6 +86,9 @@ export class ActionEngine {
     };
     this.postureSince = null;
     this.last = null;
+    // 上一帧选中的腿/臂：换侧时角度序列不连续，计数必须先中止（见 update）
+    this.lastKneeSide = null;
+    this.lastElbowSide = null;
   }
 
   reset() {
@@ -99,6 +104,8 @@ export class ActionEngine {
     this.reachHold.reset();
     this.carryHold.reset();
     this.pointHold.reset();
+    this.frontHold.reset();
+    this.sideHold.reset();
     this.graspSeq.reset();
     this.graspCount = 0;
     this.graspPhase = 'idle';
@@ -107,6 +114,8 @@ export class ActionEngine {
     this.reps.clap.reset();
     this.postureSince = null;
     this.last = null;
+    this.lastKneeSide = null;
+    this.lastElbowSide = null;
   }
 
   /**
@@ -137,6 +146,8 @@ export class ActionEngine {
         },
         gates: prev?.gates ?? { squat: false, pushup: false, clap: false },
         countBlocked: prev?.countBlocked ?? { squat: false, pushup: false, clap: false },
+        // 判定不可靠的原因：界面/导出据此提示「这一帧别太当真」
+        unreliable: ['low_confidence', ...(s.extrapolated_any ? ['extrapolated'] : [])],
         repPhase: {
           squat: this.reps.squat.phase,
           pushup: this.reps.pushup.phase,
@@ -225,6 +236,12 @@ export class ActionEngine {
     const pointing = this.pointHold.update(extended && (anyOpen || closedL || closedR)
       && (ap.arm_side_L || ap.arm_side_R || ap.arm_front_L || ap.arm_front_R), ts);
 
+    // 前/侧平举：信号层是瞬时布尔，这里补一个保持窗。
+    // 走路摆臂时 3D 方位角的噪声会断续命中，实测最长一段只有 250ms；
+    // 不加保持窗，界面会一直闪「前平举」。
+    const armFront = this.frontHold.update(!!(ap.arm_front_L || ap.arm_front_R), ts);
+    const armSide = this.sideHold.update(!!(ap.arm_side_L || ap.arm_side_R), ts);
+
     // 拿取状态机：reach（伸手且手张开）→ grasp（手合上）。两次都成立才算一次拿取。
     const observed = extended && anyOpen ? 'reach'
       : (extended && anyClosed ? 'grasp' : null);
@@ -233,6 +250,18 @@ export class ActionEngine {
     this.graspCount = step.count;
 
     // —— 计数类
+    // —— 换侧保护：膝角/肘角在左右两侧之间切换时，角度序列不连续。
+    // 拿不连续的角度去数周期，会在换侧那一帧凭空凑出一次「到顶/到底」，
+    // 深蹲/俯卧撑会多数一次或少计一次。换侧时中止当前半程，宁可漏这一帧也不数错。
+    const kneeSideNow = (s.knee_side === 'L' || s.knee_side === 'R') ? s.knee_side : null;
+    const elbowSideNow = (s.elbow_side === 'L' || s.elbow_side === 'R') ? s.elbow_side : null;
+    const kneeSwitched = !!(kneeSideNow && this.lastKneeSide && kneeSideNow !== this.lastKneeSide);
+    const elbowSwitched = !!(elbowSideNow && this.lastElbowSide && elbowSideNow !== this.lastElbowSide);
+    if (kneeSwitched) this.reps.squat.abort();
+    if (elbowSwitched) this.reps.pushup.abort();
+    if (kneeSideNow) this.lastKneeSide = kneeSideNow;
+    if (elbowSideNow) this.lastElbowSide = elbowSideNow;
+
     // 短时遮挡外推期间冻结计数：外推坐标是猜的，拿来数必然出错。
     // 按动作只冻结用到的那几个点，避免左手被挡就全都不数。
     const ext = new Set(s.extrapolated || []);
@@ -265,12 +294,20 @@ export class ActionEngine {
       flags: {
         armRaised, waving, crossed, onHips, armsOpen, bothHandsUp, handAtHead,
         reaching, carrying, pointing,
-        armFront: ap.arm_front_L || ap.arm_front_R,
-        armSide: ap.arm_side_L || ap.arm_side_R,
+        armFront,
+        armSide,
       },
       reps: { squat: squatCount, pushup: pushupCount, clap: clapCount, grasp: this.graspCount },
       gates: { squat: squatGate, pushup: pushupGate, clap: clapGate },
       countBlocked: { squat: squatBlocked, pushup: pushupBlocked, clap: clapBlocked },
+      // 判定不可靠的原因：界面/导出据此提示「这一帧别太当真」
+      unreliable: [
+        ...(s.extrapolated_any ? ['extrapolated'] : []),
+        ...(kneeSwitched || elbowSwitched ? ['side_switched'] : []),
+        ...(s.world?.bones && Object.values(s.world.bones).some((v) => v === false)
+          ? ['bone_blocked'] : []),
+        ...(s.angle_outliers?.length ? ['angle_outlier'] : []),
+      ],
       repPhase: {
         squat: this.reps.squat.phase,
         pushup: this.reps.pushup.phase,

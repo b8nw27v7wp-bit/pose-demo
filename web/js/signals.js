@@ -406,10 +406,21 @@ export class SignalEngine {
     this.kpFilter = new KpFilter(p.smoothing, p.visMin, p.occlusion.maxExtrapMs);
     this.angleOpts = { minCutoff: p.smoothing.angleCutoff, beta: p.smoothing.angleBeta };
     this.angleFilters = {};
+    this.angleLast = {};       // 每个角度上一次的有效原始值（用于突变剔除）
+    this.angleOutliers = {};   // 被剔除的帧数（诊断用）
+    this.angleRejected = [];   // 本帧被剔除的角度名（动作层 → unreliable）
+    this.angleJump = p.angleJump;
+    this.sideHyst = p.sideHysteresis;
+    this.prevKneeSide = null;  // 上一帧选中的腿/臂，供滞回使用
+    this.prevElbowSide = null;
     this.scaleWin = new MedianWindow(p.scaleMedianFrames);
     this.scaleWorldWin = new MedianWindow(p.scaleMedianFrames);
+    // 髋不可信时用肩宽换算躯干长；lastScale 记住最后一次可信的躯干长（肩也侧对镜头时兜底）
+    this.shoulderToTorso = p.shoulderToTorso;
+    this.lastScale = 0;
     this.upFilter2 = new OneEuro(p.smoothing.upright);
     this.upFilter3 = new OneEuro(p.smoothing.upright);
+    this.upFilterHead2 = new OneEuro(p.smoothing.upright);
     this.velCfg = p.velocity;
     this.velFilters = {};
     this.velState = {};
@@ -423,10 +434,17 @@ export class SignalEngine {
   reset() {
     this.kpFilter.reset();
     this.angleFilters = {};
+    this.angleLast = {};
+    this.angleOutliers = {};
+    this.angleRejected = [];
+    this.prevKneeSide = null;
+    this.prevElbowSide = null;
     this.scaleWin.reset();
     this.scaleWorldWin.reset();
+    this.lastScale = 0;
     this.upFilter2.reset();
     this.upFilter3.reset();
+    this.upFilterHead2.reset();
     this.velFilters = {};
     this.velState = {};
     this.wristHist = { L: [], R: [] };
@@ -435,6 +453,22 @@ export class SignalEngine {
 
   _smoothAngle(name, value, tSec) {
     if (!this.angleFilters[name]) this.angleFilters[name] = new OneEuro(this.angleOpts);
+    // 单帧坏点剔除：挡住/漂移的关键点会让角度瞬间跳几十度。
+    // 与上次**有效**值比较；超时（> maxDtMs）说明新值持续存在，接受它。
+    // 注意：这里不沿用旧值冒充当前——返回 NaN，调用方按「本帧无角度」处理。
+    const st = this.angleLast[name];
+    if (Number.isFinite(value) && st && Number.isFinite(st.v)) {
+      const dtMs = (tSec - st.t) * 1000;
+      if (dtMs > 0 && dtMs <= this.angleJump.maxDtMs) {
+        const rate = Math.abs(value - st.v) / (dtMs / 1000);
+        if (rate > this.angleJump.maxRate) {
+          this.angleOutliers[name] = (this.angleOutliers[name] || 0) + 1;
+          this.angleRejected.push(name);
+          return NaN;
+        }
+      }
+    }
+    if (Number.isFinite(value)) this.angleLast[name] = { v: value, t: tSec };
     return this.angleFilters[name].filter(value, tSec);
   }
 
@@ -463,6 +497,7 @@ export class SignalEngine {
    */
   update(person, ts) {
     const tSec = ts / 1000;
+    this.angleRejected = [];   // 本帧的坏点清单（逐帧重置）
     const C = this.params;
     const WC = C.world;
     const { kp, extrapolated } = this.kpFilter.run(person.kp, tSec);
@@ -472,7 +507,10 @@ export class SignalEngine {
     // 可见性门控：不可见的点算出来的几何量是垃圾，必须给 NaN（NaN 参与比较恒为 false）
     const V = (name) => P(name)[2] ?? 0;
     const VIS_MIN = this.visMin;
-    const visTorso = Math.min(V('shoulder_L'), V('shoulder_R'), V('hip_L'), V('hip_R'));
+    // 肩/髋分开算：上半身构图里髋常在画面外，把两者取 min 会让每一帧都「躯干不可见」。
+    const visShoulder = Math.min(V('shoulder_L'), V('shoulder_R'));
+    const visHip = Math.min(V('hip_L'), V('hip_R'));
+    const visTorso = Math.min(visShoulder, visHip);
     const visAnkle = Math.min(V('ankle_L'), V('ankle_R'));
     const visWristL = V('wrist_L');
     const visWristR = V('wrist_R');
@@ -480,9 +518,22 @@ export class SignalEngine {
     const shoulderMid = mid(P('shoulder_L'), P('shoulder_R'));
     const hipMid = mid(P('hip_L'), P('hip_R'));
     const ankleMid = mid(P('ankle_L'), P('ankle_R'));
+    const nose = P('nose');
 
-    // 尺度锚点：滤波 + 中值平滑后的躯干长，异常时退回检测层的值
+    // 尺度锚点：优先用躯干长（肩中点↔髋中点），滤波 + 中值平滑，异常时退回检测层的值。
+    // 上半身构图里髋点不可信（模型是猜的，位置会随躯干一起漂），躯干长会忽大忽小；
+    // 这时改用肩宽 × 人体比例（肩宽≈躯干长/1.4），它同样随距离缩放，量纲保持一致。
     let scale = Math.hypot(shoulderMid[0] - hipMid[0], shoulderMid[1] - hipMid[1]);
+    if (visHip < this.minTorsoVis) {
+      const shoulderW = Math.hypot(
+        P('shoulder_L')[0] - P('shoulder_R')[0],
+        P('shoulder_L')[1] - P('shoulder_R')[1],
+      );
+      if (shoulderW > 5) scale = shoulderW * this.shoulderToTorso;
+      else if (this.lastScale > 0) scale = this.lastScale;
+    } else if (scale > 5) {
+      this.lastScale = scale;
+    }
     scale = this.scaleWin.push(scale);
     if (!(scale > 5)) scale = Math.max(person.scale, 1);
 
@@ -521,19 +572,37 @@ export class SignalEngine {
       if (finite3(aLW) && finite3(aRW)) ankleMidW = v3mid(aLW, aRW);
     }
 
-    // 直立度：躯干四点都得够可见（单点飘了，中点就在乱动）
+    // 直立度：优先用躯干轴（髋中点→肩中点），四点都得够可见（单点飘了，中点就在乱动）。
+    // 上半身构图里髋不可见时退回「鼻尖→肩中点」：直立/端坐时鼻在肩上方，躺卧时两者接近水平，
+    // 与躯干轴同向、同量纲。两条轴各自滤波，切换时不会出现台阶。
     const tvx = shoulderMid[0] - hipMid[0];
     const tvy = shoulderMid[1] - hipMid[1];
     const tlen2 = Math.hypot(tvx, tvy) || 1;
-    const up2d = this.upFilter2.filter(visTorso >= VIS_MIN ? -tvy / tlen2 : NaN, tSec);
-    let up3d = NaN;
-    if (w3 && torsoW && visTorso >= VIS_MIN) {
-      const tlen3 = v3norm(torsoW) || 1;
-      // 3D：躯干单位向量与重力轴（world −y，即 [0,-1,0]）的点积
-      const raw = -(torsoW[0] * GRAVITY_DOWN[0] + torsoW[1] * GRAVITY_DOWN[1]
-        + torsoW[2] * GRAVITY_DOWN[2]) / tlen3;
-      if (Number.isFinite(raw)) up3d = this.upFilter3.filter(raw, tSec);
+    let up2d = NaN;
+    let upSource = 'none';
+    if (visTorso >= VIS_MIN) {
+      up2d = this.upFilter2.filter(-tvy / tlen2, tSec);
+      upSource = 'torso';
+    } else if (visShoulder >= VIS_MIN && V('nose') >= VIS_MIN) {
+      const nx = nose[0] - shoulderMid[0];
+      const ny = nose[1] - shoulderMid[1];
+      const nl = Math.hypot(nx, ny) || 1;
+      up2d = this.upFilterHead2.filter(-ny / nl, tSec);
+      upSource = 'head';
     }
+    let up3d = NaN;
+    if (w3 && visTorso >= VIS_MIN) {
+      if (torsoW) {
+        const tlen3 = v3norm(torsoW) || 1;
+        // 3D：躯干单位向量与重力轴（world −y，即 [0,-1,0]）的点积
+        const raw = -(torsoW[0] * GRAVITY_DOWN[0] + torsoW[1] * GRAVITY_DOWN[1]
+          + torsoW[2] * GRAVITY_DOWN[2]) / tlen3;
+        if (Number.isFinite(raw)) up3d = this.upFilter3.filter(raw, tSec);
+      }
+    }
+    // 注意：上半身退路只用 2D 的鼻→肩轴，不做 3D 版本。
+    // 鼻尖在 3D 里明显位于肩平面之前（脸向前突出约 0.1m），世界坐标的「鼻→肩」向量
+    // 天然带一个大 z 分量，点积会系统性偏低（实测直立人只有 0.62），比 2D 更不能代表直立度。
     const uprightness = (WC.uprightness && Number.isFinite(up3d)) ? up3d : up2d;
 
     // 腿的竖直延伸：2D 用像素 scale；3D 用世界竖直投影 / 世界躯干长。
@@ -630,13 +699,20 @@ export class SignalEngine {
       : Number.isFinite(a) ? a : b);
 
     // 计数用的膝角/肘角：只在「角度有效」的一侧里挑可见性最高的；选中的那侧无效就退回另一侧
-    const pickSide = (l, r, visL, visR) => {
+    // 带滞回：上一帧选中的一侧仍然有效时，另一侧要明显更可信（≥ sideHysteresis）才换。
+    // 不设滞回时，两侧可见性在 0.7/0.72 之间抖动会让膝角在两条腿之间来回跳；
+    // 计数层拿到的是两条腿拼起来的角度序列，容易多数或漏数（见 actions.js 的换侧中止）。
+    const pickSide = (l, r, visL, visR, prevSide = null) => {
       const cand = [
         { side: 'L', v: l, vis: visL },
         { side: 'R', v: r, vis: visR },
       ].filter((c) => Number.isFinite(c.v));
-      cand.sort((a, b) => b.vis - a.vis);
-      return cand.length ? cand[0] : { side: 'L', v: NaN, vis: 0 };
+      if (!cand.length) return { side: prevSide || 'L', v: NaN, vis: 0 };
+      let best = cand[0];
+      for (const c of cand) if (c.vis > best.vis) best = c;
+      const prev = prevSide ? cand.find((c) => c.side === prevSide) : null;
+      if (prev && best.side !== prev.side && best.vis - prev.vis < this.sideHyst) return prev;
+      return best;
     };
 
     const kneeVisL = visOf(['hip_L', 'knee_L', 'ankle_L']);
@@ -644,16 +720,19 @@ export class SignalEngine {
     const elbowVisL = visOf(['shoulder_L', 'elbow_L', 'wrist_L']);
     const elbowVisR = visOf(['shoulder_R', 'elbow_R', 'wrist_R']);
 
-    const kneeSel = pickSide(angles.knee_L, angles.knee_R, kneeVisL, kneeVisR);
-    const elbowSel = pickSide(angles.elbow_L, angles.elbow_R, elbowVisL, elbowVisR);
+    const kneeSel = pickSide(angles.knee_L, angles.knee_R, kneeVisL, kneeVisR, this.prevKneeSide);
+    const elbowSel = pickSide(angles.elbow_L, angles.elbow_R, elbowVisL, elbowVisR, this.prevElbowSide);
     const kneeSide = kneeSel.side;
     const kneePick = kneeSel.v;
     const elbowSide = elbowSel.side;
     const elbowPick = elbowSel.v;
-    const kneePick2d = pickSide(angles2d.knee_L, angles2d.knee_R, kneeVisL, kneeVisR).v;
-    const kneePick3d = pickSide(angles3d.knee_L, angles3d.knee_R, kneeVisL, kneeVisR).v;
-    const elbowPick2d = pickSide(angles2d.elbow_L, angles2d.elbow_R, elbowVisL, elbowVisR).v;
-    const elbowPick3d = pickSide(angles3d.elbow_L, angles3d.elbow_R, elbowVisL, elbowVisR).v;
+    // 诊断用的 2D/3D 版本跟随同一侧，保证和判定侧可比
+    const kneePick2d = pickSide(angles2d.knee_L, angles2d.knee_R, kneeVisL, kneeVisR, this.prevKneeSide).v;
+    const kneePick3d = pickSide(angles3d.knee_L, angles3d.knee_R, kneeVisL, kneeVisR, this.prevKneeSide).v;
+    const elbowPick2d = pickSide(angles2d.elbow_L, angles2d.elbow_R, elbowVisL, elbowVisR, this.prevElbowSide).v;
+    const elbowPick3d = pickSide(angles3d.elbow_L, angles3d.elbow_R, elbowVisL, elbowVisR, this.prevElbowSide).v;
+    this.prevKneeSide = kneeSide;
+    this.prevElbowSide = elbowSide;
 
     // 角速度（度/秒），用选中的那一侧
     const vel = {};
@@ -740,7 +819,6 @@ export class SignalEngine {
     }
 
     // 手在头部附近：腕到鼻尖够近，**且腕不低于肩太多**（走路时手臂前摆会经过脸前，只判距离会误报）
-    const nose = P('nose');
     const head2dL = (armUsableL && (V('nose') ?? 0) >= VIS_MIN) ? d2(wristL, nose) / scale : NaN;
     const head2dR = (armUsableR && (V('nose') ?? 0) >= VIS_MIN) ? d2(wristR, nose) / scale : NaN;
     const head3dL = (!armBlocked('L') && (V('nose') ?? 0) >= VIS_MIN)
@@ -787,10 +865,25 @@ export class SignalEngine {
     // 实测过没这道门控时，走路视频里 armFront 一直是 true。
     const horizontal = (elevT) => Number.isFinite(elevT)
       && elevT > azimCfg.minElev && elevT < azimCfg.maxElev;
-    const armFrontL = horizontal(elevTorsoL) && Math.abs(azimL) < azimCfg.frontMax;
-    const armFrontR = horizontal(elevTorsoR) && Math.abs(azimR) < azimCfg.frontMax;
-    const armSideL = horizontal(elevTorsoL) && Math.abs(azimL) > azimCfg.sideMin;
-    const armSideR = horizontal(elevTorsoR) && Math.abs(azimR) > azimCfg.sideMin;
+    // 腕必须在肩高度附近：3D 方位角/抬臂角在走路时噪声很大，单看 3D 会把自然摆臂
+    // 算成「前平举」（实测走路样例 41/60 帧误报）。自然下垂时腕在髋旁，约 1 个躯干长低于肩，
+    // 这道 2D 物理门便宜且稳，和 3D 判据是互补关系而不是重复。
+    const wristAtShoulder = (sh, wr) => wr[1] < sh[1] + 0.4 * scale;
+    // 手臂要基本伸直：弯着胳膊横在胸前时 3D 方位角也像「平举」，但腕-肩距离只有 0.5~0.8。
+    // 这里有 world 就用 3D 比值（前伸会 2D 透视缩短，2D 会把真平举也挡掉）。
+    const reachForArm = (r3, r2) => (Number.isFinite(r3) ? r3 : r2);
+    const armStraight = (side) => reachForArm(
+      side === 'L' ? reach3dL : reach3dR,
+      side === 'L' ? reachL : reachR,
+    ) > azimCfg.minReach;
+    const armFrontL = horizontal(elevTorsoL) && Math.abs(azimL) < azimCfg.frontMax
+      && wristAtShoulder(shL, wristL) && armStraight('L');
+    const armFrontR = horizontal(elevTorsoR) && Math.abs(azimR) < azimCfg.frontMax
+      && wristAtShoulder(shR, wristR) && armStraight('R');
+    const armSideL = horizontal(elevTorsoL) && Math.abs(azimL) > azimCfg.sideMin
+      && wristAtShoulder(shL, wristL) && armStraight('L');
+    const armSideR = horizontal(elevTorsoR) && Math.abs(azimR) > azimCfg.sideMin
+      && wristAtShoulder(shR, wristR) && armStraight('R');
 
     // 抱臂：两腕的左右顺序相对肩膀翻转（用顺序而不是固定符号，人转身背对镜头也成立）
     const shOrder = Math.sign(shL[0] - shR[0]) || 1;
@@ -836,7 +929,8 @@ export class SignalEngine {
       const flare = Number.isFinite(flare3) ? flare3 : elbowOut2d(sh, hip, el);
       return flare > C.arm.onHips.elbowFlare;
     };
-    const onHips = wristsVisible
+    // 髋不可见时髋点全是模型猜的，腕到「髋」的距离没有意义，直接不判叉腰。
+    const onHips = wristsVisible && visHip >= VIS_MIN
       && onHipsSide('L', shL, hipL, P('elbow_L'), V('elbow_L'))
       && onHipsSide('R', shR, hipR, P('elbow_R'), V('elbow_R'));
     // 张开双臂：两侧都接近水平且伸得够远。
@@ -848,19 +942,25 @@ export class SignalEngine {
       && elevCmpL > ow.minElev && elevCmpL < ow.maxElev
       && elevCmpR > ow.minElev && elevCmpR < ow.maxElev
       && reachL > ow.minReach && reachR > ow.minReach;
-    // 鼓掌门控：两腕在肩与髋之间（胸前），否则头顶合手也会被算
+    // 鼓掌门控：两腕在肩与髋之间（胸前），否则头顶合手也会被算。
+    // 髋不可见时把「髋」放到肩下方一个躯干长处（scale 的几何定义），门控仍然成立。
     const ch = C.arm.chest;
+    const hipY = visHip >= VIS_MIN ? hipMid[1] : shoulderMid[1] + scale;
     const chestHeight = wristsVisible
       && wristL[1] > shoulderMid[1] + ch.above * scale
-      && wristL[1] < hipMid[1] + ch.below * scale
+      && wristL[1] < hipY + ch.below * scale
       && wristR[1] > shoulderMid[1] + ch.above * scale
-      && wristR[1] < hipMid[1] + ch.below * scale;
+      && wristR[1] < hipY + ch.below * scale;
 
     const score = person.score ?? 0;
+    // 有效锚点：肩必须在画面里；髋可见时也要求可信。
+    // 上半身构图里髋在画面外，不能因为髋不可见就把整帧判成无效——那会让动作层一直冻结
+    // （实测头~胸构图髋可见性≈0.15 → ok=false → 举手/挥手/抱臂全部不输出）。
+    const visAnchor = visHip >= this.minTorsoVis ? visTorso : visShoulder;
 
     return {
       ts,
-      ok: score >= this.minScore && visTorso >= this.minTorsoVis,
+      ok: score >= this.minScore && visAnchor >= this.minTorsoVis,
       score,
       kp,
       scale,
@@ -884,6 +984,14 @@ export class SignalEngine {
       elbow_vel: elbowVel,
       angles_vel: vel,
       uprightness,
+      // 直立度用的是哪条轴：torso=躯干轴，head=鼻→肩（上半身构图），none=不可用
+      uprightness_source: upSource,
+      // 分组可见性：界面据此提示「下半身不在画面内」，不用再猜为什么没姿态
+      vis: {
+        shoulder: visShoulder, hip: visHip,
+        knee: Math.min(V('knee_L'), V('knee_R')),
+        ankle: visAnkle, nose: V('nose'),
+      },
       uprightness_2d: up2d,
       uprightness_3d: up3d,
       leg_vertical: legVertical,
@@ -895,6 +1003,8 @@ export class SignalEngine {
       // 短时遮挡按最后速度外推的点；动作层在这期间冻结计数
       extrapolated: extrapolated.slice(),
       extrapolated_any: extrapolated.length > 0,
+      // 本帧因角速度过大被剔除的角度名；动作层据此标 unreliable=angle_outlier
+      angle_outliers: this.angleRejected.slice(),
       world: {
         has_world: !!w3,
         enabled: !!WC.enabled,

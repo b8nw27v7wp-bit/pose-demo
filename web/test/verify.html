@@ -44,10 +44,18 @@ const log = (o) => { out.textContent = JSON.stringify(o, null, 2); window.__veri
 
 function sigOf(person, ts) {
   const se = new SignalEngine();
-  const sig = se.update(person, ts);
   const ae = new ActionEngine();
-  const act = ae.update(sig, ts);
+  let sig = null;
+  let act = null;
+  // 单张图片没有时间窗。直接把同一帧喂 12 次（合成 100ms 步长），让 Hold / streak 收敛，
+  // 否则图片模式下姿态和手臂动作全是 false —— 那不是「判不出来」，是缺时间证据。
+  // 需要运动的动作（挥手、计数）在单帧上本来就不适用，这里也不会凭空出现。
+  for (let i = 0; i < 12; i++) {
+    sig = se.update(person, ts + i * 100);
+    act = ae.update(sig, ts + i * 100);
+  }
   return {
+    settled_frames: 12,
     knee_avg: +sig.knee_avg.toFixed(1),
     elbow_avg: +sig.elbow_avg.toFixed(1),
     uprightness: +sig.uprightness.toFixed(3),

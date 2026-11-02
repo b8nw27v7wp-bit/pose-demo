@@ -653,7 +653,9 @@ console.log('\n[19] 混淆矩阵');
   const recs = [];
   let t = 0;
   for (let i = 0; i < 10; i++) recs.push(frame(t += 100, STAND));
-  for (let i = 0; i < 10; i++) recs.push(frame(t += 100, squatKp(1)));
+  // 逐帧下蹲（0.25 → 1）：真实下蹲不是单帧跳变；信号层现在会剔除
+  // 单帧 >80° 的膝角跳变（坏点保护），直接 STAND→squatKp(1) 会被延迟 2~3 帧。
+  for (let i = 0; i < 10; i++) recs.push(frame(t += 100, squatKp(Math.min(1, (i + 1) / 4))));
   for (let i = 0; i < 10; i++) recs.push(frame(t += 100, STAND));
   for (let i = 0; i < 10; i++) recs.push(frame(t += 100, STAND));
   recs.push({ ts: t + 100, person_count: 0, persons: [], signals: null, actions: null });
@@ -675,7 +677,8 @@ console.log('\n[19] 混淆矩阵');
     && conf.matrix.every((r) => r.length === 5));
   check('统计到姿态帧', conf.frames > 0, `frames=${conf.frames}`);
   check('stand 行对角线最大', conf.matrix[idx('stand')][idx('stand')]
-    >= Math.max(...conf.matrix[idx('stand')]));
+    >= Math.max(...conf.matrix[idx('stand')]),
+  `row=${JSON.stringify(conf.matrix[idx('stand')])} labels=${conf.labels}`);
   check('none 段被站姿误判会进入 none 行', conf.matrix[idx('none')][idx('stand')] > 0,
     `row=${JSON.stringify(conf.matrix[idx('none')])}`);
   check('!姿态 反例不计入真值', conf.negatedSkipped > 0, `skipped=${conf.negatedSkipped}`);

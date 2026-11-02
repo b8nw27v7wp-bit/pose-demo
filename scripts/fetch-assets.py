@@ -1,6 +1,6 @@
 """下载 demo 需要的二进制资产（MediaPipe 的 js/wasm 与模型权重）。
 
-这些文件共约 65MB，不进 git；克隆后跑一次本脚本即可：
+这些文件共约 95MB（含可选的 heavy 姿态模型），不进 git；克隆后跑一次本脚本即可：
 
     python scripts/fetch-assets.py
 
@@ -26,6 +26,8 @@ MODELS = {
         f"{MODEL_BASE}/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
     "pose_landmarker_lite.task":
         f"{MODEL_BASE}/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+    "pose_landmarker_heavy.task":
+        f"{MODEL_BASE}/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
     "hand_landmarker.task":
         f"{MODEL_BASE}/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
 }
