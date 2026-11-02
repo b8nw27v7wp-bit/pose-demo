@@ -16,7 +16,7 @@
 | 每个动作反例 | ≥ 20 | 含 `none` 段与 `!动作` 反例段 |
 | 人物 | ≥ 2 人 | 必须有一个**没有参与调参**的人（留一验证） |
 | 机位 | ≥ 2 个 | 至少正面 + 侧面 |
-| 模型档位 | 记录 `full` / `lite` | 录制用 full + 30fps；量化时另跑 lite/15fps |
+| 模型档位 | 记录 `full` / `heavy` / `lite` | 录制用 full + 30fps；量化时另跑 lite/15fps；heavy 可选 |
 
 低于这个量，报告里的百分比没有统计意义。**反例不够时，precision 恒为 1，等于没测。**
 
@@ -147,7 +147,7 @@ eval-data/
       "camera": "side",                        // front|side|oblique|close
       "subject": "A",                          // 受试者编号，不是姓名
       "lighting": "front",                     // front|back|low|side|mixed|unknown
-      "model": "full",                         // full|lite
+      "model": "full",                         // full|heavy|lite
       "fps": 30,
       "note": "深蹲 12 次，含 3 次半蹲变形"
     }
@@ -200,7 +200,7 @@ node web/test/evaluate.mjs --dir eval-data --resample 15
 | 动作之间不停顿 | 无法区分"漏判"和"没复位" | 每次动作后 1~2 s 纯站姿 |
 | 录制中途点停止 | 滤波重置，起止时间偏 | 一口气录完 |
 | 用循环播放的素材 | `video_time` 回绕，秒数不唯一；评估器拒绝秒数标注 | 单次播放；或改用 `start/end`（ts）标注 |
-| 用 lite 录、用 full 调阈值 | 两档噪声不同，阈值不通用 | manifest 记录 model/fps，两个档位都跑 |
+| 用一个档位录、用另一个档位调阈值 | 各档噪声不同，阈值不通用 | manifest 记录 model/fps；换档位要重测，不能沿用旧阈值 |
 | 用合成样例定阈值 | `sample.*` 是链路自检，不是实拍 | 只用来验证工具，不产出准确率结论 |
 | 帧文件被截断 | 长视频尾部缺帧，recall 失真 | 当前上限 20000 帧（约 11 分钟 @30fps），分段录 |
 

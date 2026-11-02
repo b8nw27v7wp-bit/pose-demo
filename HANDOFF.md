@@ -1,5 +1,9 @@
 # 交接文档 · 2026-10-30（续作更新）
 
+> **历史记录**：本文是当天的交接快照。里面的 worktree 路径、默认模型（lite）、测试数量（531）
+> 都已经过时；当前实现（默认 full/heavy、图片输入、腕部 ROI、上半身构图、unreliable）与
+> 验证结果以 `README.md`、`docs/` 和 git log 为准。
+>
 > 给下一个 session 的自包含说明。更细的设计见
 > `C:\Users\18434\.claude\plans\parallel-giggling-crown.md`（前端计划）。
 

@@ -251,6 +251,10 @@ labels 里写 `camera` / `subject`，报告会分别给出：
 关键信号按动作选：姿态看 `uprightness / knee / leg_vertical`，抬臂看 `elev_* / elev_torso_*`，
 抱臂/鼓掌看 `hands_close`，叉腰看 `reach_*`。完整映射见 `evaluate.mjs` 的 `SIGNALS_FOR`。
 
+> 导出帧的 `actions.unreliable` 记录逐帧弃权原因（低置信 / 外推 / 换侧 / 骨骼异常 / 角度坏点，
+> 见 `docs/signals.md` §三·九）。**报告不按它筛选**——报告比的是「规则最终判定 vs 标注」。
+> 排查失败段时打开 JSONL 对照这一列，用来区分「动作确实没做出来」和「这一帧被判为不可靠」。
+
 ## 事件时延与抖动
 
 报告里的 `## 事件时延与抖动` 回答两个问题：
@@ -361,7 +365,8 @@ profile 可以声明这套阈值是在哪个姿态模型档位下校准的：
 { "name": "fitness", "model": "lite", "params": { ... } }
 ```
 
-- `lite` 与 `full` 的关键点噪声不同，**用 full 拟合的阈值拿到 lite 上可能漏计**。
+- 各档（`full` / `heavy` / `lite`）的关键点噪声不同，**用一个档位拟合的阈值拿到另一个档位可能漏计**。
+  `heavy` 更慢、可见性输出更保守，默认不用；只有 `full` 仍不够时才考虑。
 - 页面加载后，若 profile 声明与实际运行的模型不一致，工具条上的 profile 标签会标黄并在状态栏提示。
 - 评估时若数据 meta 里的 `model` 与 profile 的 `model` 不一致，报告头部会给出警告。
   这不是错误（仍然能跑），但此时报告里的数字不能当成"这套阈值在目标档位上的表现"。

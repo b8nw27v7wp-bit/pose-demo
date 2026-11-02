@@ -1,6 +1,7 @@
 // app.js — 组装层：输入源 → 感知（姿态 + 手部）→ 信号 → 动作 → 可视化/导出
 import { createEstimator, detectVideo, toPersons, closeEstimator } from './pose.js';
-import { createHandEstimator, detectHandsVideo, toHands, classifyHand, handsReady, closeHandEstimator } from './hands.js';
+import { createHandEstimator, detectHandsVideo, detectHandsNearWrists, toHands, classifyHand, handsReady, closeHandEstimator } from './hands.js';
+import { wristsToRetry } from './handroi.js';
 import { HandShapeStabilizer, SHAPE_LABELS } from './handshape.js';
 import { SignalEngine } from './signals.js';
 import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from './actions.js';
@@ -10,6 +11,7 @@ import { drawSkeleton, drawHand, clearCanvas } from './draw.js';
 
 const $ = (id) => document.getElementById(id);
 const videoEl = $('video');
+const photoEl = $('photo');
 const canvas = $('overlay');
 const ctx = canvas.getContext('2d');
 const stage = $('stage');
@@ -68,7 +70,10 @@ function applyParams(params, name = 'default') {
   actionEngine = new ActionEngine(activeParams);
   shapeStable = makeShapeStable(activeParams);
   activeParamsHash = paramsHash(activeParams);
-  squatCfg = resolveParams(activeParams).actions.reps.squat;
+  const resolved = resolveParams(activeParams);
+  squatCfg = resolved.actions.reps.squat;
+  handRoiCfg = resolved.signals.hand.roi;
+  handVisMin = resolved.signals.visMin;
   updateSparkLegend();
   resetRuntime();
 }
@@ -214,6 +219,9 @@ let customProfileUrl = null;    // ?profile= 或上次保存的自定义 profile
 let lastProfileId = 'default';  // 最近一次成功应用的 profile（失败时回退用）
 let activeParamsHash = paramsHash({});
 let squatCfg = resolveParams({}).actions.reps.squat;
+// 腕部 ROI 补检参数：每帧都要用，不能在主循环里 deepMerge 一次参数树
+let handRoiCfg = resolveParams({}).signals.hand.roi;
+let handVisMin = resolveParams({}).signals.visMin;
 let logDropped = 0;             // 超过 MAX_LOG 被裁掉的帧数（会话摘要要如实显示）
 let seeking = false;            // 正在拖进度条：syncPlayer 不要覆盖用户拖动
 let resumeAfterSeek = false;
@@ -337,7 +345,9 @@ async function initEstimator() {
         await initHands(delegate);
         if (autoSrc && !autoLoaded) {
           autoLoaded = true;
-          useVideoSource(autoSrc, { loop: $('chkLoop').checked });
+          // ?src= 也可以指向图片（用于自检 / 分享单张素材）
+          if (/\.(jpe?g|png|webp|gif|bmp|avif)(\?|$)/i.test(autoSrc)) useImageSource(autoSrc);
+          else useVideoSource(autoSrc, { loop: $('chkLoop').checked });
         }
         return true;
       } catch (e) {
@@ -347,7 +357,9 @@ async function initEstimator() {
     // 不把 activeModel 清空：已经录下的帧仍属于上一档模型，导出的 meta 要如实写。
     // 工具条显示由 updateModelInfo() 依据 estimatorReady 决定。
     updateModelInfo();
-    setStatus(`模型加载失败：${lastErr?.message || 'unknown'}`, 'err');
+    // 新增模型档位时最容易踩的坑：models/ 里没有对应 .task（不进 git）。
+    // 错误信息里直接给出补救命令，别让用户对着 404 猜。
+    setStatus(`模型加载失败：${lastErr?.message || 'unknown'} · 先运行 scripts/fetch-assets.py`, 'err');
     return false;
   } finally {
     modelSel.disabled = false;
@@ -362,6 +374,14 @@ async function initHands(delegate) {
     try {
       await createHandEstimator({ delegate: d, runningMode: 'VIDEO', numHands: 2 });
       handReady = true;
+      // ROI 补检需要独立的 IMAGE 实例（VIDEO 实例用于整帧追踪，混用会把裁图当成下一帧）。
+      // 建不起来不致命：退回纯整帧检测，只是远景手部动作会漏。
+      try {
+        await createHandEstimator({
+          delegate: d, runningMode: 'IMAGE', numHands: 1,
+          detConf: 0.3, presenceConf: 0.3,
+        });
+      } catch { /* ROI 补检不可用 */ }
       return;
     } catch { /* 手部模型失败不影响主体识别 */ }
   }
@@ -449,6 +469,8 @@ async function startCamera(opts = {}) {
       cameraDeviceId = null;
       stream = await navigator.mediaDevices.getUserMedia(constraints(null));
     }
+    // 摄像头真的起来了才清掉图片：失败时原来的画面还在
+    clearPhoto();
     currentStream = stream;
     videoEl.srcObject = stream;
     assigned = true;
@@ -469,10 +491,13 @@ async function startCamera(opts = {}) {
   } catch (e) {
     // 摄像头没起来、文件源一点没动：保持原视频和已录帧，只报错。
     // （之前这里无条件 resetRuntime()，会把用户已录的一段数据清空）
-    if (!assigned && prevMode === 'file' && videoEl.getAttribute('src')) {
-      setStatus(`摄像头不可用（${e.name}），原视频继续`, 'err');
+    const keepCurrent = !assigned && ((prevMode === 'file' && videoEl.getAttribute('src'))
+      || (prevMode === 'image' && !photoEl.hidden));
+    if (keepCurrent) {
+      setStatus(`摄像头不可用（${e.name}），原画面继续`, 'err');
       syncPlayer();
     } else {
+      clearPhoto();
       placeholder.hidden = false;
       placeholder.querySelector('p').textContent = `摄像头不可用（${e.name}）`;
       placeholder.querySelector('.hint').textContent = '检查浏览器权限后点「摄像头」重试';
@@ -530,8 +555,8 @@ async function useVideoSource(src, { loop = false, revoke = null } = {}) {
   await profileReady;
   stopStream();
   if (!(await ensureEstimator())) {
-    // 模型起不来时，正在播的原文件别跟着一起清掉
-    if (mode === 'file' && videoEl.getAttribute('src')) {
+    // 模型起不来时，正在播的原文件 / 正在看的图片别跟着一起清掉
+    if ((mode === 'file' && videoEl.getAttribute('src')) || (mode === 'image' && !photoEl.hidden)) {
       if (revoke) URL.revokeObjectURL(revoke);   // 新 blob 从没挂到 video 上，直接释放
       syncPlayer();
       return false;
@@ -565,6 +590,8 @@ async function useVideoSource(src, { loop = false, revoke = null } = {}) {
     failInput(`视频播放被拒（${e.name}）`);
     return false;
   }
+  // 视频已经能播了再撤掉图片，加载失败时保持原画面
+  clearPhoto();
   mode = 'file';
   placeholder.hidden = true;
   setActiveInput('file');
@@ -617,9 +644,199 @@ async function useVideoFile(file) {
   return ok;
 }
 
+// —— 图片输入 -------------------------------------------------------------
+// 单张图片没有时间窗，而姿态/手臂判定里的 Hold、streak 都要求「持续了多久」。
+// 只判一帧会全部输出 false（看起来像「识别不出来」）。这里把同一帧在信号层/动作层
+// 重复喂 12 次（合成 100ms 步长）让它们收敛，再显示结果。
+// 需要运动的动作（挥手、深蹲/俯卧撑计数）在单张图上本来就不适用，不会凭空出现。
+const STILL_SETTLE_FRAMES = 12;
+let photoUrl = null;
+
+function isImageFile(f) {
+  if (!f) return false;
+  if (f.type) return f.type.startsWith('image/');
+  return /\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(f.name || '');
+}
+
+/** 退出图片模式：隐藏并释放图片 URL，视频元素恢复显示 */
+function clearPhoto() {
+  photoEl.hidden = true;
+  photoEl.removeAttribute('src');
+  videoEl.hidden = false;
+  if (photoUrl) {
+    URL.revokeObjectURL(photoUrl);
+    photoUrl = null;
+  }
+}
+
+/** 手势分类 + 去抖：实时与静态两条路径共用 */
+function classifyHands(list, ts) {
+  return list.map((hd) => {
+    const cls = classifyHand(hd.kp);
+    // 手势去抖：连续 N 帧命中才切换，否则「张开↔剪刀手」会来回闪
+    const stable = shapeStable[hd.handedness === 'Left' ? 'L'
+      : hd.handedness === 'Right' ? 'R' : 'U'].update(cls.shape, ts);
+    // 中文名只从 handshape.js 的 SHAPE_LABELS 来（之前 app.js 又抄了一份 SHAPE_ZH）
+    const label = SHAPE_LABELS[stable] || '—';
+    return { ...hd, cls: { ...cls, shape: stable, label, raw: cls.shape } };
+  });
+}
+
+/**
+ * 只保留目标人的手。多人画面里 `hands` 会混进别人的手，
+ * 而动作层只认目标人——不筛的话「张开/握拳」可能取到旁边那个人的手。
+ * 判定口径：整帧检出要求腕点离目标腕点足够近；ROI 补检本来就是按目标腕点裁的，直接保留。
+ */
+function handsOfTarget(list, target) {
+  if (!target) return [];
+  const wl = target.kp[5];
+  const wr = target.kp[6];
+  const maxD = 2 * Math.max(target.scale, 1);
+  return list.filter((hd) => {
+    if (hd.side_from === 'roi') return true;
+    const [x, y] = hd.kp[0];
+    return Math.hypot(x - wl[0], y - wl[1]) < maxD || Math.hypot(x - wr[0], y - wr[1]) < maxD;
+  });
+}
+
+/** 整帧漏检的手用姿态腕点补检（实时与静态共用） */
+function completeHands(fullHands, target, source, w, h) {
+  if (!target || !handsReady('IMAGE')) return fullHands;
+  // 注意 handedness 是 'Left'/'Right'，腕点侧是 'L'/'R'，必须换算后再比较，
+  // 否则每一侧都会被当成「没检出」而重复补检（多人画面上会多出两只手）。
+  const have = new Set(fullHands
+    .map((x) => (x.handedness === 'Left' ? 'L' : x.handedness === 'Right' ? 'R' : ''))
+    .filter(Boolean));
+  const wrists = [
+    { side: 'L', x: target.kp[5][0], y: target.kp[5][1], vis: target.kp[5][2], scale: target.scale },
+    { side: 'R', x: target.kp[6][0], y: target.kp[6][1], vis: target.kp[6][2], scale: target.scale },
+  ];
+  const retry = wristsToRetry(wrists, have, handVisMin);
+  return retry.length
+    ? fullHands.concat(detectHandsNearWrists(source, retry, handRoiCfg, { w, h }, wrists))
+    : fullHands;
+}
+
+/** 单张图片：推理一次，然后在信号/动作层收敛后绘制 */
+function analyzeStill(img) {
+  const w = img.naturalWidth;
+  const h = img.naturalHeight;
+  canvas.width = w;
+  canvas.height = h;
+  $('badgeRes').textContent = `${w} × ${h}`;
+  $('badgeRes').hidden = false;
+
+  const ts = performance.now();
+  const persons = toPersons(detectVideo(img, ts), w, h);
+  let target = null;
+  if (persons.length) {
+    const area = (p) => (p.bbox[2] - p.bbox[0]) * (p.bbox[3] - p.bbox[1]);
+    target = persons[0];
+    for (const p of persons) if (area(p) > area(target)) target = p;
+  }
+
+  let rawHands = [];
+  if (show.hands && handReady) {
+    try { rawHands = toHands(detectHandsVideo(img, ts), w, h); } catch { /* 手部失败不影响姿态 */ }
+    // 先按目标人筛，再补检：否则「整帧检出了旁边那个人的左右手」会让补检以为目标人已经齐全
+    rawHands = completeHands(handsOfTarget(rawHands, target), target, img, w, h);
+  }
+
+  let sig = null;
+  let act = null;
+  let hands = [];
+  if (target) {
+    for (let i = 0; i < STILL_SETTLE_FRAMES; i++) {
+      const t = ts + i * 100;
+      hands = classifyHands(rawHands, t);
+      const handState = {
+        L: hands.find((x) => x.handedness === 'Left')?.cls.shape ?? null,
+        R: hands.find((x) => x.handedness === 'Right')?.cls.shape ?? null,
+      };
+      sig = signalEngine.update(target, t);
+      act = actionEngine.update(sig, t, handState);
+    }
+    if (show.skeleton) {
+      let first = true;
+      for (const p of persons) {
+        drawSkeleton(ctx, p.kp_raw, w, h, {
+          points: show.points, clear: first, alpha: p === target ? 1 : 0.4,
+        });
+        first = false;
+      }
+    } else {
+      clearCanvas(ctx, w, h);
+    }
+    for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
+    $('badgeNoPerson').hidden = true;
+  } else {
+    clearCanvas(ctx, w, h);
+    $('badgeNoPerson').hidden = false;
+  }
+
+  lastResult = { ts, persons, sig, act, hands };
+  updateUI();
+}
+
+/**
+ * 图片源（本地文件或 ?src= 的 URL）。
+ * @param {string} src
+ * @param {{revoke?: string|null}} opts revoke = 需要在本函数结束后释放的 blob URL
+ */
+async function useImageSource(src, { revoke = null } = {}) {
+  await profileReady;
+  stopStream();
+  stopLoop();
+  if (!(await ensureEstimator())) {
+    if (revoke) URL.revokeObjectURL(revoke);
+    setStatus('模型加载失败，无法分析图片', 'err');
+    return false;
+  }
+  const img = new Image();
+  img.src = src;
+  try {
+    await img.decode();
+  } catch {
+    if (revoke) URL.revokeObjectURL(revoke);
+    setStatus('图片加载失败', 'err');
+    return false;
+  }
+
+  clearPhoto();
+  photoUrl = revoke || null;
+  photoEl.src = src;
+  photoEl.hidden = false;
+  videoEl.pause();
+  videoEl.srcObject = null;
+  videoEl.removeAttribute('src');
+  videoEl.hidden = true;
+  mode = 'image';
+  placeholder.hidden = true;
+  setActiveInput('file');
+  resetRuntime();
+  syncPlayer();
+  try {
+    analyzeStill(img);
+  } catch (e) {
+    setStatus(`图片分析失败：${e.message}`, 'err');
+    return false;
+  }
+  setStatus('就绪 · 图片（单帧判定，无时间窗）', 'ok');
+  return true;
+}
+
+async function useImageFile(file) {
+  await profileReady;
+  const url = URL.createObjectURL(file);
+  const ok = await useImageSource(url, { revoke: url });
+  if (ok) setStatus(`就绪 · 图片 · ${file.name}（单帧判定）`, 'ok');
+  return ok;
+}
+
 function stopAll() {
   stopStream();
   stopLoop();
+  clearPhoto();
   // 先摘掉 src 再 revoke，否则会触发一次对已失效 blob 的加载
   if (videoEl.src && videoEl.src.startsWith('blob:')) {
     const old = videoEl.src;
@@ -727,21 +944,21 @@ function loop() {
   const persons = toPersons(res, w, h);
   let sig = null, act = null, target = null;
 
+  // 目标人 = 画面里面积最大的那个人；其余人只画骨架不参与判定。
+  // 先选人再做手部：腕部 ROI 补检要用目标人的腕点。
+  if (persons.length) {
+    const area = (p) => (p.bbox[2] - p.bbox[0]) * (p.bbox[3] - p.bbox[1]);
+    target = persons[0];
+    for (const p of persons) if (area(p) > area(target)) target = p;
+  }
+
   // —— 手部要先于动作判定：拿取/持物需要「手是张开还是握紧」，姿态层给不了。
   // 手部模型失败不影响主体识别，hands 为空时这些动作一律不成立。
   let hands = [];
   if (show.hands && handReady) {
     try {
       const hr = detectHandsVideo(v, ts);
-      hands = toHands(hr, w, h).map((hd) => {
-        const cls = classifyHand(hd.kp);
-        // 手势去抖：连续 N 帧命中才切换，否则「张开↔剪刀手」会来回闪
-        const stable = shapeStable[hd.handedness === 'Left' ? 'L'
-          : hd.handedness === 'Right' ? 'R' : 'U'].update(cls.shape, ts);
-        // 中文名只从 handshape.js 的 SHAPE_LABELS 来（之前 app.js 又抄了一份 SHAPE_ZH）
-        const label = SHAPE_LABELS[stable] || '—';
-        return { ...hd, cls: { ...cls, shape: stable, label, raw: cls.shape } };
-      });
+      hands = toHands(hr, w, h);
       handFails = 0;
     } catch (e) {
       // 连续失败说明手部模型挂了：关掉它，别每帧都抛异常拖慢主循环
@@ -752,14 +969,14 @@ function loop() {
         setStatus('手部模型异常，已自动关闭', 'err');
       }
     }
+    // 整帧漏检的手用姿态腕点补检。全身/远景构图里手只有几十像素，整帧 HandLandmarker
+    // 实测 0 命中；腕点裁一块放大后同一模型能稳定检出。只在漏检且腕点可见时才付这次推理。
+    // 先按目标人筛，再补检：否则「整帧检出了旁边那个人的左右手」会让补检以为目标人已经齐全
+    hands = completeHands(handsOfTarget(hands, target), target, v, w, h);
+    hands = classifyHands(hands, ts);
   }
 
-  if (persons.length) {
-    // 目标人 = 画面里面积最大的那个人；其余人只画骨架不参与判定
-    const area = (p) => (p.bbox[2] - p.bbox[0]) * (p.bbox[3] - p.bbox[1]);
-    target = persons[0];
-    for (const p of persons) if (area(p) > area(target)) target = p;
-
+  if (target) {
     if (show.skeleton) {
       let first = true;
       for (const p of persons) {
@@ -876,6 +1093,7 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
       flags: act.flags,
       reps: act.reps,
       grasp_phase: act.repPhase?.grasp ?? null,
+      unreliable: act.unreliable ?? [],
     } : null,
     hands: hands.map((hd) => ({
       handedness: hd.handedness,
@@ -1224,6 +1442,7 @@ function resetPlaceholder() {
 function failInput(message) {
   setStatus(message, 'err');
   stopLoop();
+  clearPhoto();
   videoEl.removeAttribute('src');
   videoEl.srcObject = null;
   mode = 'idle';
@@ -1264,12 +1483,20 @@ function updateUI() {
   const { sig, act, hands } = lastResult || {};
 
   const postureEl = $('posture');
-  postureEl.textContent = act?.posture || (sig ? '未判定' : '—');
+  // 只有上半身在画面里时，站/坐/蹲/躺都判不了（缺膝、踝）。这不是「没识别」，
+  // 而是信息不足——明确写出来，别让用户以为模型挂了。
+  const upperOnly = !!(sig && sig.ok && !Number.isFinite(sig.leg_vertical));
+  postureEl.textContent = act?.posture
+    || (sig ? (sig.ok ? (upperOnly ? '上半身' : '未判定') : '置信不足') : '—');
   postureEl.classList.toggle('dim', !act?.posture);
 
   if (act?.posture) {
     const secs = (act.postureMs / 1000).toFixed(1);
     $('postureMeta').textContent = act.frozen ? `保持 ${secs}s · 置信不足` : `持续 ${secs}s`;
+  } else if (sig && !sig.ok) {
+    $('postureMeta').textContent = `画面内置信 ${r2(sig.score)} · 人体太小/光线不足/被遮挡`;
+  } else if (upperOnly) {
+    $('postureMeta').textContent = '下半身不可见（出画/遮挡），站/坐无法判定';
   } else {
     $('postureMeta').textContent = sig ? '—' : '无画面';
   }
@@ -1315,8 +1542,19 @@ function updateUI() {
     .map(([k, v]) => `<tr><td>${k}</td><td>${v === null || v === undefined ? '—' : v}</td></tr>`)
     .join('');
 
+  // 下半身是否入镜：髋/膝/踝任一不可见就提示。用户据此知道该退后还是换机位，
+  // 而不是对着一个空姿态反复试。
+  const vis = sig?.vis;
+  const lowerHidden = !!vis && (vis.hip < 0.4 || vis.knee < 0.3 || vis.ankle < 0.3);
+  // 判定不可靠的原因：让用户知道这一帧别太当真，而不是把误判当成结论
+  const UNRELIABLE = {
+    low_confidence: '低置信', extrapolated: '外推', side_switched: '换侧',
+    bone_blocked: '骨骼异常', angle_outlier: '角度坏点',
+  };
+  const unrel = (act?.unreliable || []).map((r) => UNRELIABLE[r] || r);
   $('signalMeta').textContent = sig
     ? `膝角取${sig.knee_side === 'L' ? '左' : '右'}腿 · 置信 ${r2(sig.score)}`
+      + `${lowerHidden ? ' · 下半身不可见' : ''}${unrel.length ? ` · 不可靠：${unrel.join('/')}` : ''}`
     : '—';
 
   if (act?.reps) renderReps(act.reps);
@@ -1328,9 +1566,10 @@ function updateUI() {
     ? (frameLog[frameLog.length - 1].ts - frameLog[0].ts) / 1000
     : 0;
   const recState = mode === 'idle' ? '未开始'
-    : videoWrapDetected ? '记录已停止（时间回退）'
-      : mode === 'camera' ? '记录中'
-        : (videoEl.paused ? '已暂停' : '记录中');
+    : mode === 'image' ? '单帧判定'
+      : videoWrapDetected ? '记录已停止（时间回退）'
+        : mode === 'camera' ? '记录中'
+          : (videoEl.paused ? '已暂停' : '记录中');
   const dropped = logDropped ? ` · 已丢弃 ${logDropped} 帧（上限 ${MAX_LOG}）` : '';
   $('logInfo').textContent = frameLog.length
     ? `${frameLog.length} 帧 / ${span.toFixed(1)}s · ${recState}${dropped}`
@@ -1362,6 +1601,14 @@ function isVideoFile(file) {
     || /\.(mp4|webm|mov|m4v|ogv|ogg)$/i.test(file.name || ''));
 }
 
+/** 文件入口统一分发：图片走单帧判定，视频走播放/记录 */
+async function useAnyFile(file) {
+  if (isImageFile(file)) return useImageFile(file);
+  if (isVideoFile(file)) return useVideoFile(file);
+  setStatus('只支持视频或图片文件', 'err');
+  return false;
+}
+
 $('btnCamera').addEventListener('click', () => startCamera());
 $('btnSwitchCam').addEventListener('click', switchCamera);
 $('btnStop').addEventListener('click', stopAll);
@@ -1371,7 +1618,7 @@ $('fileInput').addEventListener('change', async (ev) => {
   const f = ev.target.files?.[0];
   // 清空 value：否则连续选同一个文件不会再触发 change
   ev.target.value = '';
-  if (f) await useVideoFile(f);
+  if (f) await useAnyFile(f);
 });
 
 // 拖拽上传：整个画面区域都可以接收视频
@@ -1396,11 +1643,7 @@ stage.addEventListener('drop', async (e) => {
   dragDepth = 0;
   stage.classList.remove('dragover');
   const file = e.dataTransfer?.files?.[0];
-  if (!isVideoFile(file)) {
-    setStatus('只支持视频文件', 'err');
-    return;
-  }
-  await useVideoFile(file);
+  await useAnyFile(file);
 });
 placeholder.addEventListener('click', () => $('fileInput').click());
 

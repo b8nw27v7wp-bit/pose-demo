@@ -17,7 +17,7 @@
       "kp": [[65.1, 342.2, 1], ...],// 13 个点，顺序见 kpt.js 的 KPT，像素坐标 + 置信度
       "kp_world": [[0.02, -0.48, 0.1], ...], // 可选：MediaPipe worldLandmarks，33 点米制 3D
       "scale": 127.22,              // 尺度锚点，像素：肩中点↔髋中点距离（躯干长）
-      "score": 0.94                 // 该人的平均关键点置信度
+      "score": 0.94                 // 该人画面内关键点的平均置信度（出画的点不计入）
     }
   ],
   "signals": {                      // 信号层输出（可重算，落盘便于回放与调试）
@@ -37,18 +37,22 @@
     "bones_ok": { "foreArm_L": true, "thigh_R": false, "...": true }
   },
   "actions": {                      // 规则层输出
-    "posture": "stand",
+    "posture": "stand",             // stand|sit|squat_static|lying；证据不足时为 null（如只有上半身）
     "flags": {
       "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
       "onHips": false, "armsOpen": false, "handAtHead": false,
       "reaching": false, "carrying": false, "pointing": false,
       "armFront": false, "armSide": false
     },
-    "reps": { "squat": 0, "pushup": 0, "clap": 0, "grasp": 0 }
+    "reps": { "squat": 0, "pushup": 0, "clap": 0, "grasp": 0 },
+    // 判定不可靠的原因（不是动作）：低置信 / 外推 / 换侧 / 骨骼异常 / 角度坏点
+    // 含义与对判定的影响见 docs/signals.md §三·九
+    "unreliable": []
   },
   "hands": [                        // 手部（可选，独立模型）
     {
-      "handedness": "Left",         // 被识别者自己的左右手
+      "handedness": "Left",         // 被识别者自己的左右手；腕部 ROI 补检时由腕点所在侧决定
+                                    // （MediaPipe 的 handedness 假设自拍镜像输入，普通视频会反过来）
       "shape": "open",              // 稳定后的手势（见 handshape.js）：
                                     // fist|open|victory|pointing|thumbs_up|ok|gun|rock|unknown
       "shape_raw": "open",          // 本帧原始分类，未过 HandShapeStabilizer
@@ -67,8 +71,13 @@
 > `unknown` 表示判不出来，不是「张开」——但动作层目前只区分「闭合/非闭合」，这一点见已知限制。
 > 离线评估器的手势指标（`action:"gesture"`）读的也是 `shape`；`orient.facing === "edge"`（手掌侧对）
 > 的帧会被当作弃权，不计入手势 recall 的分母（`docs/eval.md`）。
+>
+> 全身/远景构图里整帧检不到手时，页面会用姿态腕点裁图补检（`web/js/handroi.js`）；
+> 这类结果的 `handedness` 由腕点所在侧决定，不采信模型在「自拍镜像输入」假设下的输出。
+> `actions.unreliable` 是逐帧的可靠性标记，不是动作。看失败段时先看它，
+> 用来区分「动作没做出来」和「这一帧被判为不可靠（弃权）」。
 
-## 三条硬规矩
+## 四条硬规矩
 
 1. **感知层不产出语义**。adapter 不知道「深蹲」是什么，只输出坐标。
 2. **距离必须带尺度锚点**。2D 距离写成 `距离 / scale`，3D 距离写成 `距离 / scale_world`，
@@ -105,7 +114,7 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
 
 ```
 第一行：{"exported_at":"...","schema":"frame.jsonl v0","kp_format":"mediapipe33",
-        "model":"lite","delegate":"GPU","hand_model":"hand_landmarker","infer_fps":15,
+        "model":"full","delegate":"GPU","hand_model":"hand_landmarker","infer_fps":15,
         "profile":"fitness","profile_model":"lite","params_hash":"fnv1a:1a2b3c4d",
         "params":{...},"fps":14.4,"frame_count":562}
 后续每行：一条帧记录（上面那种结构）
@@ -135,7 +144,7 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
 | 字段 | 含义 | 为什么必须记 |
 |---|---|---|
 | `schema` | 契约版本，当前 `frame.jsonl v0` | 解析器据此分支；只加可选字段不升版本 |
-| `model` | 姿态模型档位 `lite` / `full` | 两档关键点噪声不同，阈值不能混用 |
+| `model` | 姿态模型档位 `full` / `heavy` / `lite` | 各档关键点噪声不同，阈值不能混用 |
 | `delegate` | `GPU` / `CPU` | 同一档位在不同后端下结果也可能有细微差异 |
 | `hand_model` | 手部模型文件名；未加载为 `null` | 手势结论要能追溯到手部模型 |
 | `infer_fps` | 推理帧率上限（10/15/30） | 15 fps 下最短持续时间的量化粒度与 30 fps 不同 |

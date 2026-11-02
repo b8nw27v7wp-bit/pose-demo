@@ -16,7 +16,7 @@ const asset = (p) => new URL(p, import.meta.url).href;
 
 /**
  * 创建/切换姿态估计器。模型或 delegate 变化时会重建实例。
- * @param {{model?: 'full'|'lite', delegate?: 'GPU'|'CPU', runningMode?: 'VIDEO'|'IMAGE', numPoses?: number}} opts
+ * @param {{model?: 'full'|'heavy'|'lite', delegate?: 'GPU'|'CPU', runningMode?: 'VIDEO'|'IMAGE', numPoses?: number}} opts
  */
 export async function createEstimator(opts = {}) {
   const {
@@ -111,7 +111,12 @@ export function toPersons(result, w, h) {
       ? result.worldLandmarks[i].map((p) => [p.x, p.y, p.z])
       : [];
 
-    const vis = raw.reduce((s, p) => s + (p.visibility ?? 0), 0) / raw.length;
+    // 平均置信度只统计**画面内**的点：上半身构图里，画面外的腿/脚本来就没有可见度，
+    // 用 33 点全量平均会把整帧判成低置信（实测头~胸构图 0.63 → ok=false → 动作全冻结）。
+    // 画面内点太少（<5，人体大部分出画）时退回全量平均，避免用一两个点代表整个人。
+    const inFrame = raw.filter((p) => p.x >= -0.02 && p.x <= 1.02 && p.y >= -0.02 && p.y <= 1.02);
+    const meanVis = (pts) => pts.reduce((s, p) => s + (p.visibility ?? 0), 0) / pts.length;
+    const vis = meanVis(inFrame.length >= 5 ? inFrame : raw);
 
     out.push({
       track_id: i,

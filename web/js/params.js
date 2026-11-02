@@ -14,9 +14,22 @@ export const DEFAULT_PARAMS = {
       upright: { minCutoff: 1.5, beta: 0.02 },
     },
     scaleMedianFrames: 5,
+    // 左右侧选择滞回：另一侧的可信度要高出这么多才换侧。
+    // 不设滞回时，两侧可见性在阈值附近抖动会让膝角在两条腿之间来回跳，
+    // 计数会拿到不连续的角度序列（见 actions.js 的换侧中止）。
+    sideHysteresis: 0.15,
+    // 关节角突变剔除：角速度超过 maxRate（度/秒）且间隔不超过 maxDtMs 时，
+    // 视为单帧坏点（不给滤波器、也不沿用旧值冒充当前）。持续超过 maxDtMs 才接受新值。
+    // 用「角速度」而不是固定角度：100ms 内跳 100° 是 1000°/s（真实快速下蹲量级），
+    // 33ms 内跳 100° 是 3000°/s（坏点量级）—— 同一个角度差在两种帧率下含义完全不同。
+    angleJump: { maxRate: 1500, maxDtMs: 250 },
     visMin: 0.3,          // 单点可见性低于此值 → 依赖它的信号给 NaN
-    minScore: 0.45,       // 人体平均置信度低于此值 → ok=false，动作层冻结
+    minScore: 0.45,       // 画面内关键点平均置信度低于此值 → ok=false，动作层冻结
     minTorsoVis: 0.4,     // 肩/髋四点最低可见性
+    // 髋不可信（上半身构图 / 贴身机位）时，用肩宽换算躯干长：torso ≈ shoulderWidth × 此值。
+    // 实测（MediaPipe world）肩宽 0.315m / 躯干长 0.489m ≈ 1.55；2D 正面视角会更小，
+    // 取 1.4 折中。只影响尺度归一化，阈值仍按躯干长拟合。
+    shoulderToTorso: 1.4,
     // —— 3D（worldLandmarks）——
     // 默认只开「语义与 2D 直接可比」的两类：关节角、直立度。
     // legVertical / ratios 的量纲相对 2D 有系统性偏移（3D 腿长/躯干 ≈2.0，2D 约 1.3），
@@ -57,13 +70,21 @@ export const DEFAULT_PARAMS = {
       extend: { minReach: 1.25, minElev: 30 },
       // 3D 水平方位角：0°=正前方，±90°=正侧方。用来区分前平举与侧平举。
       // 必须配合「手臂接近水平」才有效：手自然下垂时水平分量接近 0，方位角是噪声
-      azimuth: { frontMax: 35, sideMin: 55, minElev: 60, maxElev: 120 },
+      // minReach：平举时手臂必须基本伸直（3D 腕-肩距离 / 躯干长）。弯着胳膊横在胸前
+      // （走路/抱臂）会被 3D 方位角算成水平，但 reach 只有 0.5~0.8，用这道门挡掉。
+      azimuth: { frontMax: 35, sideMin: 55, minElev: 60, maxElev: 120, minReach: 0.85 },
       // 持物：手闭合且臂未伸出
       carry: { maxReach: 1.2 },
     },
     hand: {
       // 判定为「握住」的手势。ok/gun 是捏取，也算能拿东西
       closedShapes: ['fist', 'ok'],
+      // 腕部 ROI 补检：整帧漏检时，以姿态腕点为中心裁一块放大后重检。
+      // 全身构图里手只有几十像素，整帧检测实测 0 命中；补检后同一模型 100% 命中。
+      // mul = 框边长 / 躯干长；maxCenterOffset = 检出腕点离框中心的最大偏移（占框边长）。
+      // 归属判据不是这个偏移量，而是「检出腕点离哪个姿态腕点最近」（hands.js 里做），
+      // 这里只是排除离裁图中心太远的框（基本是另一只手/背景）。
+      roi: { mul: 1.8, minPx: 64, maxPx: 480, maxCenterOffset: 0.6 },
     },
     grasp: {
       // 拿取状态机的时间窗
@@ -89,6 +110,9 @@ export const DEFAULT_PARAMS = {
       arm: 300, wave: 150, crossed: 400, hips: 400, open: 400,
       handFace: 350, handChest: 350, bothHandsUp: 350,
       reach: 250, carry: 300, point: 250,
+      // 前/侧平举原本是瞬时布尔：走路摆臂会被 3D 方位角的噪声凑成「前平举」，
+      // 实测 45 帧里断续命中 41 帧、最长一段仅 250ms。加保持窗把瞬时误报滤掉。
+      front: 300, side: 300,
     },
     // adaptiveMs：有历史后，用「半程时长中位数 × adaptiveMinRatio」替代固定 minCycleMs。
     // 挥手/快速深蹲不再被固定周期判成抖动，慢动作也不会因此漏计（见 docs/signals.md §二）。
