@@ -19,9 +19,21 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { SignalEngine } from '../js/signals.js';
 import { profileParams } from '../js/params.js';
 import { summarize, overlapCoefficient } from '../js/stats.js';
-import { loadFrames, loadLabels as readLabels, frameTs, videoTimeMonotonic } from './frame-io.mjs';
+import {
+  loadFrames, loadLabels as readLabels, frameTs, stripBom, videoTimeMonotonic,
+} from './frame-io.mjs';
 
-const loadLabels = async (p) => (p ? readLabels(p) : null);
+/** 与采集协议一致的同名 labels：a.frames.jsonl / a.jsonl → a.labels.json */
+function siblingLabels(p) {
+  return /\.frames\.(json|jsonl)$/i.test(p)
+    ? p.replace(/\.frames\.(json|jsonl)$/i, '.labels.json')
+    : p.replace(/\.(json|jsonl)$/i, '.labels.json');
+}
+
+/** --action 时如果没显式给 labels，自动找同名 labels；找不到就退回「不筛选」并报告。 */
+async function optionalSiblingLabels(framesPath) {
+  try { return await readLabels(siblingLabels(framesPath)); } catch { return null; }
+}
 
 // —— 信号取值表：默认只列 R3 关心的几族，每族都带 2D / 3D 两份 ——
 const SIGNALS = {
@@ -221,17 +233,19 @@ async function main() {
     return;
   }
   const params = args.profile
-    ? profileParams(JSON.parse(await readFile(args.profile, 'utf8')))
+    ? profileParams(JSON.parse(stripBom(await readFile(args.profile, 'utf8'))))
     : {};
   const warmup = Number.isFinite(Number(args.warmup)) ? Number(args.warmup) : 15;
+  const action = typeof args.action === 'string' ? args.action : null;
 
   const [framesA, framesB, labelsA, labelsB] = await Promise.all([
     loadFrames(args.a),
     loadFrames(args.b),
-    loadLabels(args['labels-a']),
-    loadLabels(args['labels-b']),
+    args['labels-a'] ? readLabels(args['labels-a'])
+      : (action ? optionalSiblingLabels(args.a) : null),
+    args['labels-b'] ? readLabels(args['labels-b'])
+      : (action ? optionalSiblingLabels(args.b) : null),
   ]);
-  const action = typeof args.action === 'string' ? args.action : null;
 
   const A = collect(framesA, labelsA, params, action, warmup);
   const B = collect(framesB, labelsB, params, action, warmup);

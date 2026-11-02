@@ -1,13 +1,16 @@
 # 数据契约 · frame.jsonl v0
 
-所有感知模型（MediaPipe / RTMPose / 将来的任何模型）的输出都必须映射成这个结构。
-下游的信号层、规则层、可视化、回放只认这个结构 —— **换模型只改 adapter，不动下游**。
+所有感知模型的输出都必须映射成这个结构。下游的信号层、规则层、可视化、回放只认这个结构 ——
+**换模型只改 adapter，不动下游**。
+
+> 当前初始版只接了 **MediaPipe Pose（`mediapipe33`）**；RTMPose / ViTPose / Halpe 的映射表
+> 是计划中的扩展，`kpt.js` 里还没有。本文其余字段在当前实现里都已生效。
 
 ## 一条记录
 
 ```jsonc
 {
-  "ts": 1585,                       // 毫秒，单调递增（浏览器用 performance.now，服务端用单调时钟）
+  "ts": 1585,                       // 毫秒，单调递增（当前实现用 performance.now；服务端将来用单调时钟）
   "video_time": 0.93,               // 媒体播放秒数；摄像头为 null。单次播放内单调，用于写 labels 的 startSec/endSec
   "persons": [
     {
@@ -22,7 +25,7 @@
   ],
   "signals": {                      // 信号层输出（可重算，落盘便于回放与调试）
     "knee": 162.9,                  // 判定实际使用的膝角（有 world 时可能是 3D）
-    "knee_2d": 162.9,               // 2D 对照（R3 起与 3D 并行导出）
+    "knee_2d": 162.9,               // 2D 对照（与 3D 并行导出）
     "knee_3d": 175.1,
     "uprightness": 1,               // 躯干直立度 cos，站立≈1，躺平≈0
     "uprightness_2d": 1,
@@ -99,11 +102,11 @@
 
 ## kp_format 对照
 
-| kp_format | 点数 | 来源 | 备注 |
+| kp_format | 点数 | 来源 | 状态 |
 |---|---|---|---|
-| `mediapipe33` | 33（内部取 13） | MediaPipe PoseLandmarker | 浏览器 Demo 默认 |
-| `coco17` | 17 | RTMPose / ViTPose | 服务端引擎用 |
-| `halpe26` | 26 | RTMPose Halpe | 含颈、髋，判弯腰更好 |
+| `mediapipe33` | 33（内部取 13） | MediaPipe PoseLandmarker | **已实现**，浏览器 Demo 默认 |
+| `coco17` | 17 | RTMPose / ViTPose | 计划中（`kpt.js` 尚无映射表） |
+| `halpe26` | 26 | RTMPose Halpe | 计划中（含颈、髋，判弯腰更好） |
 
 内部统一骨架 = `KPT` 的 13 点（COCO-17 子集）：鼻、双肩、双肘、双腕、双髋、双膝、双踝。
 新增格式时在 `kpt.js` 的 `MP_INDEX` 旁加一张映射表即可。
@@ -168,7 +171,7 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
 会拒绝秒数标注，要求改用 `start/end`（ts），自动标注也会在回绕素材上退回 `ts`。
 摄像头录制的 `video_time` 为 `null`，标注一律用 `ts`。
 
-引擎侧落盘格式相同，一行一条（JSONL），便于 `jq` 与逐帧回放。
+将来的服务端引擎应使用同一落盘格式（一行一条 JSONL），便于 `jq` 与逐帧回放；本版只有浏览器侧实现。
 
 ## persons 里的 kp_world
 

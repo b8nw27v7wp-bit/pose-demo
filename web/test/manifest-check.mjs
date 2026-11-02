@@ -15,12 +15,16 @@
 import { readFile, writeFile, readdir, access } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { loadLabels } from './frame-io.mjs';
-import { ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS as REP_REGISTRY } from '../js/actions.js';
+import { loadLabels, stripBom } from './frame-io.mjs';
+import {
+  ACTION_CATALOG, ARM_ACTIONS, ARM_ID_TO_FLAG, REP_ACTIONS as REP_REGISTRY,
+} from '../js/actions.js';
 
 export const CAMERAS = ['front', 'side', 'oblique', 'close'];
 export const LIGHTING = ['front', 'back', 'low', 'side', 'mixed', 'unknown'];
-export const MODELS = ['full', 'lite'];
+// 与页面模型下拉、docs/data-collection.md 的 model 字段保持一致：
+// 三档都是合法取值，缺一档会让 heavy 录制的素材无法登记进清单。
+export const MODELS = ['full', 'heavy', 'lite'];
 // 动作清单从 js/actions.js 的注册表派生。手抄过一次：§12.7 的 5 个手臂动作与 grasp
 // 在这里被漏掉，标注它们会被当成「未知动作」、覆盖度也能在零数据时报达标。
 export const POSTURES = ACTION_CATALOG.map((a) => a.id);
@@ -94,6 +98,11 @@ export async function validateManifest(manifest, baseDir, { requireFiles = true 
   return { errors, warnings, clips };
 }
 
+// labels 里手臂动作既接受注册表 flag（armRaised），也接受 ARM_ACTIONS 的 id（arm_raised）；
+// evaluate.mjs 的 parseSegment 会归一，清单统计也必须在同一处归一，否则同一份 labels
+// 在评估器里算正例、在清单里却被记成「未知动作」，覆盖度永远为零。
+const canonicalAction = (action) => ARM_ID_TO_FLAG[action] || action;
+
 /**
  * 覆盖度：每个动作的正例样本数、段数、反例段、人物/机位/模型集合。
  * 正例样本数：计数类按 count 求和，其余按段数（一段=一次）。
@@ -107,7 +116,9 @@ export async function coverageReport(manifest, baseDir, opts = {}) {
     minSubjects = DEFAULT_THRESHOLDS.minSubjects,
     minCameras = DEFAULT_THRESHOLDS.minCameras,
   } = opts;
-  const rows = Object.fromEntries(actions.map((a) => [a, {
+  // 去重后再统计：--actions arm_raised,armRaised 不应产生两行。
+  const wanted = [...new Set(actions.map(canonicalAction))];
+  const rows = Object.fromEntries(wanted.map((a) => [a, {
     action: a,
     pos: 0,
     segs: 0,
@@ -145,11 +156,12 @@ export async function coverageReport(manifest, baseDir, opts = {}) {
         continue;
       }
       const negated = raw.startsWith('!');
-      const action = negated ? raw.slice(1) : raw;
+      const rawAction = negated ? raw.slice(1) : raw;
+      const action = canonicalAction(rawAction);
       const row = rows[action];
       if (!row) {
         // 合法但不在 --actions 范围内的动作静默跳过；只有真正不认识的名字才提示
-        if (!ACTIONS.includes(action)) unknownActions.add(raw);
+        if (!ACTIONS.includes(rawAction) && !ARM_ID_TO_FLAG[rawAction]) unknownActions.add(raw);
         continue;
       }
       const isNeg = negated || seg.expect === false;
@@ -163,7 +175,7 @@ export async function coverageReport(manifest, baseDir, opts = {}) {
     }
   }
 
-  const outRows = actions.map((a) => {
+  const outRows = wanted.map((a) => {
     const r = rows[a];
     const ok = r.pos >= minPos && r.neg >= minNeg
       && r.subjects.size >= minSubjects && r.cameras.size >= minCameras;
@@ -294,7 +306,7 @@ async function main() {
   const baseDir = path.dirname(manifestPath);
   let manifest;
   try {
-    manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    manifest = JSON.parse(stripBom(await readFile(manifestPath, 'utf8')));
   } catch (e) {
     console.error(`读不到或解析不了 ${manifestPath}：${e.message}`);
     console.error('可以先运行：node web/test/manifest-check.mjs --init --dir eval-data');

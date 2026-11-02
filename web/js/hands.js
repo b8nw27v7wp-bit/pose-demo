@@ -38,6 +38,10 @@ export async function createHandEstimator(opts = {}) {
   if (!vision) vision = await FilesetResolver.forVisionTasks(asset('../vendor/wasm'));
   if (slot?.landmarker) {
     try { slot.landmarker.close(); } catch { /* ignore */ }
+    // 必须在建新实例前移出 map：createFromOptions 失败时，旧的（已 close 的）
+    // 实例若还留在 slots 里，handsReady() 会返回 true，主循环随后每帧调用已释放的
+    // 实例并抛异常，最终把整个手部功能自动关掉。
+    slots.delete(runningMode);
   }
 
   const landmarker = await HandLandmarker.createFromOptions(vision, {

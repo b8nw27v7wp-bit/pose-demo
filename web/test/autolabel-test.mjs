@@ -4,7 +4,8 @@
 // 验证：区间合并/丢弃、计数周期合并、真实样例上的草稿内容，
 // 以及「草稿自评全通过」——同一套规则生成的草稿，评估器必须判它全对。
 
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { rangesFrom, repSessions, autolabelFrames, ARM_FLAGS, REPS } from './autolabel.mjs';
@@ -91,6 +92,18 @@ console.log('\n[3] sample.frames.json');
   check('自动标注覆盖注册表里的每个计数动作',
     REP_ACTIONS.every((r) => REPS.includes(r.id)),
     `missing=${REP_ACTIONS.map((r) => r.id).filter((id) => !REPS.includes(id))}`);
+
+  // 裸数组可能是多行格式化的；按行解析会一行都认不出来，静默得到 0 帧。
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'pose-frames-'));
+  try {
+    const pretty = path.join(tmp, 'pretty.json');
+    // 同时覆盖「多行裸数组」和「Windows 编辑器写入的 UTF-8 BOM」。
+    await writeFile(pretty, `﻿${JSON.stringify(frames.slice(0, 3), null, 2)}\n`, 'utf8');
+    const again = await loadFrames(pretty);
+    check('多行裸数组（含 BOM）帧文件仍能读取', again.length === 3, `len=${again.length}`);
+  } finally {
+    await rm(tmp, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

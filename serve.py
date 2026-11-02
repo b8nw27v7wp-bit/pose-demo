@@ -35,16 +35,29 @@ class RangeHandler(SimpleHTTPRequestHandler):
             self.send_error(404, "File not found")
             return None
 
-        m = self.range_re.match(rng)
+        m = self.range_re.fullmatch(rng.strip())
         if not m:
             return super().send_head()
 
         size = os.path.getsize(path)
         start_s, end_s = m.group(1), m.group(2)
-        start = int(start_s) if start_s else 0
-        end = int(end_s) if end_s else size - 1
-        end = min(end, size - 1)
-        if start > end:
+        # bytes=-N 是「最后 N 字节」的 suffix range，不是 0~N；浏览器拖动进度时会发。
+        # 两种都解析错的话，视频会从错误位置开始播，难排查。
+        if not start_s and not end_s:
+            self.send_error(416, "Requested Range Not Satisfiable")
+            return None
+        if not start_s:
+            length = int(end_s)
+            if length <= 0:
+                self.send_error(416, "Requested Range Not Satisfiable")
+                return None
+            start = max(0, size - length)
+            end = size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+            end = min(end, size - 1)
+        if start >= size or start > end:
             self.send_error(416, "Requested Range Not Satisfiable")
             return None
 

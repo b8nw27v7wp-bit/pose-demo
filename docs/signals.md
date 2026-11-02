@@ -1,11 +1,12 @@
 # 信号层定义 · signals v0.1
 
-**这份文档是唯一真相**。浏览器端 `web/js/signals.js` 与服务端 `engine/signals/*.py` 都按它实现，
-两边算法必须一致 —— 否则同一个动作在 Demo 和引擎里会给出不同的起止时间。
+**这份文档是唯一真相**。当前实现是浏览器端 `web/js/signals.js`；本版**没有**服务端引擎
+（Python 引擎见 `PLAN.md` 的路线）。将来实现服务端时，算法必须与这里一致，否则同一个动作
+在 Demo 和引擎里会给出不同的起止时间。
 
-> **v0.1（2026-10-29，R3）**：新增 3D（`worldLandmarks`）信号、骨骼长度一致性、角速度、
-> 短时遮挡外推、自适应周期；并明确「何时用 3D、何时退回 2D」的规则（§一·五）。
-> 帧契约仍是 `v0`（只加可选字段，见 `docs/frame-schema.md`）。
+> **v0.1（初始版）**：包含 3D（`worldLandmarks`）信号、骨骼长度一致性、角速度、
+> 短时遮挡外推、自适应周期，以及「何时用 3D、何时退回 2D」的规则（§一·五）。
+> 帧契约是 `v0`（只加可选字段，见 `docs/frame-schema.md`）。
 
 信号 = **时间序列**，不是单帧布尔。所有判定都必须能看到「过去 N 毫秒发生了什么」。
 
@@ -39,7 +40,7 @@
 > `scale` 保持像素是**有意的向后兼容**：已有导出与阈值都按像素比拟合。
 > 3D 侧使用独立的 `scale_world`（米），两者不混用。
 
-## 一·五、3D 信号与退回规则（R3）
+## 一·五、3D 信号与退回规则
 
 `worldLandmarks` 是 MediaPipe 给的**米制 3D 坐标**：33 点、原点在髋中心、
 **y 向下为正**（实测鼻 y≈−0.62、踝 y≈+0.63）。
@@ -65,15 +66,15 @@
 | `enabled` | `true` | 总开关；false 时全部退回 2D |
 | `angles` | `true` | 膝角/肘角/髋角用 3D 夹角 |
 | `uprightness` | `true` | 躯干与重力轴点积 |
-| `legVertical` | **`false`** | 3D 腿竖直比。**量纲不同**（站立 3D≈1.9 vs 2D≈1.3），现有 `leg_vertical` 阈值直接切换会误判，等 R4 重拟合后再开 |
+| `legVertical` | **`false`** | 3D 腿竖直比。**量纲不同**（站立 3D≈1.9 vs 2D≈1.3），现有 `leg_vertical` 阈值直接切换会误判，需用实拍数据重拟合后再开 |
 | `ratios` | **`false`** | `reach` / `hands_close` / 手-头距离 / 手腕-髋距离改用世界距离 / `scale_world`。同样需要重拟合 |
 | `boneCheck` | `{enabled:true, windowFrames:60, minSamples:10, tolerance:0.2}` | 见下 |
 
 为什么脚/比值默认仍是 2D：**3D 更好不等于现有阈值在 3D 下仍然成立**。
-`leg_vertical` 与距离比值的量纲会整体偏移，切换必须同时换阈值（R4）。
+`leg_vertical` 与距离比值的量纲会整体偏移，切换必须同时换阈值（用 `--fit` 重拟合）。
 在此之前，3D 版本以 `*_3d` 字段并行导出，用 `web/test/signal-compare.mjs` 量化后再决定。
 
-### 骨骼长度一致性（新增）
+### 骨骼长度一致性
 
 每条肢体（上臂/前臂/大腿/小腿）维护最近 `windowFrames` 帧的**世界长度中位数**；
 攒够 `minSamples` 帧后（armed），当前帧长度偏离中位数超过 `tolerance`（20%）→ 该肢不可靠。
@@ -86,7 +87,7 @@
 
 对**选中的**角度信号做一阶差分：`v = (angle_t − angle_{t−1}) / Δt`，单位度/秒。
 Δt 超出 `[minDtMs, maxDtMs]` 给 NaN；速度再做一次 One Euro（`minCutoff=3`）。
-当前只导出、不单独参与判定——它的用途是 R4 判断「这个动作是否快到 `Hold`/滞回跟不上」。
+当前只导出、不单独参与判定——它的用途是判断「这个动作是否快到 `Hold`/滞回跟不上」。
 
 ### 短时遮挡外推
 
@@ -102,13 +103,12 @@
 
 | 原语 | 语义 | 参数 | 实现要求 |
 |---|---|---|---|
-| `state` | 信号越阈并**保持**一段时间才算成立 | `minMs` | 单帧命中一律不算 |
-| `rep` | 滞回周期计数 | `down`, `up`, `minHalfMs`, `adaptiveMs`, `adaptiveMinRatio` | 下阈/上阈不共用一条线；有历史后按半程中位数判周期（见下） |
-| `in_roi` | 关键点或框在 ROI 内 | `roi`（归一化 0~1 坐标） | ROI 用相对画面坐标，不用像素 |
-| `near` | 归一化距离阈值 | `max_dist`（单位=scale） | 禁止写像素 |
-| `sequence` | 有序阶段组合 | `phases`, `minPhaseMs`, `maxPhaseMs`, `completeAt` | 见 §二「sequence」；不是简单的 `max_gap` |
-| `absence` | 时间窗内未发生 | `window` | 用于「未复位」「未起身」 |
-| `cooldown` | 同类事件冷却 | `ms` | 防连发 |
+| `state`（`Hold`） | 信号越阈并**保持**一段时间才算成立 | `minMs` | 单帧命中一律不算 |
+| `rep`（`RepCounter`） | 滞回周期计数 | `down`, `up`, `minHalfMs`, `adaptiveMs`, `adaptiveMinRatio` | 下阈/上阈不共用一条线；有历史后按半程中位数判周期（见下） |
+| `sequence`（`PhaseSequence`） | 有序阶段组合 | `phases`, `minPhaseMs`, `maxPhaseMs`, `completeAt` | 见 §二「sequence」；不是简单的 `max_gap` |
+
+> **本版没有实现** `in_roi` / `near` / `absence` / `cooldown` 四个原语。
+> Demo 目前用不到它们；实现 Python 引擎或扩展动作时再补，不要假设它们在 `signals.js` 里存在。
 
 ### `sequence`：有序阶段（拿取的地基）
 
@@ -160,8 +160,9 @@
 
 - **持物 `carrying`**：手闭合且两臂都没伸出（`reach < carry.maxReach`）。
   端着东西走路就是这种姿势；手举得很远则是拿取过程，不算持物。
-- **指向 `pointing`**：单臂伸出，且手臂朝向接近水平（`arm_front` 或 `arm_side`）。
+- **指向 `pointing`**：单臂伸出、该侧手被检出，且手臂朝向接近水平（`arm_front` 或 `arm_side`）。
 - **伸手 `reaching`**：臂伸出 **且手张开**；握着拳不算伸手（那是持物/拿取）。
+  手的状态必须来自**伸出的那条臂**——另一侧手张开不能替它成立。
 - **拿取 `grasp`**：`PhaseSequence(['reach','grasp'])`，先伸手再合手才计一次（见 §二）。
 
 这四个动作（伸手/持物/指向/拿取）依赖手部模型。手部关掉或未检出时它们恒为 `false`，
@@ -274,7 +275,7 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 | 骨骼长度偏离 | > 20% 判不可靠 | 模型估计值的正常波动约 5~10%；20% 已明显是漂移 | `signals.world.boneCheck.tolerance` |
 | 骨骼样本数 | ≥ 10 帧才启用 | 太少的中位数本身不可信 | `signals.world.boneCheck.minSamples` |
 | 遮挡外推 | ≤ 300 ms | 超过 0.3 s 的常速度假设不成立 | `signals.occlusion.maxExtrapMs` |
-| `knee_vel` / `elbow_vel` | 只导出，不设阈值 | 速度阈值的用途是 R4 判断 Hold 是否跟得上 | `signals.velocity` |
+| `knee_vel` / `elbow_vel` | 只导出，不设阈值 | 速度阈值的用途是判断 Hold 是否跟得上 | `signals.velocity` |
 | 关节角突变 | > 1500°/s 且间隔 ≤ 250 ms | 33 ms 内跳 110°≈3333°/s（坏点）；100 ms 内跳 100°=1000°/s（真实下蹲） | `signals.angleJump.maxRate` / `maxDtMs` |
 | 左右侧滞回 | 0.15 | 另一侧可见性要高出 0.15 才换侧，防两侧抖动 | `signals.sideHysteresis` |
 | 上半身尺度换算 | 肩宽 × 1.4 | 髋不可信时用肩宽估躯干长；实测肩宽/躯干长 ≈1.25~1.55 | `signals.shoulderToTorso` |
@@ -305,7 +306,7 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
   否则站着弯一下手臂就会被算成一个俯卧撑。
 - 门控失效时调用 `RepCounter.abort()` 把相位复位，而不是暂停计数 ——
   暂停会让「下到底 → 坐下 → 再站起」被补记一次。
-- **短时遮挡外推期间例外：冻结而不是 abort**（R3）。`extrapolated` 命中的帧只跳过
+- **短时遮挡外推期间例外：冻结而不是 abort**。`extrapolated` 命中的帧只跳过
   `update()`，相位与计数都保持；外推结束后从原相位继续。按动作只冻结用到的点：
   深蹲看选中侧的髋/膝/踝，俯卧撑看选中侧的肩/肘/腕，鼓掌看两腕。
 
@@ -406,7 +407,7 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 
 阈值：`elev_torso < 75°` 记为举起（`arm.elevTorso.raised`）。
 
-### R3：3D 比值的双份导出
+### 3D 比值的双份导出
 
 `reach` / `hands_close` / 手-头距离 / 手腕-髋距离都有 `*_2d` 与 `*_3d` 两份，
 判定用哪份由 `signals.world.ratios` 决定（默认 2D）。导出帧里两份都在，
@@ -416,15 +417,16 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 node web/test/signal-compare.mjs --a front.frames.json --b side.frames.json --action squat
 ```
 
+`--action` 会自动找同名 `front.labels.json` / `side.labels.json`；没有 labels 时只做全帧分布对比。
 输出每套信号的分布与**跨素材重合度**（1=完全重合），以及 2D/3D 的差值。
 重合度高不代表信号正确，它只回答「换机位后分布漂不漂」，必须和 recall/precision 一起看。
 
 ## 七、已知限制
 
 - **3D 不是真值，是模型估计值**。`worldLandmarks` 的抖动可能大于 2D 投影，尤其在手部/肢体末端。
-  所以 R3 的验收不是「改完 3D 就算数」，而是在实拍素材上比较 2D / 3D 的静止峰峰值与跨机位重合度
+  所以验收不是「改完 3D 就算数」，而是在实拍素材上比较 2D / 3D 的静止峰峰值与跨机位重合度
   （`signal-compare.mjs`），允许按信号分别选。默认只开了语义直接可比的角与直立度；
-  `leg_vertical` 与距离比值需要重拟合阈值（R4）后再切。
+  `leg_vertical` 与距离比值需要重拟合阈值后再切。
 - **骨骼长度一致性有冷启动**：前 `minSamples`(10) 帧不否定任何肢体；单帧深度估计跳变若恰好
   落在中位数窗口里，会短暂把正常肢判成不可靠。阈值 20% 是量级参考，需用实拍统计校准。
 - 侧视 vs 正视：侧面看蹲是膝角，正面看蹲是髋下沉量。同一动作不同机位要不同原语，

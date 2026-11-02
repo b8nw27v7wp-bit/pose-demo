@@ -512,6 +512,13 @@ console.log('\n[15] 元数据与报告');
     await writeFile(wrapped, JSON.stringify({ model: 'lite', frames: recs }), 'utf8');
     const loaded2 = await loadFrames(wrapped);
     check('{frames:[...]} 容器的 meta 也能读到', loaded2.meta?.model === 'lite' && loaded2.length === 5);
+
+    // 单行 JSONL 只有 meta（空导出）时不能把 meta 当成一帧喂给信号层。
+    const metaOnly = path.join(dir, 'meta-only.jsonl');
+    await writeFile(metaOnly, `${JSON.stringify(meta)}\n`, 'utf8');
+    const loaded3 = await loadFrames(metaOnly);
+    check('只有 meta 的单行 JSONL 不当成帧',
+      loaded3.length === 0 && loaded3.meta?.model === 'full', `len=${loaded3.length}`);
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }

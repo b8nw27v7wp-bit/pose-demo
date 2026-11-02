@@ -143,7 +143,7 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 
 `none` 与 `noArm` 的差别：`noArm` 不把站立/坐下当成错误，也不追究计数；`none` 什么都不允许，并把窗口内的计数误报算进去。
 
-### 手势段（R7）
+### 手势段
 
 手势不是动作层的布尔 flag，而是「这一帧、这只手被判成什么」，所以单独写一段：
 
@@ -161,7 +161,7 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
   反例段里正常判出「不是目标手势」的帧不会被漏掉。这是刻意的：手势分类在侧对时本来就不可信。
 - 手-人归属：手 bbox 中心落在 `persons[0]`（页面导出的目标人）bbox 内、各边留 5% 余量，才算这个人的手。
   当前导出每条记录只有目标人；多人素材请等导出侧支持多人后再谈。
-- `none` 段窗口里判定出的手势记为该手势的 **FP**（补上以前的漏洞），但不会让 `none` 段本身失败。
+- `none` 段窗口里判定出的手势记为该手势的 **FP**，但不会让 `none` 段本身失败。
 
 ## 难例回流（页面「判错了」按钮）
 
@@ -178,7 +178,7 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
    **计数类要把 `count` 改成实际期望次数**（草稿默认是 1）；
 5. 跑一次全量报告，看这个难例属于漏判、误报还是串判。
 
-`!动作` / `noArm` 是 R1 的反例语法，评估器直接认；`hardcase.js` 只是把它们原样写进
+`!动作` / `noArm` 是评估器的反例语法，`hardcase.js` 只是把它们原样写进
 `segments[].action`，不会改写成 `expect:false` 对象。
 
 视频播完之后再点也没问题：单次播放结束后帧不再增加，点击窗口里没有帧时窗口会锚到
@@ -226,7 +226,7 @@ node web/test/manifest-check.mjs --init --dir eval-data   # 扫帧文件生成�
   其余姿态是什么并不知道）。同一帧被两个不同姿态段覆盖 → 标为**冲突**并跳过，这是标注错误，不算模型错。
 - **手臂**是多标签（可以同时成立，例如挥手必然同时是举手），做不了混淆矩阵，
   因此给出**共现矩阵**：`matrix[i][j]` = 第 i、j 个动作同时为真的帧数。它回答"哪些动作总是一起报"。
-- 手势（R7）还没有评估语法，暂不进入矩阵。
+- 手势是**帧级指标**，单独成节（见上文「手势（帧级）」），不进入姿态混淆矩阵与手臂共现矩阵。
 
 ### 分组统计
 
@@ -270,8 +270,7 @@ labels 里写 `camera` / `subject`，报告会分别给出：
 - 时延和抖动按**动作**汇总，不按机位拆；分组看 recall/precision 就够了。
 - 抖动统计的是整段素材，不只是标注段。
 - 翻转的合并语义：连续 on 采样永远合并，off 间隙 ≤ `mergeMs` 才接回去。
-  （之前默认 `mergeMs=0` 会把每一帧 on 都拆成一个区间；判定只用 overlap 所以看不出来，
-  但翻转次数会直接失真——这是加抖动指标时暴露出来的 bug，已修。）
+  如果把每一帧 on 都拆成一个区间，判定只用 overlap 看不出来，但翻转次数会直接失真。
 
 ## 阈值拟合（B 阶段）
 
@@ -329,7 +328,7 @@ node web/test/evaluate.mjs --dir eval-data --loso --max-loso-drop 0.1
 - 要求每份 labels 都填 `subject`，且至少有 **2 个受试**；缺 `subject` 的素材不参与 fold 并会告警。
 - 每个 fold：用其余人的素材拟合阈值（同 `--margin`），在留出者上重放，报 `训练 recall/precision`、
   `留出 recall/precision` 与 **Δ = 留出 − 训练**（负数才是退化）。
-- `--max-loso-drop R`：Δ 低于 `−R` 即门槛失败、退出码 2（PLAN §13.4 的「留一人退化 ≤10 个百分点」）。
+- `--max-loso-drop R`：Δ 低于 `−R` 即门槛失败、退出码 2（验收口径：留一人退化 ≤10 个百分点）。
 - 每折拟合出的覆盖项在 `--json` 的 `loso.folds[].fitted` 里，带参数指纹。
 - 单人的数据做不了 LOSO——这正是 `docs/data-collection.md` 要求 ≥2 人的原因。
 
@@ -341,7 +340,7 @@ node web/test/evaluate.mjs --dir eval-data --resample 15
 
 - 按目标 fps 等间隔抽帧后重放；报告给出 `帧数 before → after` 与相对原始帧的指标 Δ。
 - 目标 fps 等于源 fps 时是 no-op；5% 的间隔容差吸收 `video_time` 三位小数与时间戳取整造成的抖动。
-- 15 fps 下 120 ms 只有 2 帧，`minHalfMs` / Hold 会先失效；这正是 R4 要看的。
+- 15 fps 下 120 ms 只有 2 帧，`minHalfMs` / Hold 会先失效；这正是帧率验收要看的。
 - 重采样会改变帧序号，`startFrame/endFrame` 标注会被拒绝，请改用 `start/end` 或 `startSec`。
 
 ## 用 profile 跑
@@ -425,7 +424,7 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.posture.stand.kneeGt 
   旧导出若没有 `hands`，手部动作按页面「手部未加载」处理（`reaching`/`carrying`/`pointing`/`grasp` 恒为 false）；
   若没有 `kp_world`，角度/直立度走 2D，与页面的 3D 默认不是同一套信号。报告头会回显数据的模型档位，
   但**不会**统计每段素材的 3D 覆盖率——混用新旧导出时要自己确认。
-- 如果导出被截断（旧版本 `MAX_LOG=600`），长视频的尾部会缺帧；当前版本上限 20000 帧。
+- 导出上限是 20000 帧（`MAX_LOG`）；更长的素材尾部会被按批丢弃（页面会显示丢弃帧数），recall 会失真，请分段录。
 - `startSec/endSec` 只在**单次播放**的素材上唯一；循环/拖回导致 `video_time` 回绕时，评估器会报错并要求改用 `start/end`（ts）。
 - 合成样例（`make-sample.mjs`）只验证链路，不构成任何准确率结论。
 

@@ -1,4 +1,4 @@
-# 采集与标注协议（R2）
+# 采集与标注协议
 
 这份文档只回答一件事：**怎样采一批数据，能支撑"动作判得准不准"的结论。**
 没有它，`evaluate.mjs` 能算出数字，但数字的样本量、机位、人和反例都说不清，结论不成立。
@@ -115,7 +115,7 @@
 > 评估器原生支持 `none`、`!动作`、`expect:false`、`noArm`；manifest 校验器按手臂动作计 `noArm` 反例。
 > 单动作误报（例如站着但被误判叉腰）用 `!onHips`，不要用 `none`——`none` 还要求姿态也不出现。
 >
-> **`subject` 必须填**（labels 顶层，例如 `"subject": "A"`）：R4 的留一人验证（`evaluate --loso`）
+> **`subject` 必须填**（labels 顶层，例如 `"subject": "A"`）：留一人验证（`evaluate --loso`）
 > 按它划分训练/留出，至少需要 2 个不同的值。同一受试的所有素材写同一个名字，否则 LOSO 会把它当成两个人。
 
 ## 七、文件命名与目录
@@ -180,7 +180,7 @@ node web/test/manifest-check.mjs --manifest eval-data/manifest.json
 # 6. 达标后再打分
 node web/test/evaluate.mjs --dir eval-data --report eval-data/report.md
 
-# 7. R4：分位→profile、留一人验证、帧率敏感性（至少 2 人、labels 必须填 subject）
+# 7. 分位→profile、留一人验证、帧率敏感性（至少 2 人、labels 必须填 subject）
 node web/test/evaluate.mjs --dir eval-data --fit --fit-out /tmp/fitness-fit.json
 node web/test/evaluate.mjs --dir eval-data --loso --max-loso-drop 0.1
 node web/test/evaluate.mjs --dir eval-data --resample 15

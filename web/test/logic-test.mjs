@@ -937,6 +937,18 @@ console.log('\n[22] 拿取与手臂扩展');
   check('无手部数据 → 不判持物', r8.flags.carrying === false);
   check('无手部数据 → 不判拿取', r8.reps.grasp === 0);
 
+  // 手必须和伸出的那条臂对应：左臂伸出但左手未检出，右手在身侧张开，
+  // 不能拿右手的状态去判「伸手」/「指向」。
+  const ae8b = new ActionEngine();
+  let t8b = 0; let r8b;
+  for (let i = 0; i < 6; i++) r8b = ae8b.update(mkSig(), t8b += 100, hands(null, 'open'));
+  check('另一侧手张开不能替伸出的手判定伸手', r8b.flags.reaching === false);
+  check('另一侧手张开不能替伸出的手判定指向', r8b.flags.pointing === false);
+  const ae8c = new ActionEngine();
+  let t8c = 0; let r8c;
+  for (let i = 0; i < 6; i++) r8c = ae8c.update(mkSig(), t8c += 100, hands('open', 'fist'));
+  check('伸出侧手张开 + 另一侧握拳 → 仍算伸手', r8c.flags.reaching === true);
+
   // 前平举 / 侧平举
   const frontSig = mkSig({
     armPose: { ...mkSig().armPose, arm_front_L: true, arm_side_L: false },

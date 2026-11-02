@@ -48,6 +48,9 @@ let profileModel = null;
 // 实际跑起来的模型/后端：导出时写进 meta，否则事后无法判断数据出自哪一档
 let activeModel = null;
 let activeDelegate = null;
+// 手部模型是否在本会话里成功加载过。停止/切换输入后 handReady 会变成 false，
+// 但已记录的帧仍是用它产出的，导出 meta 必须保留这个信息（同 activeModel 的理由）。
+let activeHandModel = null;
 let signalEngine = new SignalEngine(activeParams);
 let actionEngine = new ActionEngine(activeParams);
 
@@ -227,6 +230,10 @@ let seeking = false;            // 正在拖进度条：syncPlayer 不要覆盖�
 let resumeAfterSeek = false;
 let dragDepth = 0;
 let profileReady = Promise.resolve(); // 启动时 profile 加载完成前不要开始输入
+// 输入代次：摄像头/视频/图片的启动都要等模型或首帧，多个 await 之间用户可能已经换了输入。
+// 每个入口先领一个 token，await 回来发现不是最新的一代就放弃——否则旧任务会覆盖新源，
+// 或者旧任务的失败分支把刚加载好的新源一起清掉。
+let inputSeq = 0;
 
 const show = { skeleton: true, hands: true, points: true, mirror: true };
 const autoSrc = new URLSearchParams(location.search).get('src');
@@ -367,13 +374,30 @@ async function initEstimator() {
   }
 }
 
+// 手部初始化做串行化：快速开关「手部」会并发两次 createHandEstimator，
+// 两边都看到槽位为空、各建一个实例，后一个覆盖前一个，前一个的显存就泄漏了。
+let handsInitPromise = null;
+
 async function initHands(delegate) {
+  if (handsInitPromise) return handsInitPromise;
+  handsInitPromise = doInitHands(delegate).finally(() => { handsInitPromise = null; });
+  return handsInitPromise;
+}
+
+async function doInitHands(delegate) {
   handReady = false;
-  if (!show.hands) return;
+  if (!show.hands) {
+    // 手部关闭时要真的把实例放掉，否则换模型后旧的 VIDEO/IMAGE 实例仍各占一份显存。
+    closeHandEstimator();
+    return;
+  }
   for (const d of delegate === 'GPU' ? ['GPU', 'CPU'] : ['CPU']) {
     try {
       await createHandEstimator({ delegate: d, runningMode: 'VIDEO', numHands: 2 });
+      // 建模型期间用户可能已经关掉手部（或又换了输入）：关掉就释放，别留下实例。
+      if (!show.hands) { closeHandEstimator(); return; }
       handReady = true;
+      activeHandModel = 'hand_landmarker';
       // ROI 补检需要独立的 IMAGE 实例（VIDEO 实例用于整帧追踪，混用会把裁图当成下一帧）。
       // 建不起来不致命：退回纯整帧检测，只是远景手部动作会漏。
       try {
@@ -382,6 +406,8 @@ async function initHands(delegate) {
           detConf: 0.3, presenceConf: 0.3,
         });
       } catch { /* ROI 补检不可用 */ }
+      if (!show.hands) { closeHandEstimator(); return; }
+      handReady = handsReady('VIDEO');
       return;
     } catch { /* 手部模型失败不影响主体识别 */ }
   }
@@ -402,6 +428,9 @@ function resetRuntime() {
   lastInferTs = 0;
   handFails = 0;
   for (const k of Object.keys(shapeStable)) shapeStable[k].reset();
+  // 引擎和计数都重置了，上一帧的判定结果就不再属于这套参数/输入：
+  // 不清掉的话，暂停中的视频或切换 profile 后面板会继续显示旧结论。
+  lastResult = null;
   renderReps({ squat: 0, pushup: 0, clap: 0, grasp: 0 });
   updateUI();
 }
@@ -434,12 +463,17 @@ async function startCamera(opts = {}) {
   const btn = $('btnCamera');
   const prevMode = mode;      // 失败时别连累已经在播的文件
   let assigned = false;       // 是否已经把摄像头流挂到 video 上（挂上后文件源就没了）
+  const token = ++inputSeq;
+  // 用户显式点了摄像头：不要再让 ?src= 的自动素材在模型就绪后反过来顶掉摄像头。
+  if (autoSrc) autoLoaded = true;
   try {
     await profileReady;
+    if (token !== inputSeq) return;
     stopStream();
     setStatus('摄像头启动中…', 'busy');
     btn.disabled = true;
     if (!(await ensureEstimator())) {
+      if (token !== inputSeq) return;
       if (prevMode === 'file' && videoEl.getAttribute('src')) return;
       stopLoop();
       videoEl.srcObject = null;
@@ -469,9 +503,17 @@ async function startCamera(opts = {}) {
       cameraDeviceId = null;
       stream = await navigator.mediaDevices.getUserMedia(constraints(null));
     }
+    // 等权限/设备期间用户可能已经改选了视频或图片：新输入优先，别把它顶掉。
+    if (token !== inputSeq) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
     // 摄像头真的起来了才清掉图片：失败时原来的画面还在
     clearPhoto();
     currentStream = stream;
+    // 摘掉上一次文件源的 src（可能是已 revoke 的 blob），否则 srcObject 结束后
+    // 元素可能又去加载那个失效地址。
+    videoEl.removeAttribute('src');
     videoEl.srcObject = stream;
     assigned = true;
     videoEl.loop = false;
@@ -489,6 +531,8 @@ async function startCamera(opts = {}) {
     saveSettings();
     syncPlayer();
   } catch (e) {
+    // 已有更新的输入在启动：这次失败与新输入无关，不要把新输入的状态清掉。
+    if (token !== inputSeq) return;
     // 摄像头没起来、文件源一点没动：保持原视频和已录帧，只报错。
     // （之前这里无条件 resetRuntime()，会把用户已录的一段数据清空）
     const keepCurrent = !assigned && ((prevMode === 'file' && videoEl.getAttribute('src'))
@@ -504,6 +548,9 @@ async function startCamera(opts = {}) {
       setStatus('摄像头不可用', 'err');
       setActiveInput(null);
       mode = 'idle';
+      // 已经拿到的流必须在这里停掉：play() 失败/权限中途变化时若不 stopStream，
+      // 摄像头指示灯会一直亮着，直到下一次操作。
+      stopStream();
       // 旧流已停：停循环、摘掉 srcObject，别让主循环继续拿停掉的流写帧
       stopLoop();
       videoEl.srcObject = null;
@@ -552,9 +599,21 @@ function waitForVideoReady(el, timeoutMs = 10000) {
 }
 
 async function useVideoSource(src, { loop = false, revoke = null } = {}) {
+  const token = ++inputSeq;
+  // 显式输入优先于 ?src= 的自动加载：手动选了视频后，别再让自动素材在模型就绪时顶掉它。
+  autoLoaded = true;
+  const stale = () => token !== inputSeq;
   await profileReady;
+  if (stale()) {
+    if (revoke) URL.revokeObjectURL(revoke);   // 还没挂到 video 上，直接释放
+    return false;
+  }
   stopStream();
   if (!(await ensureEstimator())) {
+    if (stale()) {
+      if (revoke) URL.revokeObjectURL(revoke);
+      return false;
+    }
     // 模型起不来时，正在播的原文件 / 正在看的图片别跟着一起清掉
     if ((mode === 'file' && videoEl.getAttribute('src')) || (mode === 'image' && !photoEl.hidden)) {
       if (revoke) URL.revokeObjectURL(revoke);   // 新 blob 从没挂到 video 上，直接释放
@@ -569,27 +628,36 @@ async function useVideoSource(src, { loop = false, revoke = null } = {}) {
     syncPlayer();
     return false;
   }
+  if (stale()) {
+    if (revoke) URL.revokeObjectURL(revoke);
+    return false;
+  }
   videoEl.srcObject = null;
   if (revoke) {
     videoEl.addEventListener('loadstart', () => setTimeout(() => URL.revokeObjectURL(revoke), 5000), { once: true });
   }
   videoEl.src = src;
   videoEl.loop = loop;
-  videoEl.onerror = () => failInput(`视频无法解码（code ${videoEl.error?.code ?? '?'}）`);
+  // 出错回调也绑定到这一代输入：旧源的 error 不能清掉用户刚选中的新源。
+  videoEl.onerror = () => {
+    if (!stale()) failInput(`视频无法解码（code ${videoEl.error?.code ?? '?'}）`);
+  };
 
   // 必须先等元数据/首帧就绪再 play()，否则部分环境下 play() 会被 abort
   try {
     await waitForVideoReady(videoEl);
   } catch (e) {
-    failInput(`视频加载失败：${e.message}`);
+    if (!stale()) failInput(`视频加载失败：${e.message}`);
     return false;
   }
+  if (stale()) { if (revoke) URL.revokeObjectURL(revoke); return false; }
   try {
     await videoEl.play();
   } catch (e) {
-    failInput(`视频播放被拒（${e.name}）`);
+    if (!stale()) failInput(`视频播放被拒（${e.name}）`);
     return false;
   }
+  if (stale()) return false;
   // 视频已经能播了再撤掉图片，加载失败时保持原画面
   clearPhoto();
   mode = 'file';
@@ -602,8 +670,8 @@ async function useVideoSource(src, { loop = false, revoke = null } = {}) {
   const warmed = await warmUpPlayback();
   // 两种情况都不能用「就绪」盖掉已写好的错误状态：
   // 预热期间推理出错会 stopLoop()（rafId 变 null）；恢复播放被拒时 warmUpPlayback 返回 false。
-  if (rafId !== null && warmed) setStatus('就绪 · 视频文件', 'ok');
-  return true;
+  if (token === inputSeq && rafId !== null && warmed) setStatus('就绪 · 视频文件', 'ok');
+  return token === inputSeq;
 }
 
 /**
@@ -784,12 +852,27 @@ function analyzeStill(img) {
  * @param {{revoke?: string|null}} opts revoke = 需要在本函数结束后释放的 blob URL
  */
 async function useImageSource(src, { revoke = null } = {}) {
+  const token = ++inputSeq;
+  autoLoaded = true;   // 手动选择的图片同样优先于 ?src= 自动加载
+  const stale = () => token !== inputSeq;
   await profileReady;
-  stopStream();
-  stopLoop();
+  if (stale()) {
+    if (revoke) URL.revokeObjectURL(revoke);
+    return false;
+  }
+  // 先把模型和图片都准备好，再停当前输入：图片选择/解码失败时，
+  // 正在播的视频或摄像头不该被无辜停掉（旧代码在解码前就 stopLoop，失败后画面还在但推理没了）。
   if (!(await ensureEstimator())) {
+    if (stale()) {
+      if (revoke) URL.revokeObjectURL(revoke);
+      return false;
+    }
     if (revoke) URL.revokeObjectURL(revoke);
     setStatus('模型加载失败，无法分析图片', 'err');
+    return false;
+  }
+  if (stale()) {
+    if (revoke) URL.revokeObjectURL(revoke);
     return false;
   }
   const img = new Image();
@@ -798,10 +881,16 @@ async function useImageSource(src, { revoke = null } = {}) {
     await img.decode();
   } catch {
     if (revoke) URL.revokeObjectURL(revoke);
-    setStatus('图片加载失败', 'err');
+    if (!stale()) setStatus('图片加载失败', 'err');
+    return false;
+  }
+  if (stale()) {
+    if (revoke) URL.revokeObjectURL(revoke);
     return false;
   }
 
+  stopStream();
+  stopLoop();
   clearPhoto();
   photoUrl = revoke || null;
   photoEl.src = src;
@@ -821,8 +910,8 @@ async function useImageSource(src, { revoke = null } = {}) {
     setStatus(`图片分析失败：${e.message}`, 'err');
     return false;
   }
-  setStatus('就绪 · 图片（单帧判定，无时间窗）', 'ok');
-  return true;
+  if (token === inputSeq) setStatus('就绪 · 图片（单帧判定，无时间窗）', 'ok');
+  return token === inputSeq;
 }
 
 async function useImageFile(file) {
@@ -834,6 +923,8 @@ async function useImageFile(file) {
 }
 
 function stopAll() {
+  // 让还在等模型/首帧的输入任务作废，别在「已停止」之后又挂上新画面。
+  ++inputSeq;
   stopStream();
   stopLoop();
   clearPhoto();
@@ -1130,7 +1221,9 @@ function baseExportMeta() {
     // 事后想回答"这份数据是哪套模型跑出来的"，只能靠这两行。
     model: activeModel,
     delegate: activeDelegate,
-    hand_model: handReady ? 'hand_landmarker' : null,
+    // 用 activeHandModel 而不是 handReady：点过「停止」后模型已释放，
+    // 但已记录的帧仍是手部模型产出的，导出时不能把这份来源丢掉。
+    hand_model: activeHandModel,
     infer_fps: Number($('fpsCapSel').value) || null,
     fps: r1(fps),
     profile: profileName,
@@ -1441,6 +1534,7 @@ function resetPlaceholder() {
 /** 输入失败：停循环、摘掉源、清空本次记录，回到空闲（状态栏保留具体错误） */
 function failInput(message) {
   setStatus(message, 'err');
+  stopStream();
   stopLoop();
   clearPhoto();
   videoEl.removeAttribute('src');
@@ -1498,7 +1592,8 @@ function updateUI() {
   } else if (upperOnly) {
     $('postureMeta').textContent = '下半身不可见（出画/遮挡），站/坐无法判定';
   } else {
-    $('postureMeta').textContent = sig ? '—' : '无画面';
+    $('postureMeta').textContent = sig ? '—'
+      : (mode === 'idle' ? '无画面' : mode === 'image' ? '—' : '等待下一帧');
   }
 
   for (const a of ACTION_CATALOG) {
@@ -1699,7 +1794,14 @@ $('chkSkeleton').addEventListener('change', (e) => {
 $('chkHands').addEventListener('change', async (e) => {
   show.hands = e.target.checked;
   saveSettings();
-  if (show.hands && !handsReady()) await initHands($('delegateSel').value);
+  if (!show.hands) {
+    // 关掉手部就别再让实例占显存；下次打开时重新加载。
+    closeHandEstimator();
+    handReady = false;
+    activeHandModel = null;
+  } else if (!handsReady()) {
+    await initHands($('delegateSel').value);
+  }
   updateUI();
 });
 $('chkPoints').addEventListener('change', (e) => {
@@ -1725,7 +1827,8 @@ window.addEventListener('beforeunload', () => { stopStream(); closeEstimator(); 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     stopLoop();
-  } else if (mode !== 'idle' && estimatorReady) {
+  } else if (mode !== 'idle' && mode !== 'image' && estimatorReady) {
+    // 图片模式没有时间序列，不需要 rAF 主循环。
     ensureLoop();
   }
 });

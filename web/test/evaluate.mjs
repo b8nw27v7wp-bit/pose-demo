@@ -25,7 +25,7 @@ import { SignalEngine } from '../js/signals.js';
 import { ActionEngine, ARM_FLAG_IDS, ARM_ID_TO_FLAG, POSTURE_IDS, REP_IDS } from '../js/actions.js';
 import { SHAPE_IDS } from '../js/handshape.js';
 import { resolveParams, mergeParams, profileParams, profileName, paramsHash } from '../js/params.js';
-import { videoTimeMonotonic } from './frame-io.mjs';
+import { stripBom, videoTimeMonotonic } from './frame-io.mjs';
 
 // —— 参数 ---------------------------------------------------------------
 
@@ -170,7 +170,7 @@ function parseJsonl(text) {
  */
 export async function loadFrames(file) {
   const text = await readFile(file, 'utf8');
-  const trimmed = text.trim();
+  const trimmed = stripBom(text).trim();
   if (!trimmed) throw new Error(`${file}: 空文件`);
 
   if (trimmed.startsWith('[')) {
@@ -180,9 +180,17 @@ export async function loadFrames(file) {
   if (trimmed.startsWith('{')) {
     try {
       const raw = JSON.parse(trimmed);
-      // 单条帧记录（带 kp_format）不是容器
-      if (raw && !Array.isArray(raw.frames) && !Array.isArray(raw) && raw.kp_format !== undefined) return [raw];
-      return attachMeta(normalizeFrames(raw), metaFrom(raw));
+      // 容器（{frames} / 裸数组 / {records}）优先
+      if (Array.isArray(raw) || Array.isArray(raw?.frames) || Array.isArray(raw?.records)) {
+        return attachMeta(normalizeFrames(raw), metaFrom(raw));
+      }
+      // 单条帧记录：必须真的像一帧（有 ts 或 persons）。只凭 kp_format 会把
+      // 只有 meta 的单行 JSONL 误当成一帧，replay 后得到一个空时间线。
+      if (raw && raw.kp_format !== undefined
+        && (raw.ts !== undefined || Array.isArray(raw.persons))) return [raw];
+      const meta = metaFrom(raw);
+      if (meta) return attachMeta([], meta);
+      return attachMeta(normalizeFrames(raw), null);
     } catch (e) {
       // 整体解析失败但有多行 → 当 JSONL 处理
       const lines = text.split(/\r?\n/).filter((l) => l.trim());
@@ -195,7 +203,7 @@ export async function loadFrames(file) {
 }
 
 async function loadLabels(file) {
-  const raw = JSON.parse(await readFile(file, 'utf8'));
+  const raw = JSON.parse(stripBom(await readFile(file, 'utf8')));
   if (Array.isArray(raw)) return { segments: raw, clips: undefined };
   if (!Array.isArray(raw.segments)) throw new Error(`${file}: 缺少 segments 数组`);
   return raw;
@@ -2229,7 +2237,7 @@ export async function pairsFromDir(dir) {
 }
 
 async function readProfile(file) {
-  const raw = JSON.parse(await readFile(file, 'utf8'));
+  const raw = JSON.parse(stripBom(await readFile(file, 'utf8')));
   const params = profileParams(raw);
   const name = profileName(raw, path.basename(file));
   return {
@@ -2422,7 +2430,7 @@ async function runSingle(args, loaded, profile) {
   if (warning && !args.quiet) console.error(`⚠ ${warning}`);
 
   let baseline = null;
-  if (args.baseline) baseline = JSON.parse(await readFile(args.baseline, 'utf8'));
+  if (args.baseline) baseline = JSON.parse(stripBom(await readFile(args.baseline, 'utf8')));
 
   const summary = summarize(run.clips);
   const loso = args.loso ? runLoso(evalLoaded, profile, args) : null;
@@ -2440,7 +2448,7 @@ async function runSingle(args, loaded, profile) {
   const fitProfile = converted ? {
     name: 'fitness-fit',
     model: models.length === 1 ? models[0].split('/')[0] : null,
-    note: `自动拟合（margin=${args.margin}）；只翻译有信号来源的阈值，写入前请对分位表复核（PLAN §13 R4）`,
+    note: `自动拟合（margin=${args.margin}）；只翻译有信号来源的阈值，写入前请对分位表复核`,
     params: converted.params,
     warnings: converted.warnings,
     sources: converted.sources,

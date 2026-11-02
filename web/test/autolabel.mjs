@@ -19,7 +19,7 @@ import { pathToFileURL } from 'node:url';
 import { replay } from './evaluate.mjs';
 import { profileParams } from '../js/params.js';
 import { ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
-import { loadFrames, videoTimeMonotonic } from './frame-io.mjs';
+import { loadFrames, stripBom, videoTimeMonotonic } from './frame-io.mjs';
 
 export const POSTURES = ACTION_CATALOG.map((a) => a.id);
 export const ARM_FLAGS = ARM_ACTIONS.map((a) => a.flag);
@@ -177,7 +177,7 @@ async function main() {
     return;
   }
   const params = args.profile
-    ? profileParams(JSON.parse(await readFile(args.profile, 'utf8')))
+    ? profileParams(JSON.parse(stripBom(await readFile(args.profile, 'utf8'))))
     : {};
   const mergeMs = Number.isFinite(Number(args['merge-ms'])) ? Number(args['merge-ms']) : 500;
   const minMs = Number.isFinite(Number(args['min-ms'])) ? Number(args['min-ms']) : 300;

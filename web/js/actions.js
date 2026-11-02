@@ -222,18 +222,28 @@ export class ActionEngine {
     // 宁可漏判，也不要把「手没被检出」当成「手是空的」。
     const closedL = !!hands && this.closedShapes.has(hands.L);
     const closedR = !!hands && this.closedShapes.has(hands.R);
+    const hasL = !!hands && hands.L != null;
+    const hasR = !!hands && hands.R != null;
+    const openL = hasL && !closedL;
+    const openR = hasR && !closedR;
     const anyClosed = closedL || closedR;
-    const anyOpen = !!hands && ((hands.L != null && !closedL) || (hands.R != null && !closedR));
-    const extended = ap.extend_L || ap.extend_R;
+    const extendedL = !!ap.extend_L;
+    const extendedR = !!ap.extend_R;
+
+    // 手必须和**伸出的那条臂**对应：只看 anyOpen 时，
+    // 「左臂伸出但手没检出，右手在身侧张开」会被误判成伸手。
+    const reachOpen = (extendedL && openL) || (extendedR && openR);
+    const reachClosed = (extendedL && closedL) || (extendedR && closedR);
 
     // 伸手：臂伸出且手是张开的（握着拳不算伸手，那是持物/拿取）
-    const reaching = this.reachHold.update(extended && anyOpen, ts);
+    const reaching = this.reachHold.update(reachOpen, ts);
     // 持物：手闭合且臂没有明显伸出（端着/拿着东西的自然姿势）
     const carrying = this.carryHold.update(anyClosed
       && (ap.reach_L ?? 0) < this.carryCfg.maxReach
       && (ap.reach_R ?? 0) < this.carryCfg.maxReach, ts);
-    // 指向：单臂伸出 + 手不是握拳（食指伸出与否由手势层判断，这里只保证「臂伸直且有手」）
-    const pointing = this.pointHold.update(extended && (anyOpen || closedL || closedR)
+    // 指向：伸出那条臂的手被检出（食指伸出与否由手势层判断），且臂朝正面/侧面
+    const extendedHand = (extendedL && hasL) || (extendedR && hasR);
+    const pointing = this.pointHold.update(extendedHand
       && (ap.arm_side_L || ap.arm_side_R || ap.arm_front_L || ap.arm_front_R), ts);
 
     // 前/侧平举：信号层是瞬时布尔，这里补一个保持窗。
@@ -243,8 +253,9 @@ export class ActionEngine {
     const armSide = this.sideHold.update(!!(ap.arm_side_L || ap.arm_side_R), ts);
 
     // 拿取状态机：reach（伸手且手张开）→ grasp（手合上）。两次都成立才算一次拿取。
-    const observed = extended && anyOpen ? 'reach'
-      : (extended && anyClosed ? 'grasp' : null);
+    // 仍按「伸出的那条臂」取手的状态，避免另一只手的开合推进阶段机。
+    const observed = reachOpen ? 'reach'
+      : (reachClosed ? 'grasp' : null);
     const step = this.graspSeq.update(observed, ts);
     this.graspPhase = step.phase;
     this.graspCount = step.count;

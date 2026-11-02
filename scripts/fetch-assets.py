@@ -75,9 +75,15 @@ def fetch_vendor(dest, force):
                 name = member.name[len(VENDOR_WASM_PREFIX):]
                 if not name:
                     continue
-                out = os.path.join(wasm_dir, name)
+                # npm tarball 理论上可信，但仍按不可信输入处理：拒绝绝对路径与 ..
+                # 路径穿越，避免压缩包把文件写到 vendor/ 之外。
+                safe = os.path.normpath(name)
+                if os.path.isabs(safe) or safe.startswith("..") or safe != name:
+                    log(f"  [skip] 可疑路径：{member.name}")
+                    continue
+                out = os.path.join(wasm_dir, safe)
                 write_bytes(out, tar.extractfile(member).read())
-                log(f"  → vendor/wasm/{name}")
+                log(f"  → vendor/wasm/{safe}")
 
 
 def fetch_models(dest, force):

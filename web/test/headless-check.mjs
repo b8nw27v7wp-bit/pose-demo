@@ -7,6 +7,7 @@
 
 import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -24,6 +25,18 @@ async function findChrome() {
     try { await access(p); return p; } catch { /* next */ }
   }
   throw new Error('找不到 Chrome/Edge');
+}
+
+/** 让系统分配一个空闲端口：写死端口时，本机其它 Chrome/另一个 checkout 的检查会串到一起。 */
+async function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
 }
 
 async function startChrome(bin, port) {
@@ -107,7 +120,7 @@ class CDP {
 
 async function main() {
   const url = process.argv[2] || 'http://127.0.0.1:8765/web/?src=/data/pose-test-vp8.webm';
-  const port = 9333;
+  const port = await freePort();
 
   const bin = await findChrome();
   const { proc, profile } = await startChrome(bin, port);

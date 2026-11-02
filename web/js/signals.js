@@ -726,11 +726,19 @@ export class SignalEngine {
     const kneePick = kneeSel.v;
     const elbowSide = elbowSel.side;
     const elbowPick = elbowSel.v;
-    // 诊断用的 2D/3D 版本跟随同一侧，保证和判定侧可比
-    const kneePick2d = pickSide(angles2d.knee_L, angles2d.knee_R, kneeVisL, kneeVisR, this.prevKneeSide).v;
-    const kneePick3d = pickSide(angles3d.knee_L, angles3d.knee_R, kneeVisL, kneeVisR, this.prevKneeSide).v;
-    const elbowPick2d = pickSide(angles2d.elbow_L, angles2d.elbow_R, elbowVisL, elbowVisR, this.prevElbowSide).v;
-    const elbowPick3d = pickSide(angles3d.elbow_L, angles3d.elbow_R, elbowVisL, elbowVisR, this.prevElbowSide).v;
+    // 诊断用的 2D/3D 版本必须跟随判定侧，否则导出的 knee_2d 可能来自另一条腿，
+    // signal-compare / 阈值拟合会把两条腿的分布混在一起。
+    // 判定侧在这一信号上没有值（例如 2D 角被判坏点）时才退回 pickSide 的独立选择。
+    const sameSideKey = (side, key) => (side === 'L' ? `${key}_L` : `${key}_R`);
+    const pickDiag = (side, pick, key, visL, visR, prev) => {
+      const own = pick[sameSideKey(side, key)];
+      if (Number.isFinite(own)) return own;
+      return pickSide(pick[`${key}_L`], pick[`${key}_R`], visL, visR, prev).v;
+    };
+    const kneePick2d = pickDiag(kneeSide, angles2d, 'knee', kneeVisL, kneeVisR, this.prevKneeSide);
+    const kneePick3d = pickDiag(kneeSide, angles3d, 'knee', kneeVisL, kneeVisR, this.prevKneeSide);
+    const elbowPick2d = pickDiag(elbowSide, angles2d, 'elbow', elbowVisL, elbowVisR, this.prevElbowSide);
+    const elbowPick3d = pickDiag(elbowSide, angles3d, 'elbow', elbowVisL, elbowVisR, this.prevElbowSide);
     this.prevKneeSide = kneeSide;
     this.prevElbowSide = elbowSide;
 

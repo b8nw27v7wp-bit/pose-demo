@@ -3,14 +3,29 @@
 
 import { readFile } from 'node:fs/promises';
 
+/** 去掉 Windows 编辑器常见的 UTF-8 BOM：JSON.parse 看到它会直接抛错。 */
+export const stripBom = (s) => (s && s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s);
+
 export async function loadFrames(path) {
   const text = await readFile(path, 'utf8');
-  const trimmed = text.trim();
+  const trimmed = stripBom(text).trim();
+  if (!trimmed) return [];
+
+  // 整份文件先按 JSON 试一次。裸数组可能是格式化成多行的（`[\n {...},\n ...\n]`），
+  // 只按行解析会一行都认不出来，静默返回空数组（signal-compare/autolabel 就白跑了）。
+  if (trimmed.startsWith('[')) {
+    try {
+      const arr = JSON.parse(trimmed);
+      if (Array.isArray(arr)) return arr;
+    } catch { /* 不是整份数组：继续按 JSONL 处理 */ }
+  }
   if (trimmed.startsWith('{')) {
     try {
       const obj = JSON.parse(trimmed);
       if (Array.isArray(obj)) return obj;
       if (Array.isArray(obj.frames)) return obj.frames;
+      if (Array.isArray(obj.records)) return obj.records;
+      if (obj && typeof obj.ts === 'number') return [obj];
     } catch {
       // 首行是 meta 的 JSONL：整份不是合法 JSON → 往下按行解析
     }
@@ -29,12 +44,13 @@ export async function loadFrames(path) {
 }
 
 export async function loadLabels(path) {
-  const obj = JSON.parse(await readFile(path, 'utf8'));
+  const obj = JSON.parse(stripBom(await readFile(path, 'utf8')));
   return Array.isArray(obj) ? obj : (obj.segments || []);
 }
 
 /** 一帧的时间（毫秒）：优先 ts；video_time 是秒，转成毫秒补偿 */
 export function frameTs(frame) {
+  if (!frame || typeof frame !== 'object') return NaN;
   if (Number.isFinite(frame.ts)) return frame.ts;
   if (Number.isFinite(frame.video_time)) return frame.video_time * 1000;
   return NaN;

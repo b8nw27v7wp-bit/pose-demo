@@ -55,6 +55,12 @@ console.log('\n[1] validateManifest');
   badFps.clips[0].fps = 0;
   check('非法帧率报错', (await validateManifest(badFps, dir)).errors.some((e) => /fps/.test(e)));
 
+  // 页面与 docs/data-collection.md 都支持 heavy；清单校验漏掉它会让 heavy 素材根本无法登记。
+  const heavy = structuredClone(manifest);
+  heavy.clips[0].model = 'heavy';
+  check('heavy 是合法模型档位', (await validateManifest(heavy, dir)).errors.length === 0,
+    (await validateManifest(heavy, dir)).errors.join('; '));
+
   const missing = structuredClone(manifest);
   missing.clips[0].labels = 'nope.labels.json';
   check('labels 不存在报错', (await validateManifest(missing, dir)).errors.some((e) => /labels/.test(e)));
@@ -114,6 +120,18 @@ console.log('\n[2] coverageReport');
   }, dir, { actions: ['stand'] });
   check('未知动作被单独列出', unknown.unknownActions.includes('moonwalk'),
     JSON.stringify(unknown.unknownActions));
+
+  // 评估器的 parseSegment 接受 ARM_ACTIONS 的 id（arm_raised），清单统计也必须归一，
+  // 否则同一份 labels 在评估器里算正例、在清单里却「未知动作」、覆盖度恒为 0。
+  await writeFile(path.join(dir, 'd.labels.json'),
+    JSON.stringify({ segments: [{ action: 'arm_raised', start: 0, end: 1000 }] }));
+  const alias = await coverageReport({
+    clips: [{ clip: 'a.frames.json', labels: 'd.labels.json', camera: 'front', subject: 'A', model: 'full' }],
+  }, dir, { actions: ['armRaised'] });
+  check('手臂动作 id 与 flag 写法等价（arm_raised → armRaised）',
+    alias.unknownActions.length === 0 && alias.rows[0].action === 'armRaised'
+    && alias.rows[0].pos === 1,
+    JSON.stringify({ unknown: alias.unknownActions, row: alias.rows[0] }));
 }
 
 // —— 3. 清单骨架 ——
