@@ -45,7 +45,14 @@
       "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
       "onHips": false, "armsOpen": false, "handAtHead": false,
       "reaching": false, "carrying": false, "pointing": false,
-      "armFront": false, "armSide": false
+      "armFront": false, "armSide": false,
+      // 逐侧粒度：单手动作额外给出是哪只手；聚合 flag 保持旧语义
+      "armRaisedL": false, "armRaisedR": false,
+      "wavingL": false, "wavingR": false,
+      "reachingL": false, "reachingR": false,
+      "pointingL": false, "pointingR": false,
+      "handAtHeadL": false, "handAtHeadR": false,
+      "carryingL": false, "carryingR": false
     },
     "reps": { "squat": 0, "pushup": 0, "clap": 0, "grasp": 0 },
     // 判定不可靠的原因（不是动作）：低置信 / 外推 / 换侧 / 骨骼异常 / 角度坏点
@@ -65,6 +72,27 @@
       "bbox": [222, 114, 264, 150],
       "kp": [[x, y], ...]           // 21 点，mediapipe21
     }
+  ],
+  // —— 可选：多人 / 物体检测（关闭时为空数组）——
+  // 只有打开「多人」或「物体」时才有内容；老数据没有这两个字段，评估器按"无"处理。
+  "verdicts": [                     // 每人的判定（含主目标）；主目标的判定同时在上面 signals/actions 里
+    {
+      "track_id": 2,                // 跟踪器给的稳定 id（丢失 1.5s 内不变；超时后是新 id）
+      "bbox": [20.2, 333, 101.9, 737],
+      "posture": "stand",
+      "frozen": false,
+      "flags": { "armRaised": false, "...": false },
+      "reps": { "squat": 0, "pushup": 0, "clap": 0, "grasp": 0 },
+      "ppe": {                      // 物体检测关闭时为 null
+        "helmet": { "state": "missing",   // worn|missing|unknown
+                    "alert": "violation", // none|suspect|violation（missing 持续 ≥ minMs 才升级）
+                    "streak_ms": 3200 },  // 连续 missing 的累计时长；unknown 时暂停不清零
+        "glove":  { "state": "unknown", "alert": "none", "streak_ms": 0 }
+      }
+    }
+  ],
+  "objects": [                      // 物体检测原始输出（像素框，与 person.bbox 同口径）
+    { "label": "person", "score": 0.87, "box": [38, 10, 202, 515] }  // label 来自模型 label map，可能为 null
   ]
 }
 ```

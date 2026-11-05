@@ -64,7 +64,7 @@
 |---|---|---|---|
 | 姿态 | 站立 / 坐 / 下蹲 / 躺卧 | `stand` / `sit` / `squat_static` / `lying` | 每个姿态保持 2 s 以上 |
 | 手臂 | 举手 / 挥手 / 抱臂 / 叉腰 / 张开双臂 / 双手高举 / 手在头部 / 前平举 / 侧平举 | `armRaised` / `waving` / `crossed` / `onHips` / `armsOpen` / `bothHandsUp` / `handAtHead` / `armFront` / `armSide` | 每个动作做 2~3 s；前/侧平举需要 world 坐标（3D 方位角） |
-| 手臂（需手部模型） | 伸手 / 持物 / 指向 | `reaching` / `carrying` / `pointing` | 依赖手部开合；手部关掉或未检出时恒为 false |
+| 手臂（需手部模型） | 伸手 / 持物 / 指向 | `reaching` / `carrying` / `pointing` | 手型要对：伸手=`open`、指向=`pointing/gun`、持物=`fist/ok`；指向还需要 3D 方位角。手部关掉、未检出或侧对时恒为 false |
 | 计数 | 深蹲 / 俯卧撑 / 鼓掌 / 拿取 | `squat` / `pushup` / `clap` / `grasp` | 一次一段，段内 `count` 写实际次数；拿取需要手部模型（伸手→合手） |
 | 手势（需手部模型） | 握拳 / 张开 / 剪刀手 / 指方向 / 竖拇指 / OK / 手枪 / 摇滚 | `gesture` + `hand` + `shape`（见下） | 每只手单独标；手掌侧对镜头（`orient.facing === "edge"`）的帧不要标，评估器会把它们算作弃权 |
 

@@ -1,152 +1,192 @@
-# 交接文档 · 2026-10-30（续作更新）
+# 交接提示词：跟踪评测纠偏 + PPE 冒烟链路打通
 
-> **历史记录**：本文是当天的交接快照。里面的 worktree 路径、默认模型（lite）、测试数量（531）
-> 都已经过时；当前实现（默认 full/heavy、图片输入、腕部 ROI、上半身构图、unreliable）与
-> 验证结果以 `README.md`、`docs/` 和 git log 为准。
->
-> 给下一个 session 的自包含说明。更细的设计见
-> `C:\Users\18434\.claude\plans\parallel-giggling-crown.md`（前端计划）。
+> 复制下面整段给新会话。仓库：`E:\pose-demo`。所有改动**尚未提交**，先 `git status` / `git diff` 看清再动手。
+> 更新时间：2026-11-04 傍晚（本地）。用户使用中文，直接给结论和数字。
 
-## 0. 工作区
+---
 
-- 目录：`E:\pose-demo\.claude\worktrees\handoff-continue-68ef56`
-- 分支：`claude/handoff-continue-68ef56`
-- 基线提交：`2bda49c feat: 手势帧级评估 + 注册表派生 + 难例反例导出`
-- 上一轮的 10 个未提交文件（R4 工具 + 前端完善）已用
-  `git diff --binary` → `git apply` 从 `agitated-colden-b193f4` 同步到本 worktree，
-  **原 worktree 的那份副本仍在**（未提交、未删除），别在两个 worktree 里各改一份。
-- 本 worktree 另外补了被 `.gitignore` 忽略的 `web/vendor/`（42M）与 `web/models/`（22M），
-  否则 `app.js` 的 `import '../vendor/vision_bundle.mjs'` 直接失败、`window.__pose` 不存在，
-  无头检查会报 `Cannot read properties of undefined (reading 'state')`。
-- **仍未提交**（用户此前明确说「先不提交」）。当前共 11 个已修改文件 + `HANDOFF.md` 未跟踪。
+## 你的任务（按优先级）
 
-## 1. 当前结论（TL;DR）
+1. **跟踪**：MOT17 上继续降 ID 切换。注意——之前的 ~15% 基线**被丢帧放大了**，真正的匹配错误
+   约 9%（慢放逐帧）。再调门控之前先看 §三 的测量口径，别拿实时数字做小步调参。
+2. **PPE**：冒烟链路（数据→训练→ONNX→浏览器→PPE 判定）**已经打通**；下一步是扩数据/换机位重训，
+   再把准确率数字做出来。见 §四、§五。
+3. 保持单测（724 项）与无头检查全绿；**不要未经用户同意提交**。
 
-| 项 | 状态 |
+## 先读这些文件（按顺序）
+
+- `docs/open-datasets.md`：数据来源/许可、MOT17 评测口径、平铺检测、**测量噪声警告**。
+- `docs/multi-and-objects.md`：多人跟踪、物体检测（双后端）、PPE 语义、慢放 A/B 结果。
+- `docs/ppe-training.md`：PPE 数据→训练→ONNX→ORT Web 的完整步骤与冒烟模型指标。
+- `web/test/mot17-eval.mjs`：MOT17 评测（`--rate 0.4` 慢放逐帧）。
+- `web/js/track.js`、`web/js/params.js`：跟踪器与默认参数。
+- `web/js/objects-onnx.js`、`web/js/objects.js`、`web/js/ppe.js`。
+- `scripts/prepare-ppe-dataset.py`、`scripts/fetch-eval-data.py`、`scripts/fetch-ort.mjs`、`scripts/py.mjs`。
+
+## 当前数据（都在 `eval-data/open/`，gitignored，约 278MB）
+
+| 数据 | 内容 | 许可 |
+|---|---|---|
+| MOT17 6 条 FRCNN（02/04/05/09/10/13） | 299/300/180 帧 mp4 + `gt/gt.txt` | **CC BY-NC-SA 3.0 非商用** |
+| PPE_detection | 200 图 / 2953 框 | Roboflow（多为 CC BY 4.0） |
+| Safety-helmet | 338 图 / 1294 框（0=no_helmet、1=helmet） | MIT |
+| construction-ppe | 337 图 / 1879 框 | MIT |
+
+统一训练集（可重建，`py -I scripts/prepare-ppe-dataset.py`）：
+`eval-data/ppe-smoke/{train,val}`（VOC）与 `eval-data/ppe-yolo/`（YOLO），**623 train / 252 val，
+6126 框，9 类**：helmet, no_helmet, glove, no_glove, vest, no_vest, person, boots, no_boots。
+
+## 一、已经完成的东西（不要重复造）
+
+- `node web/test/mot17-eval.mjs`：帧级 TopK 召回/精确/ID 切换/碎片/动作触发率。
+  - 默认实时播放；**A/B 必须加 `--rate 0.4` 并固定 `--fps 15`**（见 §三）。
+  - Git Bash 会转义 `/web/...` 参数，自定义 profile 用完整 URL。
+- `node web/test/mot17-eval.mjs --seq ... --rate 0.4 --fps 15` 单序列约 40s，6 序列约 4 分钟。
+- 平铺检测 `perception.multi.tiles: 2`：夜景 04 TopK 0.3%→16.5%，02 23.3%→24.9%，默认关。
+- **PPE 冒烟模型已训好**（`eval-data/ppe-runs/smoke/weights/best.pt|best.onnx`，不进 git），
+  ONNX 已放到 `web/models/ppe_smoke.onnx`；ORT 运行时在 `web/vendor/ort/`（不进 git）。
+- 浏览器 ONNX 后端：`web/js/objects-onnx.js`（letterbox→ORT→YOLOv8 解码→逐类别 NMS），
+  `objects.js` 统一分派；`app.js` 视频循环里异步推理不 await（同一时刻只跑一帧）。
+- profile：`web/profiles/safety-ppe.json`（onnx 后端 + 9 类 labels + no_helmet/no_glove 负类）。
+
+## 二、跟踪：慢放逐帧 A/B 结果（关键，别再走回头路）
+
+`--rate 0.4 --fps 15`，6 序列，约 800 对（表内数字都是 15fps 上限下测得，临时 profile 已删）：
+
+| 配置 | ID 切换 |
 |---|---|
-| 后端单测 `npm test` | **531 全绿**（189 + 258 + 46 + 17 + 21） |
-| `node --check`（app/headless/signals/actions/params） | 通过 |
-| 无头 `headless-check.mjs` | **通过**（模型推理、播放条/进度/设置持久化/profile 切换/难例/布局 1440×900，零 JS 错误） |
-| README Demo 操作说明 | **已补**（输入 / 播放条 / 数据面板 / 设置记忆） |
-| 前端代码审核 | **已做**（4 条发现，全部修复并复验） |
-| 判定数据检查 | **已做**（坐 vs 下蹲、挥手同侧、3D→2D 逐侧回退、2D 角度可见性门控，4 处修复） |
-| 界面重设计 | **已做**（仪表/取景器方向；1440 / 1280 / 1024 / 390 截图检查，无头检查通过） |
-| 人工浏览器 QA | **未做**（需要真摄像头/真拖拽） |
-| 提交 | **未提交** |
+| centerMax 0.6 + greedy + 3 人 | **72/797（9.0%）** |
+| centerMax 0.8 + greedy + 3 人（当前默认） | **72/810（8.9%）** |
+| centerMax 0.8 + greedy + 4 人 | 75/807（9.3%） |
+| centerMax 0.8 + 外观重连（appearance on） | 81/807（10.0%） |
+| centerMax 0.8 + optimal 分配 | 82/818（10.0%） |
 
-## 2. 本轮（10-30 下午）做了什么
+- **centerMax 0.6/0.8 没有可测差异；3 人/4 人也没有**（4 人还更慢）。
+- 外观重连、optimal 分配都略差（+9~10 次），**默认保持关 / greedy**。
+- 实时模式同一配置重复跑会在 **56~70 次切换**之间跳（12.5%~15.4%），所以以前那张
+  “预测优先 77/469、外观混入 79/458、motion 107/456”的表，方向和量级都要打折扣看待。
+- 序列 05：实时 18/157 对，慢放 18/280 对——**切换次数没变，对数翻倍**。
+  结论：实时的 ~15% 主要来自 25fps 视频 + 15fps 推理上限造成的丢帧，不是匹配规则。
+- 再想降 ID 切换：优先**提吞吐/减少丢帧**（lite 模型、关手部、ROI、WebGPU），
+  或者让跟踪器按“实际经过的视频时间”缩放门控；继续微调 centerMax/appearance 已无收益。
 
-### 2.1 README
+**本轮修掉的配置 bug**：`perception.multi.maxPersons` 以前完全没生效——`ensureMultiEstimator`
+直接读工具栏 `multiSel`（固定默认 3），profile 写 4 也跑 3。现在 `applyParams` 在用户没保存过
+人数选择时用 profile 值初始化 select；有保存值时以用户选择为准。`multiKey` 会显示实际 numPoses。
 
-`README.md` 在「性能与资源」与「界面上的几个开关」之间新增
-**「Demo 怎么用（输入 / 播放条 / 数据面板）」**：摄像头切换、拖拽/点选上传、播放条
-（播放暂停/拖动/循环/重播）、回绕后记录停止的原因、20000 帧上限与丢弃数、
-profile 下拉与「切换 profile 会清空记录」、「清空记录 vs 重置计数」、按钮禁用规则、
-`localStorage` 设置记忆。同时把膝角曲线那条从写死的 100°/150° 改为「当前 profile 的上下阈」。
+当前代码默认：`motion=false`、`appearance=false`、`assignment='greedy'`、`centerMax=0.8`、
+`maxPersons=3`、`maxLostMs=1500`、**推理上限 30fps**（见 §二.5）。
 
-### 2.2 审核发现 + 修复（`/code-review`，重点状态回退/异步竞态）
+## 二.5、吞吐：把丢帧这个根因先修掉（2026-11-04）
 
-1. **摄像头启动失败会清空已录帧**（`startCamera` catch 里无条件 `resetRuntime()`）。
-   现在：文件正在播且摄像头流还没挂上（`assigned=false && prevMode==='file'`）时，
-   保留播放与帧记录，只在状态栏报错；其余情况才走清理，且**不再 `resetRuntime()`**——
-   已录帧仍可导出。无头实测：失败前 8 帧 → 失败后仍在增长（33 帧），mode 仍为 file。
-2. **停止后导出丢失 model/delegate**（`stopAll()` 置空 activeModel/activeDelegate，
-   `baseExportMeta()` 直接读它们）。现在保留这两个值给导出用，
-   工具条 `#modelInfo` 改由 `estimatorReady && activeModel` 决定是否显示 `—`；
-   `initEstimator` 失败分支也不再置空（帧仍属于上一档模型）。
-3. **切换摄像头可并发起多条流**（`switchCamera` 无在途保护，后一次覆盖 `currentStream`，
-   前一条流无人 `stop`）。新增模块级 `cameraStarting` 重入锁，`startCamera` 全程持有。
-4. **模型初始化失败时旧视频被清状态**（`useVideoSource` 里 `ensureEstimator()` 失败分支）。
-   现在若文件正在播就保持原状并释放新的 blob URL；否则才停循环/摘源。
+`npm run probe:throughput`（`web/test/throughput-probe.mjs`）测 `state.timing` 各阶段 EMA：
 
-### 2.3 判定数据修复（4 处）
+| 配置（MOT17-05，640×480） | 实测处理 |
+|---|---:|
+| 15fps 上限 · 多人3+手部 | 13.6 帧/s（pose 17.5ms + hands 14.4ms） |
+| **30fps 上限 · 多人3+手部（新默认）** | **25.3–26.4 帧/s**（pose 12.6–13 + hands 12–13） |
+| 30fps · 手部关 | 26.9 帧/s（14.7ms） |
+| 30fps · ONNX 物体（worker，新） | 26.4 帧/s（objects 摊薄 0.46ms） |
+| 30fps · ONNX 物体（主线程，旧） | 8.2 帧/s |
+| 30fps · MediaPipe efficientdet CPU（150ms 降频） | 18.3 帧/s（objects 摊薄 15.5ms） |
+| 30fps · 1080p（02） | 25.6 帧/s |
 
-用户要求「检查识别人体姿态动作时候参考的相关判定数据」后，用探针实测出 4 个问题并修复：
+三个改动：
+1. `index.html` 推理上限默认 **15 → 30fps**：15fps 在 25fps 素材上丢约一半帧。
+2. `objects-onnx.js` 开 `ort.env.wasm.proxy = true`（Web Worker）。proxy 会**转移**输入
+   buffer，每帧必须传 `new Float32Array(chw)` 拷贝（否则第二帧 `size 307200 ≠ 0`）。
+3. 新增 `perception.objects.intervalMs=150`：物体检测降频，跳过时沿用上一帧框。
+   MediaPipe efficientdet 仍是最慢的后端（~16fps），PPE 应走 ONNX。
+4. 没有检出人的帧跳过手部推理（手只能归属到人；04 夜景以前每帧白跑 ~13ms）。
+5. 换 profile 会重建物体检测实例（后端可能 mediapipe→onnx）。无头脚本改开关前要等
+   `state.profileLoaded`，否则会先按默认参数建 mediapipe 检测器，profile 的 onnx 不生效
+   （实测把 28fps 测成 18fps）。
 
-1. **坐姿被判成「下蹲」**：`squat_static` 只看膝角<110°+直立度，优先级又高于「坐」。
-   `actions.posture.squat` 新增 `legVerticalGt: 0.85`（与计数门控同口径）；
-   `--fit` 新增 `squat_static/leg_vertical` → 该键的映射。
-2. **挥手混用左右手**：翻转取任一侧、幅度取两侧最大。`wave` 新增 `amp_L/amp_R`，
-   `waving` 要求「同一条举起的臂」的翻转与幅度（走路摆臂 + 单手举起不再误报）。
-3. **3D 失效不回退 2D**：动作层只看 `has_world`。信号层新增逐侧 `raised_sel_L/R`
-   （3D 有效用 3D，NaN 才退回 2D），`armRaised` / `bothHandsUp` 改用它。
-4. **2D 膝/肘角没有可见性门控**：腿被挡住时仍拿漂移/陈旧坐标算角。现在三点任一
-   `visibility < visMin` → 该 2D 角给 NaN（不喂滤波器、不沿用旧值）。
+实测工具新增 `state.timing`（pose/hands/objects/draw/total/samples），无头脚本可读；
+ONNX 的 worker 内推理耗时看 `state.objectInfo.runMs`（~96ms/次，150ms 间隔约 2/3 占空比）。
 
-对应单测：logic-test [6]/[9]/[13]/[17]/[21]，eval-test [28]。
-注意 `params_hash` 因为参数变化而改变了（页面标题里可见），旧导出与新导出不可比指纹。
+### 本轮审核修复（2026-11-04）
 
-### 2.3 界面重设计（2026-10-30 傍晚）
+- `objects.js` / `objects-onnx.js` 加创建代次：在途创建/关闭不会互相覆盖半成品实例，
+  `meta` 与 `session` 原子安装；`detectOnnx` 先快照 session/meta，推理期间换模型会丢弃结果。
+- `ensureObjectDetector` 返回 `'superseded'` 而不是 `false`：换 profile 期间旧创建结束，
+  不再被调用方当成"加载失败"而把新 profile 的 `objects.enabled` 关掉。
+- 异步物体推理先看 `objectBusy` 再调用（原来先提交再判断，会并发跑两次、丢弃的 promise
+  没有 catch，rejection 变成页面 JS 错误）。
+- `applyParams` 每次换 profile 都作废旧物体检测器（即使新 profile 关掉 objects），
+  并在 numPoses/detConf/presenceConf 变化时重建多人估计器。
+- `mot17-eval --fps` 校验值必须在页面选项里（10/15/30），否则直接报错，避免静默跑 30fps。
+- `throughput-probe` / `headless-ppe-onnx` 先 `await close()` 再 `process.exit`（exit 不执行
+  finally，会漏 headless Chrome）；headless-ppe 的默认 profile 跟随 base URL，profile 没生效时快速失败。
+- `replayVideo` 在 seeked 之前不 play：拖动进度条后立刻点重播会被浏览器以 AbortError 拒绝，
+  视频停在 0（headless-check 曾稳定复现）。
 
-方向：**测量仪器 / 取景器**。纯白底，界面颜色只表达确定性——状态绿/琥珀/红直接复用骨架的高/中/低置信配色，
-不做装饰色；舞台是固定高度的深色取景窗，右侧是连续读数栏（不再堆四张卡片）。
+## 三、测量口径（很重要）
 
-- 结构：`web/index.html` 全量重写样式与面板结构。`.card` → `.mod`（发丝线分隔）；
-  难例下拉与「判错了」从工具条移进「计数与记录」；顶栏压缩到 44px。
-- 排版：数字/时间用 Bahnschrift（macOS 回退 DIN Alternate），中文用系统 UI 字体；
-  正文字号 14px，面板数据 13.5–14px，姿态 36px；数据右对齐、等宽数字。
-- 控件：开关改为自定义胶囊开关（背景圆点实现，不依赖 input 伪元素）；select 自定义箭头；
-  「上传视频」改为真正的 `<button id="btnUpload">`（键盘可达），由 `app.js` 转给隐藏的 file input。
-- 舞台：固定高度、`object-fit: contain`；**删除了 loop 里 `stage.style.aspectRatio = w/h` 的赋值**——
-  它会把舞台压成竖屏视频的窄柱并把整页拉高。空状态加了取景十字圈。
-- 响应式：>1080 两栏；≤1080 单栏 16:9；≤720 舞台 52vh、播放条隐藏时间/记录文字以免溢出。
-- 其它：`drawSpark` 配色与字体同步新色板；`favicon.svg` 换成新标记；顶栏改为实色（滚动时不透字）。
-- 无头检查新增三条断言：上传按钮能把点击转给 file input、文件模式下切换摄像头按钮隐藏、
-  默认 profile 下标签不重复显示。
+- 实时播放：应用最多 15fps 推理，25fps 视频每帧都可能被跳过；跳过哪帧取决于机器负载，
+  **同一配置重复跑不可复现**。
+- `--rate 0.4`：视频降到 10fps，应用能处理每一帧；评测按 25fps 帧号去重。A/B 都用它，
+  并且必须用 `--fps 15` 固定推理上限——现在默认是 30fps，同一视频帧会被多处理几次
+  （09 序列 25/159 → 29/169），不固定就没法和旧表比较。
+- 它**不是完全确定**：同配置多次总计 72/72/75/90/93，个别帧跳过或 GPU 负载会放大差异。
+  A/B 必须串行、机器空闲时跑（别同时跑吞吐探针），单臂重复 ≥2 次。
+- gt 按画面裁剪，可见面积 <30% 转 ignore；TopK 默认 3。
+- 跟踪器的时间戳仍用 `performance.now()`；慢放时帧间隔约 100ms（实时约 40~70ms），
+  `maxLostMs` 覆盖的帧数不同。跨倍速比较绝对值要谨慎，同倍速 A/B 没问题。
 
-### 2.4 复验
+## 四、PPE：链路已通，指标只够冒烟
 
-```bash
-npm test                                   # 531 通过，0 失败
-node web/test/headless-check.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-vp8.webm"
-# 结果：通过
-```
+- 训练：YOLOv8n@320，10 epoch，CPU 6.7 分钟；val mAP50 **0.40**
+  （helmet 0.757 / no_helmet 0.531 / vest 0.722 / no_vest 0.372 / person 0.667 /
+  boots 0.439 / glove 0.024 / no_glove 0.074 / no_boots 0.010）。
+- 导出：ONNX 12.1MB，`opset=12 simplify=True`；复制到 `web/models/ppe_smoke.onnx`。
+- 无头验证（`node web/test/headless-ppe-onnx.mjs`）：后端 onnx、9 类 labels 对齐、
+  一张 val 图检出 `person×5 · helmet×1 · no_vest×3`，头盔判 `worn`，无 JS 错误。
+- 手套/非正类基本没学会；数据量、机位差异、小目标都没解决，**没有任何实拍准确率**。
+- **许可**：Ultralytics YOLO 权重/代码是 AGPL-3.0。冒烟验证可以；闭源商用前必须买 Enterprise
+  或换 Apache/BSD 许可的检测器重训。MediaPipe .tflite 路线仍是 Apache-2.0，但 Model Maker
+  在原生 Windows 装不上（tensorflow-text / tflite-support 无 Windows wheel）。
 
-另外用临时探针（`%TEMP%/pose-probe.mjs`，不在仓库里）在无头 Chrome 里实测了两条失败路径：
-摄像头失败不再清空记录；点「停止」后 `#modelInfo` 显示 `—`，但 `logInfo.title`/导出仍保留 `lite/GPU`。
+## 五、下一步建议
 
-## 3. 仍未做（下一个 session 优先）
+1. **PPE 数据**：用本项目实拍素材（安全帽/反光衣/手套）标注一轮，至少每类 500~1000 实例；
+   640 输入或头部/腕部 ROI 二次检测；再训一次并做帧级 recall/precision。
+2. **吞吐**：默认 30fps + ORT worker 后已能处理 25fps 素材的每一帧；下一步可测 30fps 摄像头
+   （本轮只测了 25fps 视频），以及弱机/多标签页下的实际帧率。手部约占 12–13ms，若要上 60fps
+   源可考虑把手指检测降到 15Hz（`hands` 降频）。
+3. **跟踪**：如果一定要继续，先实现“按视频时间缩放门控”，用 `--rate 1` 的真实丢帧场景评测，
+   并且每组配置至少跑 3 次取中位数。
+4. 真实数据到位前，不要把冒烟模型写进任何“准确率”文案。
 
-1. **人工浏览器 QA**（无头覆盖不到）：
-   - 拖拽真实视频到画面；重复选同一文件；
-   - 摄像头前后/多设备切换（真摄像头）；拔掉设备后回退；
-   - 暂停→拖动→恢复；向后拖动后「记录已停止」；↺ 重播能恢复记录；
-   - 勾选循环等一圈，确认记录停止提示；
-   - 刷新页面，确认模型/帧率/开关/镜像/循环/profile 都被记住；
-   - `?profile=/web/profiles/fitness.json` 自定义项能加载；故意写坏 URL 看回退；
-   - 窄屏（<1000px）至少确认不崩。
-2. **决定是否提交**：用户之前说「先不提交」；新 session 不要擅自提交。
-3. 可选：把 `HANDOFF.md` 删除或移出仓库（未跟踪文件）。
-
-### 已知风险 / 需要重点验证
-
-- 摄像头相关的三条路径（成功、失败、切换）只有无头失败路径被实测过；成功路径需要真摄像头。
-- `headless-check` 的 `frontend` 段会暂停/拖动/重播、切换镜像并写 localStorage；结束时视频在播放，
-  profile 已切回默认。
-- 播放条与工具栏新增控件在 1440×900 下已验证 `scrollHeight=900`；更窄宽度未验证。
-
-## 4. 常用命令
-
-```bash
-cd E:/pose-demo/.claude/worktrees/handoff-continue-68ef56
-npm test
-py serve.py 8799
-node web/test/headless-check.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-vp8.webm"
-```
-
-R4 手动检查：
+## 六、验证清单（开工/收尾都跑）
 
 ```bash
-node web/test/evaluate.mjs --dir eval-data --fit --fit-out /tmp/fit.json
-node web/test/evaluate.mjs --dir eval-data --resample 15
-node web/test/evaluate.mjs --dir eval-data --loso   # 需要 labels.subject 且 >=2 人
+git status --short
+npm test                              # 724 项（含 ONNX 解码 14 项）
+npm run serve                         # 另开终端（当前 8765 已在跑）
+node web/test/headless-check.mjs      # 通过
+node web/test/headless-multi.mjs      # 19 项通过
+node web/test/headless-ppe-onnx.mjs   # 需要 web/models/ppe_smoke.onnx + web/vendor/ort/
+npm run probe:throughput -- --multi 3 --hands 1 --objects 1 --profile http://127.0.0.1:8765/web/profiles/safety-ppe.json
+py -I scripts/prepare-ppe-dataset.py  # 训练数据可重建
+npm run fetch:ort                     # 下载 ORT 运行时（固定 1.31.1）
 ```
 
-## 5. 约束与约定
+## 七、未提交改动概览
 
-- 工作区是 **worktree**；不要 `cd` 回主 checkout，不要在 `.claude/worktrees` 里重新初始化。
-- 服务器默认 8765，多开时用 8799 并显式传给 headless，避免打到别的 checkout。
-- `web/vendor/`、`web/models/` 不进 git；新 worktree 需要从别的 checkout 复制或跑 `scripts/fetch-assets.py`。
-- `--fit-out` 的文件**不要**放进 `--dir` 目录（目录扫描会把 `.json` 当帧文件）。
-- 评估口径：`--max-count-err` 是「每 20 次的绝对误差」；手势指标是帧级、弃权不进分母。
-- 提交信息若需要，沿用仓库现有中文风格，并按系统提醒加 Co-Authored-By（仅在用户明确要求提交时）。
+- 本轮新增：`web/js/objects-onnx.js`、`web/profiles/safety-ppe.json`、`web/test/onnx-test.mjs`、
+  `web/test/headless-ppe-onnx.mjs`、`web/test/throughput-probe.mjs`、`scripts/fetch-ort.mjs`、
+  `docs/ppe-training.md`。
+- 本轮改动：`web/js/app.js`（ONNX 异步推理、profile maxPersons、analyzeStill async、
+  阶段耗时 `state.timing`、物体降频）、`web/js/objects.js`（双后端分派）、
+  `web/js/objects-onnx.js`（worker proxy）、`web/js/params.js`（objects 后端字段/intervalMs、注释纠偏）、
+  `web/js/track.js`（appearance 默认 false）、`web/index.html`（默认 30fps）、
+  `web/test/mot17-eval.mjs`（`--rate` + 帧去重）、`.gitignore`、README/docs。
+- 上一轮遗留的大量新增模块（track/multi/ppe/objects/tiles/accuracy/...）仍未提交。
+- **没有提交任何 commit；不要替用户提交。**
+
+## 一句话现状
+
+跟踪：实时 ~15% 主要是丢帧造成的，慢放逐帧约 9%；centerMax/外观/optimal/人数上限都没有可测收益，
+默认保持 greedy + appearance off + centerMax 0.8。PPE：623 图冒烟模型已训好（mAP50 0.40），
+ONNX→ORT Web→PPE 判定链路在浏览器里跑通，下一步是实拍数据与准确率。

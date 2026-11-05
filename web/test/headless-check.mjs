@@ -152,9 +152,12 @@ async function main() {
         errors.push(d.exception?.description || d.text);
       }
       if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error') {
-        const text = m.params.entry.text || '';
-        // favicon 404 与页面无关，不计入
-        if (!/favicon\.ico/.test(text)) errors.push(text);
+        const entry = m.params.entry || {};
+        const text = entry.text || '';
+        const url = entry.url || '';
+        // favicon 404 与页面无关；accuracy.json 是可选报告（npm run accuracy 才生成），
+        // 没有它页面显示「未评估」是设计行为，不该让回归挂掉。
+        if (!/favicon\.ico/.test(text) && !/\/accuracy\.json/.test(url)) errors.push(text);
       }
     });
 
@@ -292,6 +295,55 @@ async function main() {
       };
     })()`);
 
+    // 动作准确度提示：每个动作一条 tooltip，面板上有一行当前提示（armhint.js）。
+    // 必须放在「清空记录」之前——清空后 lastResult 归零，提示行会变回「—」。
+    const armHint = await cdp.eval(`(() => {
+      const el = document.getElementById('armHint');
+      const acts = [...document.querySelectorAll('#armGrid .act')];
+      return {
+        hasHint: !!el,
+        line: el ? el.textContent.trim() : null,
+        count: acts.length,
+        titled: acts.filter((a) => /条件：/.test(a.title || '')).length,
+        na: acts.filter((a) => a.classList.contains('na')).map((a) => a.dataset.id),
+      };
+    })()`);
+
+    // 准确率明细：默认收起，点「准确率」展开 12 行；再点收起（布局断言要在收起后）
+    const accuracyUi = await cdp.eval(`(() => {
+      const btn = document.getElementById('btnAccuracy');
+      const box = document.getElementById('accList');
+      btn.click();
+      const open = !box.hidden;
+      const items = [...box.querySelectorAll('.acc-item')].map((el) => ({
+        name: el.querySelector('.an')?.textContent || '',
+        value: el.querySelector('.av')?.textContent || '',
+        title: el.title || '',
+      }));
+      btn.click();
+      return {
+        hasBtn: !!btn, open, hiddenAfter: box.hidden, count: items.length,
+        filled: items.filter((i) => i.name && i.value).length,
+        titled: items.filter((i) => /n=|样本不足|未评估/.test(i.title)).length,
+        hint: document.getElementById('armHint').textContent,
+      };
+    })()`);
+
+    // 单人道的动作引擎也必须拿到手：之前 handsByTrack=null，伸手/持物/指向在默认单人道
+    // 永远不成立。这里在真人视频上确认「判定结果里能挂上检出的手」。
+    const handWiring = await cdp.eval(`(async () => {
+      let withHands = 0;
+      let verdicts = 0;
+      for (let i = 0; i < 12; i++) {
+        const vs = (window.__pose.state.lastResult || {}).verdicts || [];
+        verdicts = Math.max(verdicts, vs.length);
+        withHands = Math.max(withHands, vs.filter((v) => v.hands && (v.hands.L || v.hands.R)).length);
+        if (withHands) break;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      return { handReady: !!window.__pose.state.handReady, verdicts, withHands };
+    })()`);
+
     // 数据面板：清空记录 + profile 切换
     const panel = await cdp.eval(`(async () => {
       const $ = (id) => document.getElementById(id);
@@ -331,6 +383,9 @@ async function main() {
     console.log('难例控件：', JSON.stringify(hardcase));
     console.log('难例点击：', JSON.stringify({ clickStart, clickEnd }));
     console.log('面板/profile：', JSON.stringify(panel));
+    console.log('准确率：', JSON.stringify(accuracyUi));
+    console.log('手部接线：', JSON.stringify(handWiring));
+    console.log('动作提示：', JSON.stringify(armHint));
     console.log('布局：', JSON.stringify(layout));
     console.log('状态栏：', profileEcho);
     console.log('JS 错误：', errors.length ? errors : '无');
@@ -351,6 +406,12 @@ async function main() {
       && /帧/.test(frontend.logText) && /profile=/.test(frontend.logTitle)
       && panel.clearedFrames === 0
       && /fitness/.test(panel.profileTagFitness) && /默认/.test(panel.profileTagDefault)
+      && armHint.hasHint && armHint.count === 12 && armHint.titled === 12
+      && !!armHint.line && armHint.line !== '—'
+      && accuracyUi.hasBtn && accuracyUi.open === true && accuracyUi.hiddenAfter === true
+      && accuracyUi.count === 12 && accuracyUi.filled === 12 && accuracyUi.titled === 12
+      && !!accuracyUi.hint
+      && (!handWiring.handReady || handWiring.withHands > 0)
       && hardcase.options >= 10 && hardcase.hasButton && hardcase.frames > 0
       && hardcase.segment && hardcase.action === 'squat'
       && clickStart.disabled === true && clickEnd.disabled === false

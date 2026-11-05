@@ -13,9 +13,13 @@
 
 ```bash
 cd E:/pose-demo
-python scripts/fetch-assets.py   # 首次：下载 MediaPipe js/wasm 与模型（约 95MB，不进 git）
-python serve.py                  # 多线程 + Range 支持，默认 8765
+npm run fetch:assets   # 首次：下载 MediaPipe js/wasm 与模型（约 95MB，不进 git）
+npm run serve          # 多线程 + Range 支持，默认 8765
 ```
+
+> 没有 npm 时直接跑 `python scripts/fetch-assets.py` / `python serve.py`。
+> Windows 上若只有 `py` 而没有 `python` 命令，把 `python` 换成 `py` 即可；
+> `npm run serve` / `fetch:assets` / `fetch:data` / `report:ppe` 会自动选可用解释器（`scripts/py.mjs`）。
 
 然后浏览器打开 **http://127.0.0.1:8765/web/**
 
@@ -71,6 +75,18 @@ serve.py                本地静态服务器
 **手势**（每只手单独识别）：握拳 / 张开 / 剪刀手 / 指方向 / 竖拇指 / OK / 手枪 / 摇滚
 **计数**：深蹲 / 俯卧撑 / 鼓掌 / 拿取
 
+**多人**（工具栏「多人」，或 profile 里 `perception.multi.enabled`）：同时判最多 4 个人，
+每人一条独立的状态机（计数、滞回、持续时长互不干扰），画面里给每个人标 `#id + 姿态`。
+多人走 IMAGE 模式逐帧推理 + 自研跟踪器（VIDEO 模式只回一个人），id 在丢失 1.5s 内保持不变。
+实现与实测见 `docs/multi-and-objects.md`。
+
+**物体检测 / PPE**（工具栏「物体」）：安全帽、手套这类"人身上有没有那件东西"不是姿态问题，
+是目标检测 + 人-物空间关系。打开后：头部区域内有 `helmet` → 戴了；头可见但区域内没有 →
+缺帽（连续 3s 才升为违规）；头/腕不可见 → `unknown`，**绝不判违规**。手套默认只报「疑似」，
+理由见下文。两条后端：MediaPipe `.tflite`（类别名来自模型 label map）和自训 YOLOv8 → ONNX
+（`perception.objects.backend='onnx'`，类别名由 profile 的 `labels` 按训练顺序给出），
+训练/导出/接入见 `docs/ppe-training.md`。
+
 **只有上半身在画面里时**（桌面摄像头最常见的构图）：站/坐/蹲/躺缺少膝、踝证据，
 姿态会显示「上半身 · 下半身不可见（出画/遮挡），站/坐无法判定」——这是信息不足，不是识别失败。
 手臂动作、手势和鼓掌计数照常工作：尺度锚点自动改用肩宽，直立度改用鼻→肩轴
@@ -100,22 +116,42 @@ serve.py                本地静态服务器
 手势面板还会提示**手掌朝向**：侧对镜头时四指被压扁、手势不可靠，卡片会显示虚线边框。
 手势本身经过 3 帧去抖，不会再「张开↔剪刀手」来回闪。
 
+「动作与手势」面板还会给出**判定条件与准确率**：悬停每个动作名可看判定依据、成立条件与已知误判；
+面板下方一行按当前帧给提示（手部模型关闭/未加载/未检出、无 3D、髋不可见、单帧图片、置信不足）。
+动作名前的**空心圆点**表示当前条件下这个动作根本判不了（比如没开手部模型时的伸手/持物/指向），
+不是「还没做」。提示行会带**左右手粒度**（如「左手举手」「右手指向」）；手势动作按具体手型判：
+伸手只认「张开」，指向只认「指方向/手枪」，两者不再同时亮。文案与判据同源于
+`web/js/armhint.js`，改判据时要一起改。
+
+点面板右侧的**「准确率」**展开 12 个动作的**实测召回/精确率**（来自评估报告，见下文
+「量化动作准确率」）。每个方向样本 <20 时不报百分比；没有报告或没有标注数据时显示「未评估」——
+不拿规则自估或合成样例冒充实拍准确率。
+
 ## 验证
 
 ```bash
-npm test                            # 225 逻辑 + 259 评估器 + 46 难例 + 18 自动标注 + 23 清单 = 571 项
-node web/test/logic-test.mjs        # 225 项：角度/滤波/滞回/计数门控/姿态互斥（含坐 vs 下蹲）/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/统计/拿取阶段机/注册表 flag 一致/上半身构图/腕部 ROI/手归属/平举物理门/换侧滞回/角度突变剔除/不可靠原因/手-臂对应
+npm test                            # 235 逻辑 + 31 动作提示 + 32 准确率 + 259 评估器 + 46 难例 + 18 自动标注 + 23 清单 + 66 多人 + 14 ONNX 解码 = 724 项
+node web/test/logic-test.mjs        # 235 项：角度/滤波/滞回/计数门控/姿态互斥（含坐 vs 下蹲）/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/统计/拿取阶段机/注册表 flag 一致/上半身构图/腕部 ROI/手归属/平举物理门/换侧滞回/角度突变剔除/不可靠原因/手-臂对应/手型与左右侧绑定
+node web/test/armhint-test.mjs      # 31 项：12 个动作的提示覆盖、手部关闭/未加载/未检出、无 3D/配置关闭、单帧、髋不可见、置信不足、多动作提示优先级、准确率文案（提示行与 tooltip）、左右手粒度
+node web/test/accuracy-test.mjs     # 32 项：flag→id 映射、n/95%CI 保留、样本不足不报百分比、未评估、合成来源标记、档位边界、报告加载容错、参数指纹过期检测
 node web/test/eval-test.mjs         # 259 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile（含下蹲腿竖直比）/LOSO/重采样）
 node web/test/hardcase-test.mjs     # 46 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口、!动作/noArm 反例导出、尾部锚点（区分播完与暂停）
 node web/test/autolabel-test.mjs    # 18 项：区间合并/丢弃、计数周期、草稿内容与自评全通过、注册表覆盖
 node web/test/manifest-test.mjs     # 23 项：清单字段与文件校验（含 heavy 档位）、覆盖度、计数与反例、动作 id/flag 等价、清单骨架、注册表覆盖
+node web/test/multi-test.mjs        # 66 项：跟踪 id 稳定/防换 id/超时换 id、每人独立状态机与 gap 重置、手部归属、PPE 标签/几何/unknown 语义/持续门槛、平铺几何、运动/外观/最优分配
+node web/test/onnx-test.mjs         # 14 项：YOLOv8 输出解码（[C,N]/[N,C]）、逐类别 NMS、letterbox 逆变换、形状/缺省参数校验
 ```
 
 页面级（需要 serve.py 已启动）：
 
 ```bash
-node web/test/headless-check.mjs    # 无头 Chrome 真加载页面：模型就绪、跑到帧、13 关键点、零 JS 错误
+node web/test/headless-check.mjs    # 无头 Chrome 真加载页面：模型就绪、跑到帧、13 关键点、动作提示、准确率明细、零 JS 错误
 node web/test/headless-check.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-vp8.webm"   # worktree/多开：显式换端口
+node web/test/headless-multi.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-two.webm"  # 多人 + 物体检测（19 项）
+node web/test/headless-ppe-onnx.mjs # 自训 PPE 冒烟模型：ONNX 后端加载、labels 对齐、no_helmet 不被当正类（需 web/models/ppe_smoke.onnx）
+node web/test/throughput-probe.mjs  # 吞吐探针：应用自报 fps、实测帧/s、pose/hands/objects/draw 各阶段毫秒
+node web/test/mot17-eval.mjs        # MOT17 gt 帧级评测：TopK 召回 / ID 切换 / 动作触发率（需先 npm run fetch:data）
+node web/test/mot17-eval.mjs --rate 0.4   # 慢放逐帧：A/B 对比用（实时播放每次丢的帧不同，ID 切换会抖 ±10%）
 ```
 
 > 端口冲突：`serve.py` 默认 8765，Windows 允许第二个进程静默绑定同一端口，
@@ -129,6 +165,27 @@ node web/test/headless-check.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test
   挥手与计数这类需要运动的动作在单帧上本来就不适用）
 - `.../verify.html?mode=video&model=full&vid=/data/pose-test-vp8.webm`
 - `.../verify.html?mode=image&poses=2&img=/data/pose-test-two.jpg` 多人（仅 IMAGE 模式有效）
+
+## 开源验证素材（没人出镜时用）
+
+自己的实拍没有之前，用开源数据集只能回答"链路在真实画面上还成不成立"，回答不了"在你的机位上准不准"。
+
+```bash
+npm run fetch:data                        # 下到 eval-data/open/（不进 git），约 280MB
+npm run report:ppe                        # 只读盘点：图片/label 配齐没、每类多少框、类别名有没有
+npm run eval:mot17                        # MOT17 gt 帧级评测：TopK 召回 / ID 切换 / 动作触发率
+node web/test/headless-open-data.mjs "http://127.0.0.1:8799/web/"   # 跑一遍并报人数/轨迹/框数
+```
+
+等价的直接调用：`python scripts/fetch-eval-data.py`、`python -I scripts/ppe-dataset-report.py`
+（Windows 上没有 `python` 命令时用 `py`）。
+
+四份数据（MOT17 多人视频、两份 MIT 安全帽/工地 PPE、一份带 gloves 与 no_gloves 的 PPE）、
+许可红线（**MOT17 非商用**）、以及"哪份能验什么"见 `docs/open-datasets.md`。
+
+**这些数据没有动作标注**：MOT17 全是行走，PPE 是静态图。它们能验多人跟踪与 PPE 检测，
+**不能产出举手/双手高举/挥手/抱臂/叉腰/张开双臂/手在头部/伸手/持物/指向的准确率**——
+那需要自己拍并标注（见下文），或用带帧级动作标签的数据。
 
 ## 量化动作准确率（重要）
 
@@ -159,7 +216,13 @@ node web/test/evaluate.mjs --dir eval-data --min-recall 0.9 --min-precision 0.85
 # 7. 两套 profile 对比 / 单参数灵敏度
 node web/test/evaluate.mjs --dir eval-data --compare web/profiles/a.json web/profiles/b.json
 node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.squat.down
+
+# 8. 把准确率回显到 Demo（页面「动作与手势」→「准确率」）
+npm run accuracy                    # 读 eval-data/ → 写 web/accuracy.json
 ```
+
+页面只显示**这个文件里的实测值**，不自己估。每个方向样本 <20 时不报百分比（n=1 的 100% 会骗人）；
+没有报告或没有标注数据时显示「未评估」。合成样例会被标成「合成样例自检」，不会冒充实拍准确率。
 
 `autolabel` 只生成正例；反例必须人工补，否则 precision 恒为 1（见 `docs/data-collection.md` §六）。
 清单校验的退出码：0 达标 / 2 覆盖不足 / 1 清单有错，可直接进 CI。
@@ -261,7 +324,7 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 | 项 | 默认 | 说明 |
 |---|---|---|
 | 姿态模型 | **full** | 三档：`full`（默认，准确度/速度平衡）、`heavy`（最准、最慢）、`lite`（省电，骨架精度明显更差）。阈值按档位校准，换档后旧 profile 可能不准 |
-| 推理帧率上限 | **15 fps** | 10/15/30 可选。手部 + 姿态两个模型都在跑时，30fps 是双倍开销 |
+| 推理帧率上限 | **30 fps** | 10/15/30 可选。15fps 在 25/30fps 素材上会丢约一半帧（ID 切换被放大）；实测 full/GPU + 多人 3 + 手部在 30fps 上限下约 26 帧/s、每帧 28ms。弱机达不到上限会自然回落 |
 | 手部补检 | 仅在漏检时 | 全身/远景下整帧检不到手，会对每只漏检的手多做一次裁图推理；两只都检出时不额外开销 |
 | 模型加载 | **懒加载** | 打开页面不建模型，点「摄像头」/「上传视频/图片」才加载 |
 | 后台暂停 | 开 | 标签页切到后台自动停推理（`visibilitychange`） |
@@ -270,7 +333,8 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 **注意**：这个 demo 里没有任何训练，全是推理。所谓"训练量大"不存在；
 真正吃资源的是**同时开着多个标签页**，每个标签页都持有自己的 GPU 上下文、
 一个姿态模型和两个手部实例（整帧 + 腕部补检）。
-一个页面 15fps 大概占单核一小部分；开 5 个页面就是 5 倍。
+一个页面 30fps（实测 ~26 帧/s，每帧约 28ms）占的 CPU/GPU 明显高于 15fps；
+开 5 个页面就是 5 倍。长时间挂机时可在工具栏把上限降到 10/15fps。
 
 ## Demo 怎么用（输入 / 播放条 / 数据面板）
 
@@ -308,6 +372,11 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 ## 界面上的几个开关
 
 - **骨架 / 关键点**：关键点关掉只剩连线，弱机或录制时更清爽
+- **多人**：同时判 2/3/4 个人。每多一人多一次姿态推理，且走 IMAGE 模式（无模型内跟踪），
+  帧率会明显下降；打开后右侧多一块「人员」列表，画面里每人一个 `#id` 标签
+- **物体**：打开物体检测（PPE 的前提）。默认用 EfficientDet-Lite0（COCO 80 类）验证链路，
+  所以 PPE 会全部显示 `帽? / 手套?`——COCO 里没有安全帽类别，这是正确的「unknown」，
+  不是 bug。换自训模型后才会出现 `帽✓ / 缺帽`。模型默认走 CPU：GPU delegate 实测会 trap
 - **镜像**：自拍习惯，关掉后左右与你本人一致（角度判定不受影响，角度是几何量）
 - **膝角曲线**：右下曲线是最近 5 秒的膝角信号 + 当前 profile 的下阈/上阈阈值线，**这是校准阈值用的**。
   做几次深蹲，看曲线在多少度到底、多少度站直，再把实测值写进 profile 的 `actions.reps.squat.down/up`
@@ -317,9 +386,16 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 
 以下结论来自当前仓库的自动化测试、合成样例与样例视频；**不代表实拍准确率**。
 
-- 逻辑单测 **225/225**：角度/滤波/滞回/计数门控/姿态互斥（含坐 vs 下蹲）/置信冻结/手势分类/
+- 逻辑单测 **235/235**：角度/滤波/滞回/计数门控/姿态互斥（含坐 vs 下蹲）/置信冻结/手势分类/
   可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/
-  上半身构图/腕部 ROI/手-臂对应/换侧滞回/角度突变剔除/不可靠原因
+  上半身构图/腕部 ROI/手-臂对应/换侧滞回/角度突变剔除/不可靠原因/手型与左右侧绑定
+- 动作提示单测 **31/31**：12 个动作的 tooltip 全覆盖；手部模型关闭/未加载/未检出、无 3D、
+  配置关闭 3D、单帧、髋不可见、置信不足各有提示；多动作同时亮时按可信度最低的那个讲；
+  提示行与 tooltip 都能带出实测准确率或「未评估」，并标出是哪只手。
+  无头页面确认 12 条 tooltip、提示行与准确率明细（12 行）真的渲染，且 1440×900 仍无整页滚动
+- 准确率单测 **32/32**：评估报告 flag→动作 id 映射、n/95%CI 原样保留、样本不足不报百分比、
+  没有数据写「未评估」、合成来源标记、档位边界、报告加载的 404/格式错误/网络异常容错、
+  参数指纹不一致时标记报告过期
 - 评估器单测 **259/259**：反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson 区间、
   门槛、灵敏度扫描、A/B、时延与抖动、`video_time` 回绕、手势帧级指标/弃权/归属、
   分位→profile、LOSO、帧率重采样
@@ -333,6 +409,8 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 - 全身手部：样例视频里整帧 HandLandmarker **0/18 帧**检出手；腕点 ROI 补检后
   **18/18 帧**检出双手。真页面 30fps 限速下 2 只手/帧、fps≈28.8，UI 显示「张开 / 指方向」。
   多人图上只保留目标人的手；双手靠近时按「离哪个姿态腕点最近」判归属
+- 单人路径手部接线：无头页面在样例视频上确认 `verdicts` 能挂上检出的手
+  （`handsByTrack` 曾在单人模式为 null，伸手/持物/指向/拿取在默认单人道恒为 false；已修）
 - 前/侧平举：走路摆臂的误报在加「2D 腕高接近肩 + 手臂基本伸直（3D reach > 0.85）
   + 300ms 保持窗」三道门后为 **0/63 帧**；合成数据的真正前/侧平举仍能判出（单测 [24]）
 - 稳健性：左右侧选择 0.15 可见性滞回；换侧时计数半程中止；单帧角速度 > 1500°/s 判坏点。
@@ -360,13 +438,25 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 - **真实动作准确率没有数字**：深蹲/俯卧撑/挥手/躺卧/手势的识别率与计数准确性目前只有合成信号
   单测和评估器自测，**没有任何实拍素材跑过**。这正是 `docs/eval.md` 与
   `docs/data-collection.md` 要解决的问题，也是本版最大的空白。
+  页面上的「准确率」因此只显示「未评估 / 样本不足(n=…)」，跑完 `npm run accuracy` 才会变成实测值；
+  这是刻意设计，不是没接上。
 - 摄像头实时路径没有在自动化里跑过（无头浏览器无法给摄像头）。
 - 帧率数字来自无头环境，不代表真机；请在自己机器上开 DevTools 看。
 - 跨机位阈值漂移幅度、不同身高体型的泛化都没有数据。
 - 真机 / 非 Chrome 浏览器：页面级回归只在无头 Chrome + 1440×900 下跑过。
 - 手势准确率：只有度量口径与工具（合成帧自测覆盖），8 种手势在实拍上的 recall/precision
   仍是 0 个数字；侧对帧占比也不知道。
-- Python 服务端引擎、YAML 规则、多人跟踪不在本版内，见 `PLAN.md`。
+- **多人只在双人样例视频上验证过"能出 2 条轨迹"**：速度（每多一人多一次推理）、3 人以上、
+  交叉遮挡下的 id 稳定性都没有量化；多人时手部 ROI 补检只对主目标做。
+- **PPE 冒烟模型已训好，但精度不够考核**：623 train / 252 val、9 类、YOLOv8n@320 训 10 epoch，
+  val mAP50 0.40（helmet 0.76、person 0.67、vest 0.72、no_helmet 0.53；glove/no_boots 接近 0）。
+  训练→导出 ONNX→浏览器 ORT→PPE 判定这条链路已跑通（`npm run check:ppe`），但数据量、机位差异、
+  小目标都还没解决，**没有任何实拍准确率**。判定逻辑（看不见≠没戴、连续 3s、手套只报疑似）有单测，
+  但"准不准"仍未知。见 `docs/ppe-training.md`。
+- 物体检测的 GPU delegate 对该模型会 trap（wasm divide by zero，且会污染整个运行时），
+  默认走 CPU；换自训模型后需要自己验证能否上 GPU。
+- 多人 + PPE 的评估口径（按 track 的 recall/precision）还没接进 `evaluate.mjs`。
+- Python 服务端引擎、YAML 规则、RTSP 多路不在本版内，见 `PLAN.md`。
 
 ## 插图
 
@@ -384,6 +474,10 @@ Copyright (c) 2026 王宇 (b8nw27v7wp-bit)
 | 组件 | 许可 |
 |---|---|
 | MediaPipe Tasks Vision（`@mediapipe/tasks-vision`，含 PoseLandmarker / HandLandmarker 权重） | Apache-2.0 |
+| onnxruntime-web（PPE ONNX 后端） | MIT |
+| Ultralytics YOLOv8n（**仅用于训练冒烟 PPE 模型**，权重与代码） | **AGPL-3.0** |
 | `data/` 下的测试图片与视频 | 由 COCO 数据集样本（经 Ultralytics assets 仓库）裁剪而来，仅用于本地功能验证，不随产品分发 |
 
-另外提醒：Ultralytics 自家的 YOLO 系列是 AGPL-3.0，本项目没有使用；若要换成 YOLO-pose，闭源商用需要买授权。
+另外提醒：Ultralytics 自家的 YOLO 系列是 AGPL-3.0。本项目**只在 PPE 冒烟训练/导出时使用**
+（`docs/ppe-training.md`），运行时产物 `ppe_smoke.onnx` 只是验证链路；闭源商用前必须处理许可
+（购买 Ultralytics Enterprise，或换 Apache/BSD 许可的检测器重训）。

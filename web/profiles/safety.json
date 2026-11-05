@@ -1,0 +1,31 @@
+{
+  "name": "safety",
+  "model": "full",
+  "note": "工业/工地安全场景示例 profile：多人 + 物体检测 + PPE。只写与默认值不同的键。类别名必须与检测模型的 label map 对上；换成自训的 helmet/glove 模型后按实际类别名改。数值是量级参考，必须用本项目实拍素材校准后再用于考核。",
+  "params": {
+    "perception": {
+      "multi": { "enabled": true, "maxPersons": 3 },
+      "objects": {
+        "enabled": true,
+        "model": "efficientdet_lite0.tflite",
+        "delegate": "CPU",
+        "scoreThreshold": 0.4
+      }
+    },
+    "signals": {
+      "ppe": {
+        "classes": {
+          "helmet": ["helmet", "hard_hat", "hardhat", "safety_helmet"],
+          "glove": ["glove", "gloves", "hand_glove"]
+        },
+        "minScore": 0.4,
+        "headBoxScale": 0.55,
+        "gloveBoxScale": 0.45,
+        "requirePositive": true,
+        "helmet": { "minMs": 3000, "policy": "violation" },
+        "glove": { "minMs": 3000, "policy": "suspect" }
+      },
+      "track": { "maxLostMs": 2000 }
+    }
+  }
+}

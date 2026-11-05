@@ -5,6 +5,21 @@
 import { Hold, RepCounter, PhaseSequence } from './signals.js';
 import { resolveParams } from './params.js';
 
+// 手臂动作的完整 flag 集合。冻结帧和正常帧都用同一份，避免新增字段时只补一处，
+// 界面/导出在低置信帧里读到 undefined（曾经导致「置信不足时动作全灭」）。
+const EMPTY_FLAGS = {
+  armRaised: false, waving: false, crossed: false, onHips: false, armsOpen: false,
+  bothHandsUp: false, handAtHead: false, reaching: false, carrying: false,
+  pointing: false, armFront: false, armSide: false,
+  // 左右手粒度：聚合 flag 保留，新增逐侧 flag 供界面/导出说明「是哪只手」
+  armRaisedL: false, armRaisedR: false,
+  wavingL: false, wavingR: false,
+  reachingL: false, reachingR: false,
+  pointingL: false, pointingR: false,
+  handAtHeadL: false, handAtHeadR: false,
+  carryingL: false, carryingR: false,
+};
+
 /**
  * 互斥的静态姿态。prio 大者优先；streak 要求连续命中帧数，避免姿态在两个标签间闪烁。
  * 判定条件从参数构造，所以改阈值不需要改这里的逻辑。
@@ -52,6 +67,8 @@ export class ActionEngine {
     this.waveCfg = cfg.signals.wave;
     this.graspCfg = cfg.signals.grasp;
     this.closedShapes = new Set(cfg.signals.hand.closedShapes);
+    this.openShapes = new Set(cfg.signals.hand.openShapes);
+    this.pointShapes = new Set(cfg.signals.hand.pointShapes);
     this.carryCfg = cfg.signals.arm.carry;
     // 深蹲门控：躯干仍接近竖直 + 踝明显在髋下方。
     // 少了这个门，从站到坐的过程中膝角也会穿过 100°，一次坐下会被记成一次深蹲。
@@ -121,8 +138,10 @@ export class ActionEngine {
   /**
    * @param {object} s SignalEngine.update() 产出的信号
    * @param {number} ts 毫秒
-   * @param {{L?:string|null, R?:string|null}} [hands] 每只手当前的稳定手势（形如 'fist'/'ok'），
-   *   缺失表示该手未检出。拿取判定需要手的开合状态，姿态层给不了这个信息。
+   * @param {{L?:string|null, R?:string|null}} [hands] 每只手当前的稳定手势
+   *   （fist/open/victory/pointing/thumbs_up/ok/gun/rock），缺失表示该手未检出。
+   *   伸手/持物/指向按 signals.hand.openShapes/pointShapes/closedShapes 分组判定，
+   *   判不出手型时宁可弃权，也不拿「非闭合」当「张开」。
    */
   update(s, ts, hands = null) {
     // 置信度不足：冻结状态，不推进计数，也不清空姿态（否则会闪）
@@ -133,11 +152,7 @@ export class ActionEngine {
         postureId: prev?.postureId ?? null,
         postureMs: prev ? ts - (this.postureSince ?? ts) : 0,
         frozen: true,
-        flags: prev?.flags ?? {
-          armRaised: false, waving: false, crossed: false, onHips: false, armsOpen: false,
-          bothHandsUp: false, handAtHead: false, reaching: false, carrying: false,
-          pointing: false, armFront: false, armSide: false,
-        },
+        flags: prev?.flags ?? { ...EMPTY_FLAGS },
         reps: {
           squat: this.reps.squat.count,
           pushup: this.reps.pushup.count,
@@ -220,31 +235,41 @@ export class ActionEngine {
     // 这些判定需要「手是张开还是握紧」，而姿态层只有腕的位置。
     // hands 由调用方逐帧传入（手部模型的结果），缺失时这些动作一律不成立——
     // 宁可漏判，也不要把「手没被检出」当成「手是空的」。
-    const closedL = !!hands && this.closedShapes.has(hands.L);
-    const closedR = !!hands && this.closedShapes.has(hands.R);
-    const hasL = !!hands && hands.L != null;
-    const hasR = !!hands && hands.R != null;
-    const openL = hasL && !closedL;
-    const openR = hasR && !closedR;
+    // 手型按具体类别取，而不是只分「闭合/非闭合」：
+    // 伸手=open，指向=pointing/gun，持物/拿取=fist/ok。判不出（unknown/侧对）就弃权。
+    const shapeL = hands?.L ?? null;
+    const shapeR = hands?.R ?? null;
+    const closedL = !!hands && this.closedShapes.has(shapeL);
+    const closedR = !!hands && this.closedShapes.has(shapeR);
+    const openL = !!hands && this.openShapes.has(shapeL);
+    const openR = !!hands && this.openShapes.has(shapeR);
+    const pointL = !!hands && this.pointShapes.has(shapeL);
+    const pointR = !!hands && this.pointShapes.has(shapeR);
     const anyClosed = closedL || closedR;
     const extendedL = !!ap.extend_L;
     const extendedR = !!ap.extend_R;
 
     // 手必须和**伸出的那条臂**对应：只看 anyOpen 时，
     // 「左臂伸出但手没检出，右手在身侧张开」会被误判成伸手。
-    const reachOpen = (extendedL && openL) || (extendedR && openR);
-    const reachClosed = (extendedL && closedL) || (extendedR && closedR);
+    const reachOpenL = extendedL && openL;
+    const reachOpenR = extendedR && openR;
+    const reachOpen = reachOpenL || reachOpenR;
+    const reachClosedL = extendedL && closedL;
+    const reachClosedR = extendedR && closedR;
+    const reachClosed = reachClosedL || reachClosedR;
 
-    // 伸手：臂伸出且手是张开的（握着拳不算伸手，那是持物/拿取）
+    // 伸手：臂伸出且手判为张开（指向/握拳都不算，它们各有自己的动作）
     const reaching = this.reachHold.update(reachOpen, ts);
     // 持物：手闭合且臂没有明显伸出（端着/拿着东西的自然姿势）
     const carrying = this.carryHold.update(anyClosed
       && (ap.reach_L ?? 0) < this.carryCfg.maxReach
       && (ap.reach_R ?? 0) < this.carryCfg.maxReach, ts);
-    // 指向：伸出那条臂的手被检出（食指伸出与否由手势层判断），且臂朝正面/侧面
-    const extendedHand = (extendedL && hasL) || (extendedR && hasR);
-    const pointing = this.pointHold.update(extendedHand
-      && (ap.arm_side_L || ap.arm_side_R || ap.arm_front_L || ap.arm_front_R), ts);
+    // 指向：伸出那条臂的手**判为指方向/手枪**，且**同一条臂**朝正面/侧面。
+    // 以前只看「手被检出 + 任一臂朝前/侧」：张开手掌也算指向，还会出现
+    // 「左臂伸出、右手做侧平举」把指向凑出来。现在手型与左右侧都绑定。
+    const pointArmL = extendedL && pointL && (ap.arm_front_L || ap.arm_side_L);
+    const pointArmR = extendedR && pointR && (ap.arm_front_R || ap.arm_side_R);
+    const pointing = this.pointHold.update(pointArmL || pointArmR, ts);
 
     // 前/侧平举：信号层是瞬时布尔，这里补一个保持窗。
     // 走路摆臂时 3D 方位角的噪声会断续命中，实测最长一段只有 250ms；
@@ -304,9 +329,20 @@ export class ActionEngine {
       frozen: false,
       flags: {
         armRaised, waving, crossed, onHips, armsOpen, bothHandsUp, handAtHead,
-        reaching, carrying, pointing,
-        armFront,
-        armSide,
+        reaching, carrying, pointing, armFront, armSide,
+        // 逐侧粒度：界面用它说「左手举手」，导出也能按手拆准确率
+        armRaisedL: armRaised && raisedL,
+        armRaisedR: armRaised && raisedR,
+        wavingL: waving && waveL,
+        wavingR: waving && waveR,
+        reachingL: reaching && reachOpenL,
+        reachingR: reaching && reachOpenR,
+        pointingL: pointing && pointArmL,
+        pointingR: pointing && pointArmR,
+        handAtHeadL: handAtHead && !!s.arm.head_near_L,
+        handAtHeadR: handAtHead && !!s.arm.head_near_R,
+        carryingL: carrying && closedL,
+        carryingR: carrying && closedR,
       },
       reps: { squat: squatCount, pushup: pushupCount, clap: clapCount, grasp: this.graspCount },
       gates: { squat: squatGate, pushup: pushupGate, clap: clapGate },

@@ -1,0 +1,47 @@
+{
+  "name": "safety-ppe",
+  "model": "full",
+  "note": "PPE 冒烟 profile：物体检测走自训 YOLOv8n→ONNX（onnxruntime-web），不是 MediaPipe。labels 的顺序必须与训练时 eval-data/ppe-yolo/data.yaml 的 names 完全一致；换模型时一起改。冒烟模型只有 623 张训练图，精度只够验证链路，不能当作考核指标。",
+  "params": {
+    "perception": {
+      "multi": { "enabled": true, "maxPersons": 3 },
+      "objects": {
+        "enabled": true,
+        "backend": "onnx",
+        "model": "ppe_smoke.onnx",
+        "inputSize": 320,
+        "maxResults": 12,
+        "scoreThreshold": 0.3,
+        "iouThreshold": 0.45,
+        "labels": [
+          "helmet",
+          "no_helmet",
+          "glove",
+          "no_glove",
+          "vest",
+          "no_vest",
+          "person",
+          "boots",
+          "no_boots"
+        ]
+      }
+    },
+    "signals": {
+      "ppe": {
+        "classes": {
+          "helmet": ["helmet", "hard_hat", "hardhat", "safety_helmet"],
+          "glove": ["glove", "gloves", "hand_glove"],
+          "noHelmet": ["no_helmet", "no_hardhat", "no helmet"],
+          "noGlove": ["no_glove", "no_gloves"]
+        },
+        "minScore": 0.35,
+        "headBoxScale": 0.55,
+        "gloveBoxScale": 0.45,
+        "requirePositive": true,
+        "helmet": { "minMs": 3000, "policy": "violation" },
+        "glove": { "minMs": 3000, "policy": "suspect" }
+      },
+      "track": { "maxLostMs": 2000 }
+    }
+  }
+}

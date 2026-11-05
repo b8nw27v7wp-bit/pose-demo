@@ -68,6 +68,24 @@ node web/test/evaluate.mjs --dir eval-data
 
 只想看汇总和失败段时，前 9 项就是一轮完整评估的全部输出；后三项按需开启。
 
+## 把结果回显到 Demo（accuracy.json）
+
+Demo 的「动作与手势 → 准确率」读的是 `web/accuracy.json`，由评估器的 `--json` 输出转换而来：
+
+```bash
+npm run accuracy
+# 等价：node web/test/accuracy-report.mjs --dir eval-data --out web/accuracy.json --min-samples 20
+```
+
+- 动作 id 用 `js/actions.js` 注册表映射（评估器 summary 里的 `armRaised` → 页面 `arm_raised`），
+  不在页面里再抄一份。
+- `recall` / `precision` / `nRecall` / `nPrecision` / 95%CI 原样带过去；**每个方向 n < min-samples
+  不报百分比**，页面显示「样本不足(n=…)」；没有数据的动作显示「未评估」。
+- 合成样例（clip 名/备注含「合成」或 `make-sample`）会标 `source.synthetic=true`，
+  页面写「合成样例自检，不代表实拍准确率」。
+- `web/accuracy.json` 是生成物，已 gitignore；素材或阈值变了要重跑。
+- 页面不自己估准确率，也不把逻辑单测通过率当成准确率。
+
 ## 自动生成标注草稿
 
 ```bash
@@ -128,6 +146,12 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 
 动作名也接受 `ARM_ACTIONS` 里的 id（`arm_raised` / `reach` / `carry` / `point` …），
 两种写法等价，评估器内部会归一。
+
+**逐侧粒度**：导出帧的 `actions.flags` 现在带 `armRaisedL/R`、`wavingL/R`、`reachingL/R`、
+`pointingL/R`、`handAtHeadL/R`、`carryingL/R`，界面也会显示「左手举手」这类粒度；
+但 labels 还没有 `side` 字段，评估器仍按聚合动作统计。要按左手/右手分别报
+recall/precision，下一步给段加 `"side":"L"` 并让 `evaluate.mjs` 读逐侧 flag——
+在那之前不要把逐侧 flag 当成已经评估过的指标。
 
 **反例是 precision 的唯一来源。** 只标正例，报告里的 precision 永远是 1，等于没测。
 

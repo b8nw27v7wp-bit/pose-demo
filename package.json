@@ -6,8 +6,21 @@
   "license": "MIT",
   "description": "通用人体姿态识别：浏览器感知 Demo + 可配置动作识别引擎",
   "scripts": {
-    "test": "node web/test/logic-test.mjs && node web/test/eval-test.mjs && node web/test/hardcase-test.mjs && node web/test/autolabel-test.mjs && node web/test/manifest-test.mjs",
+    "test": "node web/test/logic-test.mjs && node web/test/armhint-test.mjs && node web/test/accuracy-test.mjs && node web/test/eval-test.mjs && node web/test/hardcase-test.mjs && node web/test/autolabel-test.mjs && node web/test/manifest-test.mjs && node web/test/multi-test.mjs && node web/test/onnx-test.mjs",
     "test:logic": "node web/test/logic-test.mjs",
+    "test:hint": "node web/test/armhint-test.mjs",
+    "test:accuracy": "node web/test/accuracy-test.mjs",
+    "accuracy": "node web/test/accuracy-report.mjs",
+    "test:multi": "node web/test/multi-test.mjs",
+    "check:multi": "node web/test/headless-multi.mjs",
+    "check:open": "node web/test/headless-open-data.mjs",
+    "check:ppe": "node web/test/headless-ppe-onnx.mjs",
+    "probe:throughput": "node web/test/throughput-probe.mjs",
+    "eval:mot17": "node web/test/mot17-eval.mjs",
+    "fetch:assets": "node scripts/py.mjs -I scripts/fetch-assets.py",
+    "fetch:ort": "node scripts/fetch-ort.mjs",
+    "fetch:data": "node scripts/py.mjs -I scripts/fetch-eval-data.py",
+    "report:ppe": "node scripts/py.mjs -I scripts/ppe-dataset-report.py",
     "test:eval": "node web/test/eval-test.mjs",
     "test:hardcase": "node web/test/hardcase-test.mjs",
     "test:autolabel": "node web/test/autolabel-test.mjs",
@@ -17,6 +30,6 @@
     "sample": "node web/test/make-sample.mjs",
     "eval": "node web/test/evaluate.mjs --dir eval-data",
     "compare": "node web/test/signal-compare.mjs",
-    "serve": "python serve.py"
+    "serve": "node scripts/py.mjs serve.py"
   }
 }

@@ -1067,4 +1067,103 @@ R7 的实拍手势数字、R8–R10。**不要**把当前 571 项单测当成准
 
 ---
 
+## 14. 多人与物体检测（2026-11-02 落地）
+
+> 本节按"文档维护"约定写在同一份文件里。目标：把方向从"通用单人姿态"往工业合规拉近一层
+> （`docs/multi-and-objects.md` 是实现说明）。
+
+### 14.1 做了什么
+
+| 模块 | 文件 | 说明 |
+|---|---|---|
+| 跟踪 | `web/js/track.js` | IoU（≥0.25）为主、中心距离（≤0.6×身高）兜底、身高校验 0.6~1.67、全局贪心匹配、丢失 1.5s 后换新 id |
+| 每人流水线 | `web/js/multi.js` | `track_id → 一对独立 SignalEngine/ActionEngine`；缺席 >1s 重建状态机；手部按腕点距离归属 |
+| 多人推理 | `web/js/pose.js` | 新增 IMAGE 模式多人实例（VIDEO 模式只回 1 人），`detConf` 默认 0.3 |
+| 物体检测 | `web/js/objects.js` | MediaPipe ObjectDetector 适配层；建后自检、GPU→CPU 自动降级；标签只取模型 label map |
+| PPE | `web/js/ppe.js` | 头部/腕部区域 + 检测框归属 + 持时门槛；`unknown` 不判违规、手套默认只报疑似 |
+| 场景档 | `web/profiles/safety.json` | 多人 3 + 物体 + PPE；开关本身也由 profile 声明，切档即生效 |
+| 契约 | `pushLog()` | 每帧新增 `verdicts` / `objects`，老字段不变（评估器零改动） |
+
+### 14.2 实测（本机无头 Chrome，双人样例 data/pose-test-two.webm 470×540/3s）
+
+| 项 | 数字 / 结论 |
+|---|---|
+| VIDEO 模式 `numPoses=2` | 恒 1 人 → 多人必须走 IMAGE 模式 |
+| IMAGE 模式 `numPoses=3`，detConf 0.5 | 1 人（远处那人被置信度过滤） |
+| IMAGE 模式 `numPoses=3`，detConf 0.3 | 2 人（CPU 与 GPU 一致） |
+| 跟踪 | 双人视频稳定 2 条轨迹、2 条独立判定；单人截图仍只 1 条 |
+| 物体检测 | EfficientDet-Lite0 在该帧检出 4 个框（person / bus） |
+| PPE | COCO 模型下全部 `unknown`（护栏生效，未把"没这个类别"判成"没戴"） |
+| 测试 | `multi-test` 48 项、`headless-multi` 17 项；总回归 619 项 + `headless-check` 全绿 |
+
+### 14.3 两个必须记住的坑
+
+1. **物体检测的 GPU delegate 会 trap**：efficientdet_lite0 在 GPU 上 `createFromOptions` 成功、
+   首次推理抛 `divide by zero`，且**污染整个 wasm 运行时**（之后建任何实例都挂）。所以
+   `perception.objects.delegate` 默认 CPU，并在建好后用纯黑小图自检一次。
+2. **多人 detConf 不能用单人道的 0.5**：同一张三人图，0.5 只回 1 人、0.3 回 2 人。
+
+### 14.4 路线表的变化
+
+- **R10（多人跟踪）**：不再是"可选项、最后做"。跟踪 + 每人流水线已落地，但用的是 IoU/中心距离贪心，
+  不是 ByteTrack；3 人以上、交叉遮挡、长期 re-id 都没验。剩下的部分是"量化 id 稳定性"。
+- 新增 **R11（PPE 数据与模型）**：训练/微调 helmet+head+glove 检测器，采集覆盖昼夜/逆光/工装变化，
+  验收按事件 recall/precision 与班次误报（不用 mAP）。依赖 R2 的采集协议扩展。
+- **R9（Python 引擎）** 的优先级没变，但多了一条约束：多人 + PPE 的判定现在有三份状态机
+  （跟踪、每人流水线、PPE 持时），移植到服务端时必须一起搬，不能只搬 `signals.js`。
+
+### 14.5 未验证（必须写清楚）
+
+- 没有任何工地/车间素材；PPE 准确率是 **0 个数字**，目前只有逻辑单测。
+- 多人速度：多人 + 手部 + 物体同时开时无头环境约 3~6 fps（IMAGE 模式无模型内跟踪，
+  帧率不足会加大 id 抖动）。真机要自己看 DevTools。
+- 多人 + PPE 的评估口径（按 track 的 recall/precision、跨机位退化）还没接进 `evaluate.mjs`。
+- 手部 ROI 补检只对主目标做，其余人的手来自整帧检测。
+
+---
+
+## 15. 开源验证素材（2026-11-04）
+
+目标：在没有人出镜之前，先用公开数据把"多人 + 物体检测"这条链路放到真实画面上跑一次。
+明细见 `docs/open-datasets.md`，下载脚本 `scripts/fetch-eval-data.py`（可复现，写 MANIFEST.json）。
+
+### 15.1 下了什么（84MB，eval-data/open/，不进 git）
+
+| 数据集 | 许可 | 取了什么 |
+|---|---|---|
+| Lekim89/MOT17 | CC BY-NC-SA 3.0（**非商用**） | 两条序列各 300 帧 → 合成 1080p mp4 + gt.txt |
+| Chapian/PPE_detection | Roboflow（多为 CC BY 4.0） | 100 图 + 100 YOLO 标注（9 类，含 **gloves / no_gloves**） |
+| phat06/Safety-helmet-dataset | **MIT** | 均匀抽 40 图 + 标注 |
+| vikasaarna/roboflow-construction-ppe | **MIT** | 均匀抽 40 图 |
+
+gated 未能自动下的（值得人工申请）：IITU Safety-Helmet（CC BY 4.0，无人机 3~15m、0/45/90°、夜间）、
+Aerial-PPE-Construction-Safety（CC BY-NC-ND）。
+
+### 15.2 实测（safety 档：多人 3 + 物体检测）
+
+| 素材 | 帧 | 人数 max/中位 | 轨迹 max | 框 max/中位 | fps |
+|---|---|---|---|---|---|
+| MOT17-02（拥挤街景 1080p） | 53 | 3 / 1 | 5 | 8 / 5 | 4.5 |
+| MOT17-05（俯拍广场 1080p） | 55 | 2 / 1 | 5 | 7 / 4 | 3.7 |
+
+结论：**多人链路在真实多人视频上成立**（人进人出时 id 没有塌成 1 条），物体检测出框正常。
+fps 3.7~5.2 是无头环境 + 三种模型同开的结果，真机需自测。
+
+### 15.3 素材暴露并修掉的 3 个真 bug
+
+1. 图片输入 + 多人：多人模型只在视频主循环里懒加载，图片路径未触发 → `detectMultiImage` 抛
+   "not ready" → 整张图零判定（UI 只显示"图片分析失败"）。修法：`useImageSource` 里先 ensure。
+2. 图片的物体检测用错模式：检测器建在 VIDEO 模式，图片路径调 `detectObjectsImage`（IMAGE 专用）→
+   抛错被 `catch {}` 静默吞掉，永远 0 框。修法：改用 `detectObjectsVideo(img, ts)`。
+3. 图片路径没把框写回 `lastObjects`，`state.objects` 恒为 0，无头检查看不到。
+
+### 15.4 仍然没有的
+
+- **PPE 准确率仍是 0 个数字**：COCO 模型没有 helmet/glove 类别，现在只能证明"检测这条路能跑"。
+  下一步是 R11（训 helmet/head/glove 检测器，四份数据都现成）。
+- MOT17 的 gt 是**人框**，`evaluate.mjs` 的标注是"动作段"，中间还差一层帧级人框评估器。
+- 动作类素材（弯腰/搬运/下蹲）没下：HF 上的 Kinetics 是 1.5GB/包 tar.gz，需要按类抽的解包脚本。
+
+---
+
 *文档维护：每完成一个阶段，更新本文件对应阶段的状态与实测数据，不另建文档。§13 的状态列随 R0~R10 推进更新。*

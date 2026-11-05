@@ -678,6 +678,7 @@ console.log('\n[18b] 双手高举');
   let r = null;
   for (let i = 0; i < 8; i++) r = ae.update(mkSig(), t += 100);
   check('双臂都举起 → bothHandsUp', r.flags.bothHandsUp === true);
+  check('双臂都举起 → 逐侧都成立', r.flags.armRaisedL === true && r.flags.armRaisedR === true);
 
   // 只举一只手不算双手高举
   const ae2 = new ActionEngine();
@@ -690,6 +691,8 @@ console.log('\n[18b] 双手高举');
   }
   check('只举一手 → 不算双手高举', r2.flags.bothHandsUp === false);
   check('只举一手 → 仍算举手', r2.flags.armRaised === true);
+  check('只举左手 → 逐侧 flag 指向左手',
+    r2.flags.armRaisedL === true && r2.flags.armRaisedR === false);
 }
 
 // —— 19. 手势抗抖（连续帧才切换）——
@@ -886,6 +889,7 @@ console.log('\n[22] 拿取与手臂扩展');
   for (let i = 0; i < 5; i++) r2 = ae2.update(mkSig(), t2 += 100, hands('fist', null));
   check('臂伸出但握拳 → 不算伸手', r2.flags.reaching === false);
   check('臂伸出但握拳 → 不算持物（臂伸太远）', r2.flags.carrying === false);
+  check('握拳不算指向', r2.flags.pointing === false);
 
   // 持物：手闭合 + 臂没伸出
   const ae3 = new ActionEngine();
@@ -900,11 +904,42 @@ console.log('\n[22] 拿取与手臂扩展');
   for (let i = 0; i < 6; i++) r3 = ae3.update(carried, t3 += 100, hands('fist', null));
   check('手闭合 + 臂未伸出 → 持物', r3.flags.carrying === true);
 
+  // 手张开不叫持物（持物要求握拳/OK，张开是伸手的语义）
+  const ae3b = new ActionEngine();
+  let t3b = 0; let r3b;
+  for (let i = 0; i < 6; i++) r3b = ae3b.update(carried, t3b += 100, hands('open', null));
+  check('手张开 + 臂未伸出 → 不算持物', r3b.flags.carrying === false);
+
   // 指向：臂伸出 + 朝向水平
   const ae4 = new ActionEngine();
   let t4 = 0; let r4;
   for (let i = 0; i < 6; i++) r4 = ae4.update(mkSig(), t4 += 100, hands('pointing', null));
   check('臂伸出 + 指示手势 → 指向', r4.flags.pointing === true);
+  check('指方向手型 → 不算伸手（两者互斥）', r4.flags.reaching === false);
+  check('逐侧 flag 指向左手', r4.flags.pointingL === true && r4.flags.pointingR === false);
+
+  // 张开手掌 + 臂伸出：是伸手，不是指向（以前手型不分，两者会同时亮）
+  const ae4b = new ActionEngine();
+  let t4b = 0; let r4b;
+  for (let i = 0; i < 6; i++) r4b = ae4b.update(mkSig(), t4b += 100, hands('open', null));
+  check('张开手掌 → 不算指向', r4b.flags.pointing === false);
+  check('张开手掌 → 伸手成立', r4b.flags.reaching === true);
+  check('逐侧 flag 指向左手（伸手）',
+    r4b.flags.reachingL === true && r4b.flags.reachingR === false);
+
+  // 手型与左右侧必须绑定：左臂前伸 + 左手张开，右手（另一侧）指方向但右臂不是前/侧平举
+  // → 不能拿右手的指向手型去点亮左臂的「指向」。
+  const mixed = mkSig({
+    armPose: {
+      ...mkSig().armPose,
+      extend_R: true, reach_R: 1.6,
+      arm_front_L: true, arm_front_R: false, arm_side_L: false, arm_side_R: false,
+    },
+  });
+  const ae4c = new ActionEngine();
+  let t4c = 0; let r4c;
+  for (let i = 0; i < 6; i++) r4c = ae4c.update(mixed, t4c += 100, hands('open', 'pointing'));
+  check('手型与手臂同侧才判指向', r4c.flags.pointing === false, `pointing=${r4c.flags.pointing}`);
 
   // 拿取 = 伸手 → 合手，两次条件都成立才计 1
   const ae5 = new ActionEngine();

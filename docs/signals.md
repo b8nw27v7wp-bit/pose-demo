@@ -158,15 +158,27 @@
 
 ## 三·七、持物与指向
 
-- **持物 `carrying`**：手闭合且两臂都没伸出（`reach < carry.maxReach`）。
+- **持物 `carrying`**：手被判为握拳/OK（`closedShapes`）且两臂都没伸出（`reach < carry.maxReach`）。
   端着东西走路就是这种姿势；手举得很远则是拿取过程，不算持物。
-- **指向 `pointing`**：单臂伸出、该侧手被检出，且手臂朝向接近水平（`arm_front` 或 `arm_side`）。
-- **伸手 `reaching`**：臂伸出 **且手张开**；握着拳不算伸手（那是持物/拿取）。
-  手的状态必须来自**伸出的那条臂**——另一侧手张开不能替它成立。
-- **拿取 `grasp`**：`PhaseSequence(['reach','grasp'])`，先伸手再合手才计一次（见 §二）。
+- **指向 `pointing`**：单臂伸出、**该侧手判为「指方向/手枪」**（`pointShapes`），
+  且**同一条臂**朝向接近水平（`arm_front` 或 `arm_side`，依赖 3D world 的方位角）。手型与左右侧都绑定：
+  「左手张开前伸、右手比划」不再能凑出指向；无 3D 时该动作不可用。
+- **伸手 `reaching`**：臂伸出 **且该侧手判为「张开」**（`openShapes`）；
+  握拳/OK、指方向、剪刀手都不算伸手。手的状态必须来自**伸出的那条臂**——另一侧手张开不能替它成立。
+- **拿取 `grasp`**：`PhaseSequence(['reach','grasp'])`，先伸手（open）再合手（fist/OK）才计一次（见 §二）。
+
+手型分组在 `params.signals.hand`：`openShapes` / `pointShapes` / `closedShapes`。
+判不出手型（`unknown`、侧对镜头）时这些动作弃权，不拿旧结果硬判。
 
 这四个动作（伸手/持物/指向/拿取）依赖手部模型。手部关掉或未检出时它们恒为 `false`，
 这是刻意的降级：**宁可漏判，不要拿姿态去猜手的开合**。
+
+动作输出同时给**聚合 flag** 和**逐侧 flag**（`reachingL/R`、`pointingL/R`、`armRaisedL/R`、
+`wavingL/R`、`handAtHeadL/R`、`carryingL/R`）。聚合 flag 保持旧语义，评估器/标签不受影响；
+逐侧 flag 供界面说明「是哪只手」，也为后续按手拆准确率留好导出字段。
+
+这些条件与已知误判会显示在 Demo 的「动作与手势」面板：悬停动作名看 tooltip，面板下方一行
+按当前帧提示能力缺失（手部模型/3D/髋/单帧）或当前动作最可能错在哪（`web/js/armhint.js`）。
 
 ### 取哪一侧：`knee_pick` / `elbow_pick`
 

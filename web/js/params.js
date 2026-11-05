@@ -79,6 +79,11 @@ export const DEFAULT_PARAMS = {
     hand: {
       // 判定为「握住」的手势。ok/gun 是捏取，也算能拿东西
       closedShapes: ['fist', 'ok'],
+      // 手型分组（颗粒度：不只分「握没握」，还用具体手势）。
+      // 伸手只认张开的手掌；指向只认食指伸出的「指方向 / 手枪」。
+      // 指向姿势以前被当成「非闭合」从而同时点亮伸手，这里把两者分开。
+      openShapes: ['open'],
+      pointShapes: ['pointing', 'gun'],
       // 腕部 ROI 补检：整帧漏检时，以姿态腕点为中心裁一块放大后重检。
       // 全身构图里手只有几十像素，整帧检测实测 0 命中；补检后同一模型 100% 命中。
       // mul = 框边长 / 躯干长；maxCenterOffset = 检出腕点离框中心的最大偏移（占框边长）。
@@ -94,6 +99,86 @@ export const DEFAULT_PARAMS = {
     },
     gesture: {
       streak: 3,        // 手势要连续命中几帧才切换（治「张开→剪刀手」来回闪）
+    },
+    // —— 多人跟踪（track.js）——
+    // maxLostMs：人短暂被挡/检出失败时保留 track_id 的时长。太短会频繁换 id（计数清零），
+    // 太长会让同一个人在画面里换位后仍占着旧 id 的状态。
+    // motion/velAlpha/maxPredictMs：匀速运动模型。两人交叉时只比当前位置容易配反，
+    // 用轨迹速度把框外推到当前帧再比。maxPredictMs 限制丢失后还能相信旧速度多久。
+    track: {
+      maxLostMs: 1500, iouMin: 0.25,
+      // 中心距离兜底 gate（单位：身高）。实时播放的 4 序列 A/B 曾显示 0.6→0.8 略好，
+      // 但那个测量受丢帧影响，同配置重复跑 ID 切换会在 56~70 之间跳；用 --rate 0.4
+      // 慢放逐帧复测（6 序列约 800 对）0.6 与 0.8 都是 72 次，**没有差异**。
+      // 保留 0.8：对快速移动/丢帧更宽容，代价是换人时更容易接错一点点。
+      centerMax: 0.8,
+      // 运动模型默认关：MOT17 A/B 实测（72→107 次切换）反而更差——检测框抖动会被
+      // 当成速度。代码保留，profile 可开（motion: true）做对比。
+      motion: false, velAlpha: 0.5, maxPredictMs: 500, maxSpeed: 3, motionGapRatio: 1.5,
+      // 轻量外观 ReID：bbox 中部 2×2 网格的色相直方图。代码保留，默认关：
+      // 慢放逐帧 6 序列 A/B：off 72/810 vs on 81/807，颜色直方图在拥挤/远景里
+      // 不够判别，反而会接错人。要试可 profile 里开。
+      appearance: false, appearMin: 0.82, appearWeight: 0.5,
+    },
+    // —— PPE（安全帽/手套，ppe.js）——
+    // classes 是**标签名**，必须与检测模型的 label map 对上；写错时 requirePositive
+    // 会把全场判成 unknown，而不是「都没戴」——这是刻意的防误报设计。
+    ppe: {
+      classes: {
+        helmet: ['helmet', 'hard_hat', 'hardhat', 'safety_helmet'],
+        glove: ['glove', 'gloves', 'hand_glove'],
+        // 负类只作为"直接证据"用：模型明确检出没戴，比"没检出正类"更强。
+        // 注意 matchLabel 会把 no_/not_/without_ 开头的标签排除出正类匹配。
+        noHelmet: ['no_helmet', 'no_hardhat', 'no helmet'],
+        noGlove: ['no_glove', 'no_gloves'],
+      },
+      minScore: 0.35,
+      visMin: 0.3,
+      headBoxScale: 0.55,   // 头部区域半边长 / 躯干长
+      gloveBoxScale: 0.45,  // 腕部区域半边长 / 躯干长
+      // 本场从未检出过该类正例 → 只报 unknown。模型类别名写错时防止满屏误报。
+      requirePositive: true,
+      helmet: { minMs: 3000, policy: 'violation' },  // 连续缺失多久算违规
+      // 手套默认只报「疑似」：手小、常被遮挡，「没检出」与「没戴」不可区分，
+      // 直接进实时违规就是无穷申诉。要升级成违规必须在这里显式改 policy。
+      glove: { minMs: 3000, policy: 'suspect' },
+    },
+  },
+
+  // —— 感知层档位（perception）——
+  // 和阈值分开：这两个开关改变的是"跑几个模型"，不是"怎么判"。
+  perception: {
+    // 多人：关闭时保持原行为（VIDEO 模式 + 只判画面里最大的人）。
+    // 打开后改为 IMAGE 模式逐帧独立推理 + 自研跟踪器，代价是每多一个人多一次推理。
+    // detConf/presenceConf 默认 0.3（不是单人道 0.5）：远处/被挡的人置信度天然低，
+    // 实测同一张双人图 0.5 只回 1 人、0.3 回 2 人。用 mot17-eval 调这两个值时，
+    // 把结果和 profile 一起记下来（docs/open-datasets.md）。
+    // tiles > 1 时把画面切成 n×n 块分别推理再合并（块间重叠 tileOverlap）：
+    // 远处小目标在整帧缩放下会消失，平铺等于把人放大。成本 n² 倍推理，默认关。
+    multi: {
+      enabled: false, maxPersons: 3, detConf: 0.3, presenceConf: 0.3,
+      tiles: 1, tileOverlap: 0.2,
+    },
+    objects: {
+      enabled: false,                 // 物体检测（PPE 需要它；默认关，省 GPU）
+      // backend：'mediapipe' = Tasks .tflite（自带 label map）；'onnx' = 自训 YOLOv8
+      // 导出的 ONNX（ORT Web 推理，类别名必须由下面的 labels 按训练时的顺序给出）。
+      backend: 'mediapipe',
+      model: 'efficientdet_lite0.tflite',
+      // 默认 CPU：efficientdet_lite0 的 GPU delegate 实测在第一次推理就从 wasm 抛
+      // "divide by zero"，而且会把这个 wasm 运行时搞坏（之后再建任何实例都挂）。
+      // 换自训模型并确认支持 GPU 后，再在 profile 里显式写 'GPU'。
+      delegate: 'CPU',
+      maxResults: 8,
+      scoreThreshold: 0.35,
+      // 以下只对 onnx 后端生效
+      labels: [],                     // 类别名，顺序 = 训练时 data.yaml 的 names 顺序
+      inputSize: 320,                 // 导出 ONNX 时的 imgsz（letterbox 到正方形）
+      iouThreshold: 0.45,             // 逐类别 NMS 的 IoU 阈值
+      // 物体检测的最小间隔。PPE 是 3 秒级时序判定，不需要每帧都检：
+      // MediaPipe/efficientdet 同步推理一次 ~54ms，30fps 下每帧跑会把吞吐从 28fps
+      // 拖到 11fps；150ms（约 6.7Hz）足够，主循环只跳过检测、沿用上一帧的框。
+      intervalMs: 150,
     },
   },
 

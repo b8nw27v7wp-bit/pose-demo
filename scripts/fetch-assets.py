@@ -21,15 +21,29 @@ NPM_TGZ = (
 )
 
 MODEL_BASE = "https://storage.googleapis.com/mediapipe-models"
+# 每个模型可以给多个源：官方源在国内常被拦（实测连不上 storage.googleapis.com），
+# 所以再挂一个 jsdelivr 的 GitHub 镜像。按顺序试，第一个成功即止。
 MODELS = {
-    "pose_landmarker_full.task":
+    "pose_landmarker_full.task": [
         f"{MODEL_BASE}/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
-    "pose_landmarker_lite.task":
+    ],
+    "pose_landmarker_lite.task": [
         f"{MODEL_BASE}/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
-    "pose_landmarker_heavy.task":
+    ],
+    "pose_landmarker_heavy.task": [
         f"{MODEL_BASE}/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
-    "hand_landmarker.task":
+    ],
+    "hand_landmarker.task": [
         f"{MODEL_BASE}/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+    ],
+    # 物体检测（PPE / 设备状态判定的底座）。EfficientDet-Lite0，Apache-2.0。
+    # 先用 COCO 80 类验证链路；真实场景要换成自训的 helmet/glove .tflite（同样放进 models/）。
+    # 注意：这个模型在本机 GPU delegate 上会 trap（第一次推理 "divide by zero"），
+    # 默认走 CPU（params.perception.objects.delegate），换自训模型后自行验证。
+    "efficientdet_lite0.tflite": [
+        "https://cdn.jsdelivr.net/gh/schu-lab/Tensorflow-Object-Detection@main/efficientdet_lite0.tflite",
+        f"{MODEL_BASE}/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite",
+    ],
 }
 
 # npm 包里需要挑出来的文件（其余是 .cjs/.map/type 声明，用不到）
@@ -88,15 +102,25 @@ def fetch_vendor(dest, force):
 
 def fetch_models(dest, force):
     models = os.path.join(dest, "models")
-    for name, url in MODELS.items():
+    for name, urls in MODELS.items():
         out = os.path.join(models, name)
         if not force and os.path.isfile(out) and os.path.getsize(out) > 1_000_000:
             log(f"[skip] models/{name} 已存在（{os.path.getsize(out) / 1024 / 1024:.1f} MB）")
             continue
         log(f"下载 {name} …")
-        data = download(url)
-        write_bytes(out, data)
-        log(f"  → models/{name}  {len(data) / 1024 / 1024:.1f} MB")
+        last_err = None
+        for url in urls:
+            try:
+                data = download(url)
+            except Exception as e:      # 单个源失败就换下一个
+                last_err = e
+                log(f"  [源失败] {url} — {e}")
+                continue
+            write_bytes(out, data)
+            log(f"  → models/{name}  {len(data) / 1024 / 1024:.1f} MB  ({url.split('/')[2]})")
+            break
+        else:
+            raise RuntimeError(f"{name} 全部镜像都失败：{last_err}")
 
 
 def main():

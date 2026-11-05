@@ -1,15 +1,29 @@
 // app.js — 组装层：输入源 → 感知（姿态 + 手部）→ 信号 → 动作 → 可视化/导出
-import { createEstimator, detectVideo, toPersons, closeEstimator } from './pose.js';
+import {
+  createEstimator, detectVideo, toPersons, closeEstimator,
+  createMultiEstimator, detectMultiImage, detectMultiTiled, closeMultiEstimator, multiEstimatorInfo,
+} from './pose.js';
 import { createHandEstimator, detectHandsVideo, detectHandsNearWrists, toHands, classifyHand, handsReady, closeHandEstimator } from './hands.js';
 import { wristsToRetry } from './handroi.js';
 import { HandShapeStabilizer, SHAPE_LABELS } from './handshape.js';
 import { SignalEngine } from './signals.js';
 import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from './actions.js';
+import { explainArmActions, DEFAULT_HINT } from './armhint.js';
+import { loadAccuracyReport, accuracyFor, formatAccuracy, accuracyStale } from './accuracy.js';
 import { resolveParams, profileParams, profileName as profileNameOf, paramsHash } from './params.js';
 import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS, HARDCASE_BEFORE_MS } from './hardcase.js';
-import { drawSkeleton, drawHand, clearCanvas } from './draw.js';
+import { drawSkeleton, drawHand, drawBoxes, drawTrackLabel, clearCanvas } from './draw.js';
+import { Tracker, area } from './track.js';
+import { PersonPipelines, assignHands } from './multi.js';
+import { PpeMonitor } from './ppe.js';
+import {
+  createObjectDetector, detectObjects, closeObjectDetector, objectInfo,
+} from './objects.js';
+
 
 const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const videoEl = $('video');
 const photoEl = $('photo');
 const canvas = $('overlay');
@@ -26,6 +40,9 @@ const CUSTOM_PROFILE = '__custom__';
 const PROFILES = [
   { id: 'default', label: '默认阈值', url: null },
   { id: 'fitness', label: '健身', url: '/web/profiles/fitness.json' },
+  // 工业/安全场景：多人 + 物体检测 + PPE。开关本身也写在 profile 里，
+  // 所以换到这个档不用再手动勾「多人」「物体」。
+  { id: 'safety', label: '安全合规', url: '/web/profiles/safety.json' },
 ];
 
 const MAX_LOG = 20000;   // 评估需要整段素材，截断会让 recall 失真；20k 帧 ≈ 11 分钟 @30fps
@@ -35,8 +52,11 @@ const MAX_LOG = 20000;   // 评估需要整段素材，截断会让 recall 失�
 const LOG_TRIM = Math.round(MAX_LOG * 0.1);
 const SPARK_SPAN_MS = 5000;
 
-// 推理帧率上限：默认 15fps。摄像头 30fps + rAF 60Hz 会对同一帧反复推理，白烧 CPU/GPU。
-const inferInterval = () => 1000 / (Number($('fpsCapSel').value) || 15);
+// 推理帧率上限：默认 30fps。摄像头 30fps + rAF 60Hz 会对同一帧反复推理，白烧 CPU/GPU；
+// 但 15fps 在 25/30fps 素材上会丢掉约一半帧（ID 切换被放大，见 docs/multi-and-objects.md）。
+// 实测本机 full/GPU + 多人 3 + 手部：15fps 上限 → 处理 13.6 帧/s；30fps 上限 → 26 帧/s。
+// 弱机达不到上限时会自然回落到推理速度，不需要手动降档。
+const inferInterval = () => 1000 / (Number($('fpsCapSel').value) || 30);
 
 // profile：URL 参数 ?profile=/profiles/fitness.json，用于切场景时只换阈值不改代码
 const profileUrl = new URLSearchParams(location.search).get('profile');
@@ -51,8 +71,36 @@ let activeDelegate = null;
 // 手部模型是否在本会话里成功加载过。停止/切换输入后 handReady 会变成 false，
 // 但已记录的帧仍是用它产出的，导出 meta 必须保留这个信息（同 activeModel 的理由）。
 let activeHandModel = null;
-let signalEngine = new SignalEngine(activeParams);
-let actionEngine = new ActionEngine(activeParams);
+// 每人一条判定流水线：SignalEngine / ActionEngine 里全是有记忆的部件（滤波、滞回、计数相位），
+// 两个人共用一套会互相打断。单人道仍然只有一条（track_id 固定 0），行为与以前一致。
+let pipelines = new PersonPipelines(activeParams);
+let tracker = new Tracker(resolveParams(activeParams).signals.track);
+let ppeMonitor = new PpeMonitor(resolveParams(activeParams).signals.ppe);
+// 多人感知参数（平铺检测的块数等）；换 profile 时同步，逐帧直接读
+let multiCfg = resolveParams(activeParams).perception.multi;
+let objectCfg = resolveParams(activeParams).perception.objects;
+let lastObjectTs = 0;   // 物体检测的最小间隔门控（见 params.objects.intervalMs）
+let multiNumPoses = 3;
+// 感知层开关：默认关，保持"单人 + 无物体检测"的原行为（多开两个模型很吃 GPU）
+let multiOn = false;
+let objectOn = false;
+let objectReady = false;
+let multiReady = false;
+let multiCfgKey = '';   // 建多人估计器时用的 numPoses|detConf|presenceConf，profile 变了要重建
+let objectError = null;
+let multiError = null;
+let objectBusy = false;   // ONNX 后端同一时刻只允许一帧在推理（见 loop()）
+let objectGen = 0;        // 物体检测器代次：换 profile/关开关时 +1，作废在途的创建与推理
+let replaySeq = 0;        // 重播代次：快速连点时只让最后一次的 seek→play 生效
+let profileLoaded = false;   // initProfile() 完成（无头脚本等它再改开关，避免抢跑用默认参数建模型）
+let multiMaxFromSettings = false;   // 用户保存过多人数选择后，profile 不再覆盖它
+
+// 每帧各阶段的耗时（EMA，毫秒）：吞吐优化不能靠猜，state.timing 暴露给无头脚本。
+const stageMs = { pose: 0, hands: 0, objects: 0, draw: 0, total: 0, n: 0 };
+const ema = (old, v) => old + (v - old) * 0.15;
+let lastObjects = [];
+let lastVerdicts = [];
+
 
 // 手势稳定器：左右手各一个，互不影响。streak/keepMs 从 params 读，profile 才能调
 function makeShapeStable(params) {
@@ -69,16 +117,58 @@ let shapeStable = makeShapeStable(activeParams);
 function applyParams(params, name = 'default') {
   activeParams = params || {};
   profileName = name;
-  signalEngine = new SignalEngine(activeParams);
-  actionEngine = new ActionEngine(activeParams);
+  const resolved = resolveParams(activeParams);
+  // 换参数必须重建：滤波器和计数器持有状态，只改字段会让它们停在上一次的参数上
+  pipelines = new PersonPipelines(activeParams);
+  tracker = new Tracker(resolved.signals.track);
+  ppeMonitor = new PpeMonitor(resolved.signals.ppe);
+  multiCfg = resolved.perception.multi;
+  objectCfg = resolved.perception.objects;
   shapeStable = makeShapeStable(activeParams);
   activeParamsHash = paramsHash(activeParams);
-  const resolved = resolveParams(activeParams);
+  // 场景档可以声明"这个场景需要多人/物体检测"：profile 里写 perception.multi.enabled
+  // 就直接把开关带上，否则每一次换场景都要人工记得勾两个复选框。
+  //
+  // 必须看**原始 profile**，不能看 resolveParams() 的结果：resolveParams 会把默认值
+  // 补进 perception.multi.enabled=false，于是任何 profile（包括启动时加载的默认档）
+  // 都会把用户上次保存的开关静默关掉。
+  const declared = activeParams.perception || {};
+  if (typeof declared.multi?.enabled === 'boolean') multiOn = declared.multi.enabled;
+  if (typeof declared.objects?.enabled === 'boolean') objectOn = declared.objects.enabled;
+  if (objectOn) lastObjectTs = 0;
+  // 换 profile 可能换物体后端/模型（mediapipe ↔ onnx）：旧实例必须重建，否则
+  // objectReady 还是 true，ensureObjectDetector 会直接返回旧后端（和 maxPersons 同类的坑）。
+  // 不管新旧 profile 是否开物体检测都作废旧实例：profile 可能把 objects 从开改成关，
+  // 旧实例留着会让下次勾选直接复用旧后端/旧标签（ensureObjectDetector 看到 ready 就返回）。
+  invalidateObjectDetector();
+  if (objectOn && mode !== 'idle') ensureObjectDetector().catch(() => {});
+  // profile 里的 maxPersons 之前完全没生效：ensureMultiEstimator 直接读工具栏 select，
+  // 而 select 固定默认 3，profile 写 4 也跑 3（MOT17 A/B 因此白跑）。这里在没有
+  // 用户保存过选择时，用 profile 的值初始化 select；有保存值时以用户选择为准。
+  const wantMax = Number(declared.multi?.maxPersons) || 0;
+  if (wantMax && !multiMaxFromSettings) {
+    const el = $('multiSel');
+    const v = String(Math.min(4, Math.max(1, wantMax)));
+    if ([...el.options].some((o) => o.value === v)) el.value = v;
+  }
+  // numPoses/detConf/presenceConf 是建模型时固化的：profile 改了这些值，估计器必须重建，
+  // 否则界面上显示新 profile，多人推理还在用旧的人数上限/检测阈值。
+  if (multiOn && multiReady && multiCfgKey && desiredMultiKey() !== multiCfgKey) {
+    closeMultiEstimator();
+    multiReady = false;
+    multiCfgKey = '';
+    if (mode !== 'idle') ensureMultiEstimator().catch(() => {});
+  }
+  $('chkMulti').checked = multiOn;
+  $('chkObjects').checked = objectOn;
+  $('multiSel').hidden = !multiOn;
   squatCfg = resolved.actions.reps.squat;
   handRoiCfg = resolved.signals.hand.roi;
   handVisMin = resolved.signals.visMin;
   updateSparkLegend();
   resetRuntime();
+  // 阈值变了，准确率报告可能过期：重算提示文案里的参数指纹比对
+  refreshAccuracy();
 }
 
 async function loadProfile(url) {
@@ -197,6 +287,10 @@ function updateSparkLegend() {
 
 let estimatorReady = false;
 let handReady = false;
+// 动作准确率：只来自标注数据上的评估报告（web/accuracy.json，npm run accuracy 生成）。
+// 没有报告时 accuracyById 全是「未评估」——不拿规则自估冒充实测值。
+let accuracyReport = null;
+let accuracyById = {};
 let mode = 'idle';
 let rafId = null;
 let lastVideoTime = -1;
@@ -268,6 +362,9 @@ function saveSettings() {
       fps: $('fpsCapSel').value,
       skeleton: $('chkSkeleton').checked,
       hands: $('chkHands').checked,
+      multi: $('chkMulti').checked,
+      multiMax: $('multiSel').value,
+      objects: $('chkObjects').checked,
       points: $('chkPoints').checked,
       mirror: $('chkMirror').checked,
       loop: $('chkLoop').checked,
@@ -294,6 +391,19 @@ function applyStoredSettings() {
   if (typeof s.hands === 'boolean') show.hands = s.hands;
   if (typeof s.points === 'boolean') show.points = s.points;
   if (typeof s.mirror === 'boolean') show.mirror = s.mirror;
+  // 多人/物体：模型是懒加载的，这里只恢复开关状态，真正的实例在第一次推理前建
+  if (typeof s.multi === 'boolean') multiOn = s.multi;
+  if (typeof s.objects === 'boolean') objectOn = s.objects;
+  if (s.multiMax) {
+    const el = $('multiSel');
+    if ([...el.options].some((o) => o.value === String(s.multiMax))) {
+      el.value = String(s.multiMax);
+      multiMaxFromSettings = true;
+    }
+  }
+  $('chkMulti').checked = multiOn;
+  $('chkObjects').checked = objectOn;
+  $('multiSel').hidden = !multiOn;
   $('chkSkeleton').checked = show.skeleton;
   $('chkHands').checked = show.hands;
   $('chkPoints').checked = show.points;
@@ -413,13 +523,106 @@ async function doInitHands(delegate) {
   }
 }
 
+// —— 感知层开关：多人 / 物体检测 -------------------------------------------
+// 懒加载，理由同姿态模型：页面一打开就建 GPU 上下文，多开几个标签页很吃内存。
+
+let multiInitPromise = null;
+/** 当前参数/工具栏下，多人估计器应有的配置指纹。profile 切换后与 multiCfgKey 比对。 */
+function desiredMultiKey() {
+  const cfg = resolveParams(activeParams).perception.multi;
+  const numPoses = Math.max(1, Math.min(4, Number($('multiSel')?.value) || cfg.maxPersons));
+  return `${numPoses}|${cfg.detConf}|${cfg.presenceConf}`;
+}
+
+async function ensureMultiEstimator() {
+  if (multiReady) return true;
+  if (multiInitPromise) return multiInitPromise;
+  multiInitPromise = (async () => {
+    const model = $('modelSel').value;
+    const want = $('delegateSel').value;
+    const cfg = resolveParams(activeParams).perception.multi;
+    const numPoses = Number($('multiSel')?.value) || cfg.maxPersons;
+    multiNumPoses = Math.max(1, Math.min(4, numPoses | 0));
+    for (const delegate of (want === 'GPU' ? ['GPU', 'CPU'] : ['CPU'])) {
+      try {
+        await createMultiEstimator({
+          model, delegate, numPoses,
+          detConf: cfg.detConf, presenceConf: cfg.presenceConf,
+        });
+        multiReady = multiEstimatorInfo().ready;
+        if (multiReady) {
+          multiCfgKey = `${multiNumPoses}|${cfg.detConf}|${cfg.presenceConf}`;
+          multiError = null;
+          return true;
+        }
+      } catch (e) {
+        multiError = e.message;
+      }
+    }
+    setStatus(`多人模型加载失败：${multiError || 'unknown'}`, 'err');
+    return false;
+  })().finally(() => { multiInitPromise = null; });
+  return multiInitPromise;
+}
+
+let objectInitPromise = null;
+
+/** 关掉物体检测并作废所有在途操作（创建/推理）。换 profile、关开关、换 delegate 都走这里。 */
+function invalidateObjectDetector() {
+  objectGen++;
+  closeObjectDetector();
+  objectReady = false;
+  objectBusy = false;
+  objectError = null;   // 旧配置的失败信息不要挂到新配置上
+  lastObjects = [];     // 旧检测框不能留到新后端/新 profile 里
+}
+
+async function ensureObjectDetector() {
+  if (objectReady) return true;
+  if (objectInitPromise) return objectInitPromise;
+  const gen = objectGen;
+  objectInitPromise = (async () => {
+    const cfg = resolveParams(activeParams).perception.objects;
+    // 用 profile 声明的 delegate，不跟工具栏的 GPU/CPU：物体检测模型对 GPU delegate 敏感，
+    // 不支持时会 trap 掉整个 wasm 运行时（连带姿态/手部一起挂），必须由模型自己声明。
+    try {
+      await createObjectDetector({
+        backend: cfg.backend,
+        model: cfg.model, delegate: cfg.delegate,
+        maxResults: cfg.maxResults, scoreThreshold: cfg.scoreThreshold,
+        labels: cfg.labels, inputSize: cfg.inputSize, iouThreshold: cfg.iouThreshold,
+        runningMode: 'VIDEO',
+      });
+      if (gen !== objectGen) {
+        // 创建期间 profile/开关变了：这是旧配置的实例，关掉；返回 'superseded' 而不是 false，
+        // 调用方不能把它当成"加载失败"去关掉新 profile 声明的物体检测。
+        invalidateObjectDetector();
+        return 'superseded';
+      }
+      objectReady = objectInfo().ready;
+      if (objectReady) { objectError = null; return true; }
+    } catch (e) {
+      if (gen !== objectGen) return 'superseded';   // 旧代次的失败不影响新配置
+      objectError = e.message;
+    }
+    setStatus(`物体检测不可用：${objectError || 'unknown'}`, 'err');
+    return false;
+  })().finally(() => { objectInitPromise = null; });
+  return objectInitPromise;
+}
+
 function resetRuntime() {
   cancelHardcase();
-  signalEngine.reset();
-  actionEngine.reset();
+  pipelines.reset();
+  tracker.reset();
+  ppeMonitor.reset();
+  lastVerdicts = [];
+  lastObjects = [];
   frameLog = [];
   sparkSamples = [];
   lastVideoTime = -1;
+  lastObjectTs = 0;
+  for (const k of Object.keys(stageMs)) stageMs[k] = 0;
   lastLogVideoTime = -1;
   videoWrapDetected = false;
   logDropped = 0;
@@ -751,6 +954,111 @@ function classifyHands(list, ts) {
 }
 
 /**
+ * 轻量外观描述子（跟踪用）：bbox 中部 2×2 网格的色相直方图 + 灰色格。
+ * 不跑深度学习 ReID——只给轨迹匹配加一个小权重，并用于"丢失后颜色高度相似"的重连。
+ * 16×32 采样 + 52 维，单帧 ≤3 人，开销可忽略。
+ */
+const descCanvas = document.createElement('canvas');
+const descCtx = descCanvas.getContext('2d', { willReadFrequently: true });
+const DESC_W = 16;
+const DESC_H = 32;
+const DESC_BINS = 12;
+
+function appearanceDescriptor(source, person) {
+  const W = source.videoWidth || source.naturalWidth || 0;
+  const H = source.videoHeight || source.naturalHeight || 0;
+  if (!W || !H || !person) return null;
+  const bbox = person.bbox;
+  if (!Array.isArray(bbox)) return null;
+
+  // 优先用肩/髋围出的躯干框：bbox 会混入头部背景、腿和地面，躯干颜色更稳定。
+  const kp = person.kp || [];
+  const torso = [kp[1], kp[2], kp[7], kp[8]].filter((p) => p && p[2] >= 0.25);
+  let sx;
+  let sy;
+  let sw;
+  let sh;
+  if (torso.length >= 3) {
+    const xs = torso.map((p) => p[0]);
+    const ys = torso.map((p) => p[1]);
+    const x1 = Math.min(...xs);
+    const x2 = Math.max(...xs);
+    const y1 = Math.min(...ys);
+    const y2 = Math.max(...ys);
+    const padX = (x2 - x1) * 0.15;
+    const padY = (y2 - y1) * 0.10;
+    sx = Math.floor(x1 - padX);
+    sy = Math.floor(y1 - padY);
+    sw = Math.ceil(x2 - x1 + padX * 2);
+    sh = Math.ceil(y2 - y1 + padY * 2);
+  } else {
+    // 躯干点不可见：退回 bbox 中部（去掉头/脚）
+    const bw = bbox[2] - bbox[0];
+    const bh = bbox[3] - bbox[1];
+    sx = Math.floor(bbox[0]);
+    sy = Math.floor(bbox[1] + 0.20 * bh);
+    sw = Math.floor(bw);
+    sh = Math.floor(bh * 0.55);
+  }
+  if (!(sw >= 6 && sh >= 6)) return null;
+  sx = Math.max(0, Math.min(W - 1, sx));
+  sy = Math.max(0, Math.min(H - 1, sy));
+  sw = Math.min(W - sx, sw);
+  sh = Math.min(H - sy, sh);
+  if (sw < 4 || sh < 4) return null;
+
+  descCanvas.width = DESC_W;
+  descCanvas.height = DESC_H;
+  let px;
+  try {
+    descCtx.drawImage(source, sx, sy, sw, sh, 0, 0, DESC_W, DESC_H);
+    px = descCtx.getImageData(0, 0, DESC_W, DESC_H).data;
+  } catch {
+    return null;
+  }
+
+  const out = new Float32Array(4 * (DESC_BINS + 1));
+  const halfW = DESC_W / 2;
+  const halfH = DESC_H / 2;
+  for (let y = 0; y < DESC_H; y++) {
+    for (let x = 0; x < DESC_W; x++) {
+      const i = (y * DESC_W + x) * 4;
+      const r = px[i] / 255;
+      const g = px[i + 1] / 255;
+      const b = px[i + 2] / 255;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const d = max - min;
+      const s = max > 0 ? d / max : 0;
+      let h = 0;
+      if (d > 0) {
+        if (max === r) h = ((g - b) / d) % 6;
+        else if (max === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h *= 60;
+        if (h < 0) h += 360;
+      }
+      const cell = (y >= halfH ? 2 : 0) + (x >= halfW ? 1 : 0);
+      const base = cell * (DESC_BINS + 1);
+      if (s >= 0.18) {
+        const bin = Math.min(DESC_BINS - 1, Math.floor((h / 360) * DESC_BINS));
+        out[base + bin] += s;
+        out[base + DESC_BINS] += 1 - s;
+      } else {
+        out[base + DESC_BINS] += 1;
+      }
+    }
+  }
+  for (let c = 0; c < 4; c++) {
+    const base = c * (DESC_BINS + 1);
+    let sum = 0;
+    for (let k = 0; k <= DESC_BINS; k++) sum += out[base + k];
+    if (sum > 0) for (let k = 0; k <= DESC_BINS; k++) out[base + k] /= sum;
+  }
+  return out;
+}
+
+/**
  * 只保留目标人的手。多人画面里 `hands` 会混进别人的手，
  * 而动作层只认目标人——不筛的话「张开/握拳」可能取到旁边那个人的手。
  * 判定口径：整帧检出要求腕点离目标腕点足够近；ROI 补检本来就是按目标腕点裁的，直接保留。
@@ -786,7 +1094,7 @@ function completeHands(fullHands, target, source, w, h) {
 }
 
 /** 单张图片：推理一次，然后在信号/动作层收敛后绘制 */
-function analyzeStill(img) {
+async function analyzeStill(img) {
   const w = img.naturalWidth;
   const h = img.naturalHeight;
   canvas.width = w;
@@ -795,35 +1103,82 @@ function analyzeStill(img) {
   $('badgeRes').hidden = false;
 
   const ts = performance.now();
-  const persons = toPersons(detectVideo(img, ts), w, h);
+  const multiRes = multiOn
+    ? (multiCfg.tiles > 1
+      ? detectMultiTiled(img, w, h, {
+        tiles: multiCfg.tiles, overlap: multiCfg.tileOverlap, maxPoses: multiNumPoses,
+      })
+      : detectMultiImage(img))
+    : detectVideo(img, ts);
+  const persons = toPersons(multiRes, w, h)
+    .map((p, i) => ({ ...p, track_id: i, track_age_ms: 0 }));
   let target = null;
   if (persons.length) {
-    const area = (p) => (p.bbox[2] - p.bbox[0]) * (p.bbox[3] - p.bbox[1]);
     target = persons[0];
-    for (const p of persons) if (area(p) > area(target)) target = p;
+    for (const p of persons) if (area(p.bbox) > area(target.bbox)) target = p;
   }
+  // 单张图没有时间窗：多人时全部判（各自独立状态机），单人时只判主目标。
+  // 单人道固定用 track_id 0：帧内序号随检出顺序变，状态机会在 0/1 之间来回分叉。
+  if (target && !multiOn) target.track_id = 0;
+  const judged = multiOn && persons.length ? persons : (target ? [target] : []);
 
   let rawHands = [];
   if (show.hands && handReady) {
     try { rawHands = toHands(detectHandsVideo(img, ts), w, h); } catch { /* 手部失败不影响姿态 */ }
     // 先按目标人筛，再补检：否则「整帧检出了旁边那个人的左右手」会让补检以为目标人已经齐全
-    rawHands = completeHands(handsOfTarget(rawHands, target), target, img, w, h);
+    const near = (a, b) => Math.hypot(a.kp[0][0] - b.kp[0][0], a.kp[0][1] - b.kp[0][1]) < 8;
+    const own = completeHands(handsOfTarget(rawHands, target), target, img, w, h);
+    if (multiOn) {
+      // 多人：补检只针对主目标，结果并回整帧手部列表，再按人归属
+      for (const hd of own) if (!rawHands.some((x) => near(x, hd))) rawHands.push(hd);
+    } else {
+      // 单人：只保留主目标的手（导出/绘制/判定都只该有他的）。以前把别人的手留在这里，
+      // lastResult/导出会把旁边那个人的手算进目标人。
+      rawHands = own;
+    }
+  }
+
+  // 物体检测（图片是单帧：检测器建在 VIDEO 模式，用 detectForVideo 走同一实例；
+  // 注意不能调 detectObjectsImage——那是给 IMAGE 模式实例用的，混用会抛错并被静默吞掉）
+  let objects = [];
+  if (objectOn && objectReady) {
+    const gen = objectGen;
+    try {
+      const det = await detectObjects(img, ts + 1, w, h);
+      // ONNX 推理期间可能切了 profile/关了开关：旧代次的结果/错误都不要再写回
+      if (gen === objectGen && objectOn) {
+        objects = det;
+        lastObjects = objects;   // state.objects 读的是它；不写回去，无头检查会永远是 0
+      }
+    } catch (e) {
+      if (gen === objectGen) objectError = e.message;   // 留给 UI/自检，别静默
+    }
   }
 
   let sig = null;
   let act = null;
   let hands = [];
-  if (target) {
+  let verdicts = [];
+  if (judged.length) {
     for (let i = 0; i < STILL_SETTLE_FRAMES; i++) {
       const t = ts + i * 100;
       hands = classifyHands(rawHands, t);
-      const handState = {
-        L: hands.find((x) => x.handedness === 'Left')?.cls.shape ?? null,
-        R: hands.find((x) => x.handedness === 'Right')?.cls.shape ?? null,
-      };
-      sig = signalEngine.update(target, t);
-      act = actionEngine.update(sig, t, handState);
+      // 单人也必须走一遍归属：ActionEngine 拿的是「每个人每只手」的 map，
+      // 之前单人模式传 null，导致伸手/持物/指向/拿取在默认单人道里永远不成立。
+      const handsByTrack = assignHands(judged, hands);
+      verdicts = pipelines.update(judged, t, handsByTrack);
     }
+    const primaryV = pipelines.primary(verdicts);
+    sig = primaryV ? primaryV.sig : null;
+    act = primaryV ? primaryV.act : null;
+    const ppeById = new Map();
+    if (objectOn && objectReady) {
+      for (const vd of verdicts) ppeById.set(vd.track_id, ppeMonitor.update(vd.track_id, vd.person, objects, ts));
+    }
+    lastVerdicts = verdicts.map((vd) => ({
+      track_id: vd.track_id, bbox: vd.bbox, sig: vd.sig, act: vd.act, hands: vd.hands,
+      ppe: ppeById.get(vd.track_id) || null,
+    }));
     if (show.skeleton) {
       let first = true;
       for (const p of persons) {
@@ -835,6 +1190,15 @@ function analyzeStill(img) {
     } else {
       clearCanvas(ctx, w, h);
     }
+    if (objects.length) drawBoxes(ctx, objects);
+    for (const vd of lastVerdicts) {
+      if (!multiOn) break;
+      const ppe = vd.ppe;
+      const hat = ppe ? (ppe.helmet.alert !== 'none' ? '缺帽!' : ppe.helmet.state === 'worn' ? '帽✓' : '帽?') : '';
+      const glove = ppe ? (ppe.glove.alert !== 'none' ? '手套!' : ppe.glove.state === 'worn' ? '手套✓' : '手套?') : '';
+      drawTrackLabel(ctx, vd.bbox[0], vd.bbox[1],
+        `#${vd.track_id} ${vd.act?.postureId || '—'}${hat ? ` · ${hat}` : ''}${glove ? ` ${glove}` : ''}`);
+    }
     for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
     $('badgeNoPerson').hidden = true;
   } else {
@@ -842,7 +1206,10 @@ function analyzeStill(img) {
     $('badgeNoPerson').hidden = false;
   }
 
-  lastResult = { ts, persons, sig, act, hands };
+  lastResult = {
+    ts, persons, sig, act, hands,
+    verdicts: lastVerdicts, objects, primaryId: lastVerdicts.length ? pipelines.primary(verdicts)?.track_id ?? null : null,
+  };
   updateUI();
 }
 
@@ -875,6 +1242,20 @@ async function useImageSource(src, { revoke = null } = {}) {
     if (revoke) URL.revokeObjectURL(revoke);
     return false;
   }
+  // 多人 / 物体检测是懒加载的：主循环只在视频路径里触发它们，图片路径必须自己建好，
+  // 否则 analyzeStill 里的 detectMultiImage / detectObjects 会抛 "not ready"，
+  // 表现就是"图片能加载但一个判定都没有"（实测过）。
+  if (multiOn && !multiReady && !(await ensureMultiEstimator())) {
+    multiOn = false;
+    $('chkMulti').checked = false;
+    $('multiSel').hidden = true;
+    setStatus('多人模型不可用，本张图按单人分析', 'err');
+  }
+  if (objectOn && !objectReady && (await ensureObjectDetector()) === false) {
+    objectOn = false;
+    $('chkObjects').checked = false;
+    setStatus('物体检测不可用，本张图不做物体判定', 'err');
+  }
   const img = new Image();
   img.src = src;
   try {
@@ -905,7 +1286,7 @@ async function useImageSource(src, { revoke = null } = {}) {
   resetRuntime();
   syncPlayer();
   try {
-    analyzeStill(img);
+    await analyzeStill(img);
   } catch (e) {
     setStatus(`图片分析失败：${e.message}`, 'err');
     return false;
@@ -951,8 +1332,12 @@ function stopAll() {
   // 释放模型，别让关掉的页面继续占显存/内存
   closeEstimator();
   closeHandEstimator();
+  closeMultiEstimator();
+  invalidateObjectDetector();
   estimatorReady = false;
   handReady = false;
+  multiReady = false;
+  objectBusy = false;
   // activeModel/activeDelegate 故意保留：已录的帧就是这两档模型产出的，
   // 停止后再导出仍要能写对 meta.model（否则事后分不清数据来自 lite 还是 full）。
   updateModelInfo();
@@ -1012,17 +1397,50 @@ function loop() {
   if (mode === 'file' && v.currentTime === lastVideoTime) return;
   lastInferTs = ts;
   lastVideoTime = v.currentTime;
+  const tLoop = performance.now();
+
+  // 多人估算器是懒加载的：刚勾上开关时它可能还在建。建好之前先按单人跑，
+  // 否则每一帧都会因为 detectMultiImage 抛错把主循环停掉。
+  // 建失败必须关掉开关：否则这里每一帧都会重试一次建模型（实测会持续打印错误并拖慢主循环）。
+  if (multiOn && !multiReady && !multiInitPromise) {
+    ensureMultiEstimator().then((ok) => {
+      if (ok || !multiOn) return;
+      multiOn = false;
+      $('chkMulti').checked = false;
+      $('multiSel').hidden = true;
+      saveSettings();
+    });
+  }
+  if (objectOn && !objectReady && !objectInitPromise) {
+    ensureObjectDetector().then((ok) => {
+      if (ok !== false || !objectOn) return;   // 'superseded' 交给新配置，不算失败
+      objectOn = false;
+      $('chkObjects').checked = false;
+      saveSettings();
+    });
+  }
+  const multi = multiOn && multiReady;
+  const w = videoEl.videoWidth;
+  const h = videoEl.videoHeight;
 
   let res;
+  const tPose = performance.now();
   try {
-    res = detectVideo(v, ts);
+    // 多人走 IMAGE 模式：VIDEO 模式的跟踪器只会锁定一个人（实测 numPoses=2 也没用）
+    res = multi
+      ? (multiCfg.tiles > 1
+        ? detectMultiTiled(v, w, h, {
+          tiles: multiCfg.tiles, overlap: multiCfg.tileOverlap, maxPoses: multiNumPoses,
+        })
+        : detectMultiImage(v))
+      : detectVideo(v, ts);
   } catch (e) {
     setStatus(`推理错误：${e.message}`, 'err');
     stopLoop();
     return;
   }
+  const poseMs = performance.now() - tPose;
 
-  const w = v.videoWidth, h = v.videoHeight;
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;
     canvas.height = h;
@@ -1032,24 +1450,86 @@ function loop() {
     $('badgeRes').hidden = false;
   }
 
-  const persons = toPersons(res, w, h);
-  let sig = null, act = null, target = null;
-
-  // 目标人 = 画面里面积最大的那个人；其余人只画骨架不参与判定。
-  // 先选人再做手部：腕部 ROI 补检要用目标人的腕点。
-  if (persons.length) {
-    const area = (p) => (p.bbox[2] - p.bbox[0]) * (p.bbox[3] - p.bbox[1]);
-    target = persons[0];
-    for (const p of persons) if (area(p) > area(target)) target = p;
+  // 感知：姿态（1 人或多人的稳定 id）+ 物体（可选）
+  const personsRaw = toPersons(res, w, h);
+  let persons;
+  if (multi) {
+    // 外观描述子要在 tracker.update 之前算（拿到本帧 bbox 才能裁图）
+    if (tracker.appearance) {
+      for (const p of personsRaw) p.desc = appearanceDescriptor(v, p);
+    }
+    persons = tracker.update(personsRaw, ts);
+  } else {
+    // 单人道保持旧语义：不做跟踪，track_id 用帧内序号，只判面积最大的那个人
+    persons = personsRaw.map((p, i) => ({ ...p, track_id: i, track_age_ms: 0 }));
   }
+
+  // 判谁：单人道只判主目标（其余人只画骨架），多人道所有人都判
+  let judged = persons;
+  if (!multi) {
+    const main = persons.slice().sort((a, b) => area(b.bbox) - area(a.bbox))[0] || null;
+    // 单人道固定 track_id 0（与 PersonPipelines 的注释一致）：帧内序号随检出顺序变，
+    // 两人同框时主目标会在 0/1 两条流水线之间来回切，Hold/滤波/计数全部被打断。
+    if (main) main.track_id = 0;
+    judged = main ? [main] : [];
+  }
+  const target = judged.slice().sort((a, b) => area(b.bbox) - area(a.bbox))[0] || null;
+
+  // 物体检测：PPE 的前提。失败就关掉开关，别每帧抛异常拖慢主循环。
+  // ONNX 后端是异步的（wasm 推理），这里**不能 await**：loop() 是 rAF 回调，await 会
+  // 让推理和姿态链串行。改成"上一帧结果 + 同一时刻只跑一次"，PPE 用到的框最多晚一帧。
+  const tObj = performance.now();
+  // 物体检测按 intervalMs 降频（PPE 是秒级时序判定）。跳过时沿用 lastObjects。
+  if (objectOn && objectReady && ts - lastObjectTs >= (objectCfg.intervalMs || 0)) {
+    lastObjectTs = ts;
+    const fail = (e) => {
+      objectOn = false;
+      objectReady = false;
+      $('chkObjects').checked = false;
+      setStatus(`物体检测失败，已关闭：${e.message}`, 'err');
+      lastObjects = [];
+    };
+    try {
+      // 必须先看 objectBusy 再调用：ONNX 的 detectObjects 在返回 Promise 之前就同步做了
+      // letterbox/CHW 并提交 session.run。先调用后判断会让上一次推理还在飞时又开一次，
+      // 被丢弃的 promise 没有 catch，rejection 会变成页面 JS 错误。
+      if (objectBusy) {
+        // 上一次推理还没回来，这一帧跳过（沿用上一帧的框）
+      } else {
+        const detGen = objectGen;
+        const det = detectObjects(v, ts, w, h);
+        if (det && typeof det.then === 'function') {
+          objectBusy = true;
+          det.then((o) => {
+            // 推理期间换了 profile / 关了开关：结果属于旧代次，丢掉
+            if (detGen === objectGen && objectOn) lastObjects = o;
+          }).catch((e) => {
+            if (detGen === objectGen) fail(e);
+          }).finally(() => {
+            if (detGen === objectGen) objectBusy = false;
+          });
+        } else {
+          lastObjects = det;
+        }
+      }
+    } catch (e) {
+      fail(e);
+    }
+  } else if (!objectOn) {
+    lastObjects = [];
+  }
+  const objMs = performance.now() - tObj;
 
   // —— 手部要先于动作判定：拿取/持物需要「手是张开还是握紧」，姿态层给不了。
   // 手部模型失败不影响主体识别，hands 为空时这些动作一律不成立。
   let hands = [];
-  if (show.hands && handReady) {
+  let handsByTrack = null;
+  const tHands = performance.now();
+  // 没有检出任何人时手部推理没有消费者：手只能归属到人，动作/PPE 都按人分组。
+  // 夜景/空镜头里跑 HandLandmarker 纯属白烧 ~13ms/帧（04 序列几乎每帧都是这种情况）。
+  if (show.hands && handReady && judged.length) {
     try {
-      const hr = detectHandsVideo(v, ts);
-      hands = toHands(hr, w, h);
+      hands = toHands(detectHandsVideo(v, ts), w, h);
       handFails = 0;
     } catch (e) {
       // 连续失败说明手部模型挂了：关掉它，别每帧都抛异常拖慢主循环
@@ -1062,43 +1542,104 @@ function loop() {
     }
     // 整帧漏检的手用姿态腕点补检。全身/远景构图里手只有几十像素，整帧 HandLandmarker
     // 实测 0 命中；腕点裁一块放大后同一模型能稳定检出。只在漏检且腕点可见时才付这次推理。
-    // 先按目标人筛，再补检：否则「整帧检出了旁边那个人的左右手」会让补检以为目标人已经齐全
-    hands = completeHands(handsOfTarget(hands, target), target, v, w, h);
-    hands = classifyHands(hands, ts);
+    const near = (a, b) => Math.hypot(a.kp[0][0] - b.kp[0][0], a.kp[0][1] - b.kp[0][1]) < 8;
+    if (multi) {
+      // 多人：ROI 补检只对主目标做（每多一人多一次推理），补出来的手并回整帧结果
+      for (const hd of completeHands(handsOfTarget(hands, target), target, v, w, h)) {
+        if (!hands.some((x) => near(x, hd))) hands.push(hd);
+      }
+      hands = classifyHands(hands, ts);
+    } else {
+      hands = classifyHands(completeHands(handsOfTarget(hands, target), target, v, w, h), ts);
+    }
+    // 单人也必须归属：否则 ActionEngine 拿到的是空手，伸手/持物/指向/拿取恒为 false。
+    handsByTrack = assignHands(judged, hands);
   }
+  const handsMs = performance.now() - tHands;
 
-  if (target) {
+  // 判定：每人一条独立流水线
+  const verdicts = pipelines.update(judged, ts, handsByTrack);
+  if (multi) {
+    // 跟踪器已经 prune 过超时轨迹：流水线/PPE 计时器不能继续留着（长会话里会无限增长，
+    // 而且旧 id 的 PPE 计时会在新人拿到新 id 后仍然占着内存）
+    const live = new Set(tracker.tracks.keys());
+    pipelines.prune(live);
+    ppeMonitor.prune(live);
+  }
+  const primaryV = pipelines.primary(verdicts);
+  const sig = primaryV ? primaryV.sig : null;
+  const act = primaryV ? primaryV.act : null;
+
+  // PPE：只看检测框与人的几何关系，看不见一律 unknown（见 ppe.js 头注释）
+  const ppeById = new Map();
+  if (objectOn && objectReady) {
+    for (const vd of verdicts) ppeById.set(vd.track_id, ppeMonitor.update(vd.track_id, vd.person, lastObjects, ts));
+  }
+  lastVerdicts = verdicts.map((vd) => ({
+    track_id: vd.track_id,
+    bbox: vd.bbox,
+    sig: vd.sig,
+    act: vd.act,
+    hands: vd.hands,
+    ppe: ppeById.get(vd.track_id) || null,
+  }));
+
+  const tDraw = performance.now();
+  if (judged.length) {
     if (show.skeleton) {
+      // 先画非主目标（淡），最后画主目标（实）：主目标永远在最上层
       let first = true;
-      for (const p of persons) {
+      for (const p of judged) {
         if (p === target) continue;
-        drawSkeleton(ctx, p.kp_raw, w, h, { points: show.points, clear: first, alpha: 0.4 });
+        drawSkeleton(ctx, p.kp_raw, w, h, { points: show.points, clear: first, alpha: 0.45 });
+        first = false;
+      }
+      for (const p of persons) {
+        if (judged.includes(p)) continue;
+        drawSkeleton(ctx, p.kp_raw, w, h, { points: show.points, clear: first, alpha: 0.25 });
         first = false;
       }
       drawSkeleton(ctx, target.kp_raw, w, h, { points: show.points, clear: first });
     } else {
       clearCanvas(ctx, w, h);
     }
-
-    sig = signalEngine.update(target, ts);
-    // 只把「稳定后」的手势传给动作层；未检出的手给 undefined，动作层据此不判拿取
-    const handState = {
-      L: hands.find((h) => h.handedness === 'Left')?.cls.shape ?? null,
-      R: hands.find((h) => h.handedness === 'Right')?.cls.shape ?? null,
-    };
-    act = actionEngine.update(sig, ts, handState);
     $('badgeNoPerson').hidden = true;
   } else {
     clearCanvas(ctx, w, h);
     $('badgeNoPerson').hidden = false;
   }
 
-  for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
+  if (objectOn && objectReady && lastObjects.length) drawBoxes(ctx, lastObjects);
 
-  if (mayLogFrame()) pushLog(ts, target, sig, act, persons.length, hands);
+  // 多人时给每个人标 id + 姿态 + PPE：否则画面上几条骨架分不清哪条是哪条
+  if (multi) {
+    for (const vd of lastVerdicts) {
+      const ppe = vd.ppe;
+      const hat = ppe ? (ppe.helmet.alert !== 'none' ? '缺帽!' : ppe.helmet.state === 'worn' ? '帽✓' : '帽?') : '';
+      const glove = ppe ? (ppe.glove.alert !== 'none' ? '手套!' : ppe.glove.state === 'worn' ? '手套✓' : '手套?') : '';
+      const label = `#${vd.track_id} ${vd.act?.postureId || '—'}${hat ? ` · ${hat}` : ''}${glove ? ` ${glove}` : ''}`;
+      drawTrackLabel(ctx, vd.bbox[0], vd.bbox[1], label, {
+        // lastVerdicts 是 verdicts 的副本，对象引用永远不相等；按 id 比才认得出主目标
+        color: vd.track_id === primaryV?.track_id ? '#1d1d1f' : '#6b6b70',
+      });
+    }
+  }
+
+  for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
+  const drawMs = performance.now() - tDraw;
+
+  if (mayLogFrame()) pushLog(ts, target, sig, act, persons.length, hands, { verdicts: lastVerdicts, objects: lastObjects, ppeById });
   pushSpark(ts, sig ? sig.knee_pick : null);
 
-  lastResult = { ts, persons, sig, act, hands };
+  lastResult = { ts, persons, sig, act, hands, verdicts: lastVerdicts, objects: lastObjects, primaryId: primaryV?.track_id ?? null };
+
+  // 阶段耗时只做 EMA，不逐帧存：state.timing 给无头吞吐脚本读，UI 不展示。
+  stageMs.pose = ema(stageMs.pose, poseMs);
+  stageMs.hands = ema(stageMs.hands, handsMs);
+  stageMs.objects = ema(stageMs.objects, objMs);
+  stageMs.draw = ema(stageMs.draw, drawMs);
+  stageMs.total = ema(stageMs.total, performance.now() - tLoop);
+  stageMs.n++;
   countFps(ts);
 
   if (ts - lastUiTs > 100) {
@@ -1121,12 +1662,15 @@ function countFps(ts) {
 
 // —— 记录与导出 ---------------------------------------------------------
 
-function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
+function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
   frameLog.push({
     ts: Math.round(ts),
     // 视频/摄像头画面的时间（秒）。ts 是 performance.now，录完对不上人眼看到的时间；
     // 标注时按 video_time 写秒数最省事（见 docs/eval.md）。摄像头没有稳定的媒体时间，用 ts 折算。
-    video_time: mode === 'file' ? Math.round(videoEl.currentTime * 1000) / 1000 : null,
+    // 用推理**开始前**记下的 lastVideoTime，而不是此刻的 currentTime：推理是同步阻塞的，
+    // 多人/物体模型一轮要几十到几百毫秒，读此刻的时间会让日志比实际分析的帧晚好几帧，
+    // 离线按帧对齐 gt（web/test/mot17-eval.mjs）会系统性错位。
+    video_time: mode === 'file' ? Math.round(lastVideoTime * 1000) / 1000 : null,
     person_count: personCount,
     persons: p ? [{
       track_id: p.track_id,
@@ -1195,6 +1739,23 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = []) {
       spread: hd.spread,
       bbox: hd.bbox.map(r1),
       kp: hd.kp.map(([x, y]) => [r1(x), r1(y)]),
+    })),
+    // —— 多人与物体（新增字段；老数据没有它，评估器按"没有多人信息"处理）——
+    // persons[0] 仍是主目标，signals/actions 仍是主目标的判定，老流程与评估器完全不受影响。
+    verdicts: (extra?.verdicts || []).map((vd) => ({
+      track_id: vd.track_id,
+      bbox: vd.bbox.map(r1),
+      posture: vd.act?.postureId ?? null,
+      frozen: !!vd.act?.frozen,
+      flags: vd.act?.flags ?? null,
+      reps: vd.act?.reps ?? null,
+      ppe: vd.ppe ? {
+        helmet: { state: vd.ppe.helmet.state, alert: vd.ppe.helmet.alert, streak_ms: vd.ppe.helmet.streak_ms },
+        glove: { state: vd.ppe.glove.state, alert: vd.ppe.glove.alert, streak_ms: vd.ppe.glove.streak_ms },
+      } : null,
+    })),
+    objects: (extra?.objects || []).map((o) => ({
+      label: o.label, score: r2(o.score), box: o.box.map(r1),
     })),
   });
   // 溢出时一次丢一批，摊薄成本（每帧 shift 会变成 O(n)）
@@ -1508,11 +2069,34 @@ async function togglePlay() {
 /** 清空记录并从头播放：同时清掉回绕标记，让记录重新开始 */
 function replayVideo() {
   if (mode !== 'file') return;
+  const seq = ++replaySeq;
+  // 拖动进度条后立刻点重播时，上一个 seek 还在飞行；直接 play() 会被浏览器以
+  // AbortError 拒绝，视频停在 0 不动（headless-check 里能稳定复现）：
+  // 先等 currentTime=0 的 seek 落定，再 play；期间再次点重播则放弃这一次。
+  seeking = false;
+  resumeAfterSeek = false;
   resetRuntime();
   try { videoEl.currentTime = 0; } catch { /* metadata 还没就绪 */ }
-  videoEl.play().catch((e) => setStatus(`播放被拒（${e.name}）`, 'err'));
-  setStatus('已清空记录，从头播放', 'busy');
-  syncPlayer();
+  const play = () => {
+    if (seq !== replaySeq) return;
+    videoEl.play().catch((e) => {
+      if (seq !== replaySeq) return;
+      setStatus(`播放被拒（${e.name}）`, 'err');
+    });
+    setStatus('已清空记录，从头播放', 'busy');
+    syncPlayer();
+  };
+  if (videoEl.seeking) {
+    const done = () => {
+      videoEl.removeEventListener('seeked', done);
+      clearTimeout(timer);
+      play();
+    };
+    const timer = setTimeout(done, 400);   // seek 事件丢失时兜底
+    videoEl.addEventListener('seeked', done);
+  } else {
+    play();
+  }
 }
 
 function clearLog() {
@@ -1573,6 +2157,40 @@ function buildGrids() {
     .join('');
 }
 
+// 准确率只显示评估报告里的实测值：没有报告/样本不足都明确写出来。
+// 每次报告变化才重算，不放进逐帧 updateUI。
+function refreshAccuracy() {
+  const opts = {
+    minSamples: accuracyReport?.minSamples,
+    synthetic: !!accuracyReport?.source?.synthetic,
+  };
+  const items = ARM_ACTIONS.map((a) => {
+    const f = formatAccuracy(accuracyFor(accuracyReport, a.id), opts);
+    accuracyById[a.id] = f;   // {short,long,level}：提示行用 short，tooltip 用 long
+    return { a, f };
+  });
+  renderAccuracy(items);
+}
+
+function renderAccuracy(items) {
+  const box = $('accList');
+  if (!box) return;
+  const rows = items.map(({ a, f }) => `<div class="acc-item" title="${esc(f.long)}">`
+    + `<span class="an">${esc(a.name)}</span>`
+    + `<span class="av ${f.level}">${esc(f.short)}</span></div>`).join('');
+  const src = accuracyReport?.source;
+  // 参数改过（阈值/手型分组）而报告没重跑：数字仍能看，但必须标明不是当前规则测的。
+  const stale = accuracyStale(accuracyReport, activeParamsHash);
+  const sourceNote = !accuracyReport
+    ? '没有准确率报告：运行 npm run accuracy 生成 web/accuracy.json（读取 eval-data 的标注素材）。'
+    : `${src?.dir || 'eval-data'} · ${src?.totalFrames ?? 0} 帧 · ${src?.note || ''}`
+      + (stale ? ` · 注意：报告参数 ${accuracyReport.paramsHash} 与当前 ${activeParamsHash} 不一致，改阈值后要重跑 npm run accuracy` : '');
+  box.innerHTML = rows
+    + `<div class="acc-note">${esc(sourceNote)}</div>`
+    + '<div class="acc-note">口径：逐帧召回 / 精确；每个方向样本 ≥20 才报百分比，'
+    + '「未评估」= 没有标注数据。手部「未检出」时伸手/持物/指向不判，也不计入准确率。</div>';
+}
+
 function updateUI() {
   const { sig, act, hands } = lastResult || {};
 
@@ -1601,10 +2219,30 @@ function updateUI() {
     if (el) el.classList.toggle('on', act?.postureId === a.id);
   }
 
+  // 动作判不判得出来取决于运行条件（手部模型 / 3D / 髋是否入镜 / 单帧），
+  // 把这些条件和已知误判写进面板，避免用户把「判不了」当成「没做」。
+  const armHints = explainArmActions({
+    sig, act, hands,
+    handOn: show.hands,
+    handReady,
+    imageMode: mode === 'image',
+    accuracyById,
+  });
+
   for (const a of ARM_ACTIONS) {
     const el = document.querySelector(`#armGrid .act[data-id="${a.id}"]`);
-    if (el) el.classList.toggle('on', !!act?.flags?.[a.flag]);
+    if (!el) continue;
+    const hint = armHints.byId[a.id];
+    const on = !!act?.flags?.[a.flag];
+    el.classList.toggle('on', on);
+    // 空心点 = 当前条件下这个动作根本判不了（不是还没做）
+    el.classList.toggle('na', !!hint?.na && !on);
+    el.title = hint?.title || '';
   }
+  // 有画面但没检出人：不是「没做动作」，是根本没得判；无画面时则提示怎么查条件
+  const hintLine = armHints.line || (mode === 'idle' ? DEFAULT_HINT : '未检测到人：动作不判');
+  $('armHint').textContent = hintLine;
+  $('armHint').title = hintLine;
 
   // 手部：按 handedness 取（镜像只影响画面，不影响模型输出的左右手）
   const pick = (side) => (hands || []).find((h) => h.handedness === side);
@@ -1622,6 +2260,13 @@ function updateUI() {
   $('handMeta').textContent = !show.hands ? '已关闭'
     : !handReady ? '模型未加载'
     : (hands && hands.length) ? `${hands.length} 只手 · ${orientText(hl || hr)}` : '未检出';
+  // 「未检出」不是「手是空的」：写清楚原因，以及哪些动作会因此不判
+  $('handMeta').title = armHints.hands.title;
+  const noHandTitle = armHints.hands.state === 'off' || armHints.hands.state === 'loading'
+    ? armHints.hands.title
+    : '本帧未检出这只手：手出画/太小/侧对镜头/被遮挡';
+  $('handLCard').title = hl ? '' : noHandTitle;
+  $('handRCard').title = hr ? '' : noHandTitle;
 
   const fmt = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : '—');
   const rows = [
@@ -1656,6 +2301,42 @@ function updateUI() {
   $('repMeta').textContent = act
     ? `门控 深蹲${act.gates?.squat ? '✓' : '—'} 俯卧撑${act.gates?.pushup ? '✓' : '—'} 鼓掌${act.gates?.clap ? '✓' : '—'}`
     : '—';
+
+  // —— 人员列表（多人 / PPE）——
+  // 只有开了多人或物体检测才显示：单人无 PPE 时这块没有信息量，显示出来只是噪声。
+  const showPeople = multiOn || objectOn;
+  $('peopleMod').hidden = !showPeople;
+  if (showPeople) {
+    const nameOf = (id) => ACTION_CATALOG.find((a) => a.id === id)?.name || id || '—';
+    const rows = (lastVerdicts || []).map((vd) => {
+      const ppe = vd.ppe;
+      const bad = [];
+      const good = [];
+      if (ppe) {
+        const h = ppe.helmet;
+        if (h.alert !== 'none') bad.push(`缺帽 ${Math.round(h.streak_ms / 1000)}s`);
+        else if (h.state === 'worn') good.push('帽✓');
+        else good.push('帽?');
+        const g = ppe.glove;
+        if (g.alert === 'violation') bad.push(`缺手套 ${Math.round(g.streak_ms / 1000)}s`);
+        else if (g.alert === 'suspect') bad.push(`手套疑似 ${Math.round(g.streak_ms / 1000)}s`);
+        else if (g.state === 'worn') good.push('手套✓');
+        else good.push('手套?');
+      }
+      const cls = bad.length ? 'warn' : (good.length ? 'ok' : '');
+      return `<div class="person"><span class="pid">#${vd.track_id}</span>`
+        + `<span class="pstate">${nameOf(vd.act?.postureId)}</span>`
+        + `<span class="pbadge ${cls}">${(bad.length ? bad : good).join(' · ') || '—'}</span></div>`;
+    }).join('');
+    $('peopleList').innerHTML = rows
+      || '<div class="person"><span class="pid">—</span><span class="pstate">未检出</span><span class="pbadge">—</span></div>';
+    const alerts = (lastVerdicts || []).filter((v) => v.ppe
+      && (v.ppe.helmet.alert !== 'none' || v.ppe.glove.alert !== 'none')).length;
+    const objMeta = objectOn
+      ? (objectReady ? ` · ${lastObjects.length} 框` : ' · 检测模型未就绪')
+      : '';
+    $('peopleMeta').textContent = `${(lastVerdicts || []).length} 人${objMeta}${alerts ? ` · 告警 ${alerts}` : ''}`;
+  }
 
   const span = frameLog.length > 1
     ? (frameLog[frameLog.length - 1].ts - frameLog[0].ts) / 1000
@@ -1779,11 +2460,24 @@ seek.addEventListener('change', endSeek);
 
 $('modelSel').addEventListener('change', () => {
   saveSettings();
-  if (mode !== 'idle') initEstimator();
+  // 换档后其它实例也是旧档位的：一起放掉，下次用到时按新档重建
+  closeMultiEstimator();
+  multiReady = false;
+  if (mode !== 'idle') {
+    initEstimator();
+    if (multiOn) ensureMultiEstimator();
+  }
 });
 $('delegateSel').addEventListener('change', () => {
   saveSettings();
-  if (mode !== 'idle') initEstimator();
+  closeMultiEstimator();
+  invalidateObjectDetector();
+  multiReady = false;
+  if (mode !== 'idle') {
+    initEstimator();
+    if (multiOn) ensureMultiEstimator();
+    if (objectOn) ensureObjectDetector();
+  }
 });
 $('fpsCapSel').addEventListener('change', () => { lastInferTs = 0; saveSettings(); });
 $('profileSel').addEventListener('change', (e) => switchProfile(e.target.value));
@@ -1813,9 +2507,68 @@ $('chkMirror').addEventListener('change', (e) => {
   stage.classList.toggle('mirror', show.mirror);
   saveSettings();
 });
+
+// 多人：切换会重建跟踪器与每人的状态机（id 从 1 重新开始），否则旧 track 的计数会串到新人身上
+$('chkMulti').addEventListener('change', async (e) => {
+  multiOn = e.target.checked;
+  $('multiSel').hidden = !multiOn;
+  saveSettings();
+  resetRuntime();
+  if (multiOn) {
+    const ok = await ensureMultiEstimator();
+    setStatus(ok ? '多人已开：每人一条独立判定流水线' : '多人模型不可用，已退回单人', ok ? 'ok' : 'err');
+    if (!ok) { multiOn = false; $('chkMulti').checked = false; $('multiSel').hidden = true; }
+  } else {
+    closeMultiEstimator();
+    multiReady = false;
+    setStatus('已切回单人（VIDEO 模式）', '');
+  }
+  updateUI();
+});
+
+$('multiSel').addEventListener('change', async () => {
+  saveSettings();
+  if (!multiOn) return;
+  closeMultiEstimator();
+  multiReady = false;
+  resetRuntime();
+  const ok = await ensureMultiEstimator();
+  if (!ok) setStatus('多人模型重建失败', 'err');
+  updateUI();
+});
+
+// 物体检测：PPE 的前提。模型没下载时这里会失败并给出补救命令，不影响姿态与动作
+$('chkObjects').addEventListener('change', async (e) => {
+  objectOn = e.target.checked;
+  saveSettings();
+  resetRuntime();
+  if (objectOn) {
+    lastObjectTs = 0;
+    const ok = await ensureObjectDetector();
+    if (ok === 'superseded') {
+      // 创建期间 profile/开关变过：新配置的 ensure 会接手，别把开关关掉
+      updateUI();
+      return;
+    }
+    setStatus(ok ? '物体检测已开' : '物体检测不可用（模型或后端问题）', ok ? 'ok' : 'err');
+    if (ok === false) { objectOn = false; $('chkObjects').checked = false; }
+  } else {
+    invalidateObjectDetector();
+    lastObjects = [];
+    setStatus('物体检测已关', '');
+  }
+  updateUI();
+});
 $('btnReset').addEventListener('click', () => {
-  actionEngine.reset();
+  for (const p of pipelines.map.values()) p.act.reset();
   renderReps({ squat: 0, pushup: 0, clap: 0, grasp: 0 });
+});
+$('btnAccuracy').addEventListener('click', () => {
+  const box = $('accList');
+  const open = box.hidden;
+  box.hidden = !open;
+  $('btnAccuracy').setAttribute('aria-expanded', String(open));
+  $('btnAccuracy').classList.toggle('on', open);
 });
 $('btnClearLog').addEventListener('click', clearLog);
 $('btnExport').addEventListener('click', exportJSON);
@@ -1838,9 +2591,43 @@ window.__pose = {
   get state() {
     return {
       estimatorReady, handReady, mode, fps: r1(fps), frames: frameLog.length, lastResult,
+      // 多人 / 物体检测（无头检查断言用）
+      multiOn, multiReady, objectOn, objectReady, multiError, objectError,
+      multiKey: multiEstimatorInfo().key, multiTiles: multiCfg.tiles,
+      profileLoaded,
+      tracks: tracker.tracks.size, pipes: pipelines.size(), verdicts: lastVerdicts.length,
+      objects: lastObjects.length,
+      // 物体检测后端/类别分布：无头 PPE 检查断言用（onnx 后端没有 label map，
+      // 只能靠这里确认 labels 顺序接对了）
+      objectInfo: objectInfo(),
+      objectTags: lastObjects.reduce((m, o) => {
+        const k = o.label || '?';
+        m[k] = (m[k] || 0) + 1;
+        return m;
+      }, {}),
+      // 各阶段耗时（EMA，毫秒）：web/test/throughput-probe.mjs 用
+      timing: {
+        pose: r2(stageMs.pose), hands: r2(stageMs.hands), objects: r2(stageMs.objects),
+        draw: r2(stageMs.draw), total: r2(stageMs.total), samples: stageMs.n,
+      },
     };
   },
   get lastFrame() { return frameLog[frameLog.length - 1] || null; },
+  // 离线评估用：只导出评估需要的轻量字段（video_time + 每人框/flags），
+  // 不带 kp/signals 等大字段。MOT17 gt 只需要框；flags 用来统计动作触发率
+  // （没有动作标注，只能发现明显误报）。web/test/mot17-eval.mjs 读它。
+  get frameSummary() {
+    return frameLog.map((f) => ({
+      video_time: f.video_time,
+      verdicts: (f.verdicts || []).map((v) => ({
+        track_id: v.track_id,
+        bbox: v.bbox,
+        flags: v.flags || null,
+        frozen: !!v.frozen,
+        posture: v.posture ?? null,
+      })),
+    }));
+  },
   get ui() {
     return {
       posture: $('posture').textContent,
@@ -1848,6 +2635,9 @@ window.__pose = {
       handMeta: $('handMeta').textContent,
       handL: $('handL').textContent,
       handR: $('handR').textContent,
+      armHint: $('armHint').textContent,
+      accuracyItems: document.querySelectorAll('#accList .acc-item').length,
+      accuracyLoaded: !!accuracyReport,
       signalMeta: $('signalMeta').textContent,
       repMeta: $('repMeta').textContent,
       logInfo: $('logInfo').textContent,
@@ -1878,8 +2668,15 @@ window.__pose = {
 
 // 懒加载：页面打开不建模型，点「摄像头」或「上传视频」时才加载（省内存，多开标签页也不炸）
 setStatus('待启动 · 点摄像头或上传视频', '');
+// 准确率先渲染「未评估」，报告到了再刷新；报告只影响文案，不阻塞模型加载
+refreshAccuracy();
+loadAccuracyReport().then((r) => {
+  accuracyReport = r;
+  refreshAccuracy();
+  updateUI();
+});
 // profile 先就绪再允许输入：参数变过之后记录才属于同一套阈值
 profileReady = initProfile().catch((e) => {
   setStatus(`profile 初始化失败：${e.message}`, 'err');
-});
+}).finally(() => { profileLoaded = true; });
 profileReady.then(() => { if (autoSrc) ensureEstimator(); });

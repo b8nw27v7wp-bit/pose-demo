@@ -203,7 +203,7 @@
     display: flex; flex-direction: column; min-height: 0;
     border-left: 1px solid var(--line); padding-left: 20px;
   }
-  .mod { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .mod { padding: 9px 0; border-bottom: 1px solid var(--line); }
   .mod:first-child { padding-top: 1px; }
   .mod:last-child { border-bottom: 0; padding-bottom: 0; }
   .mod-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
@@ -228,15 +228,52 @@
   .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px 4px; }
   .act {
     display: flex; align-items: center; gap: 6px;
-    padding: 4px 6px; border-radius: 6px;
+    padding: 3px 6px; border-radius: 6px;
     font-size: 12px; color: var(--mute); white-space: nowrap;
+    cursor: help;
     transition: background-color .12s, color .12s;
   }
   .act::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: #c9cec4; flex: 0 0 auto; }
   .act.on { color: var(--ink); background: var(--ok-wash); }
   .act.on::before { background: var(--ok); }
+  /* 当前条件下判不了的动作（手部模型没开、没有 3D、单帧图片）：空心点 + 降透明度。
+     和「没做」区分开——没做只是不亮，判不了是连证据都拿不到。 */
+  .act.na:not(.on) { opacity: .55; }
+  .act.na:not(.on)::before { background: transparent; box-shadow: inset 0 0 0 1.5px var(--line-strong); }
+  /* 一行当前提示 + 右侧「准确率」开关。放不下就省略，全文在 title 里 */
+  .act-hint-row { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; line-height: 1.4; }
+  .act-hint {
+    flex: 1 1 auto; min-width: 0; font-size: 11px; color: var(--mute);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #btnAccuracy { font-size: 11px; }
+  button.link.on { color: var(--ink); text-decoration: none; }
+  /* 准确率明细：默认收起，点「准确率」展开（展开后页面可以滚动） */
+  .acc-list {
+    margin-top: 6px; display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px;
+    font-size: 11px; line-height: 1.5;
+  }
+  .acc-item { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; min-width: 0; }
+  .acc-item .an { color: var(--sub); white-space: nowrap; }
+  .acc-item .av { color: var(--mute); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .acc-item .av.good { color: var(--ok); }
+  .acc-item .av.warn { color: var(--warn); }
+  .acc-item .av.bad { color: var(--bad); }
+  .acc-note { grid-column: 1 / -1; color: var(--mute); font-size: 10.5px; line-height: 1.4; margin-top: 2px; }
 
-  .hands { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  /* 人员列表（多人 / PPE）：一人一行。工程风，不加色块，只用文字与发丝线。 */
+  .people { display: flex; flex-direction: column; margin-top: 2px; }
+  .person { display: grid; grid-template-columns: 30px 1fr auto; gap: 8px; align-items: baseline;
+            padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  .person:last-child { border-bottom: 0; padding-bottom: 0; }
+  .person .pid { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--mute); }
+  .person .pstate { color: var(--ink); }
+  .person .pbadge { font-size: 11.5px; color: var(--mute); font-variant-numeric: tabular-nums; }
+  .person .pbadge.ok { color: var(--ok); }
+  .person .pbadge.warn { color: #b23b2e; }
+  select.mini { padding: 2px 4px; font-size: 12px; }
+
+  .hands { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
   .hand {
     display: flex; align-items: center; justify-content: space-between;
     padding: 5px 9px; border: 1px solid var(--line); border-radius: 6px; font-size: 12.5px;
@@ -348,12 +385,13 @@
     </select>
     <select id="fpsCapSel" title="推理帧率上限">
       <option value="10">10 fps</option>
-      <option value="15" selected>15 fps</option>
-      <option value="30">30 fps</option>
+      <option value="15">15 fps</option>
+      <option value="30" selected>30 fps</option>
     </select>
     <select id="profileSel" title="阈值 profile（切换会清空已记录的帧）">
       <option value="default">默认阈值</option>
       <option value="fitness">健身</option>
+      <option value="safety">安全合规</option>
     </select>
     <span id="profileTag" class="badge-profile" hidden></span>
   </div>
@@ -361,6 +399,13 @@
   <div class="toggles">
     <label><input id="chkSkeleton" class="sw" type="checkbox" checked>骨架</label>
     <label><input id="chkHands" class="sw" type="checkbox" checked>手部</label>
+    <label><input id="chkMulti" class="sw" type="checkbox" title="多人：IMAGE 模式逐帧推理 + 自研跟踪器，每人一条独立判定流水线">多人</label>
+    <select id="multiSel" class="mini" title="最多同时判几个人（每多一人多一次推理）" hidden>
+      <option value="2">2 人</option>
+      <option value="3" selected>3 人</option>
+      <option value="4">4 人</option>
+    </select>
+    <label><input id="chkObjects" class="sw" type="checkbox" title="物体检测：安全帽/手套等 PPE 判定依赖它（需要自训模型或 efficientdet）">物体</label>
     <label><input id="chkPoints" class="sw" type="checkbox" checked>关键点</label>
     <label><input id="chkMirror" class="sw" type="checkbox" checked>镜像</label>
   </div>
@@ -390,6 +435,11 @@
   </section>
 
   <aside class="panel">
+    <section class="mod" id="peopleMod" hidden>
+      <div class="mod-head"><h2>人员</h2><span class="meta" id="peopleMeta">—</span></div>
+      <div class="people" id="peopleList"></div>
+    </section>
+
     <section class="mod">
       <div class="mod-head"><h2>当前姿态</h2><span class="meta" id="postureMeta">—</span></div>
       <div class="posture-row"><div class="posture dim" id="posture">—</div></div>
@@ -399,6 +449,12 @@
     <section class="mod">
       <div class="mod-head"><h2>动作与手势</h2><span class="meta" id="handMeta">—</span></div>
       <div class="actions" id="armGrid"></div>
+      <div class="act-hint-row">
+        <div class="act-hint" id="armHint">悬停动作名：查看判定条件与已知误判</div>
+        <button class="link" id="btnAccuracy" aria-expanded="false"
+                title="实测召回/精确率：来自标注数据的评估报告；没有数据时显示「未评估」">准确率</button>
+      </div>
+      <div class="acc-list" id="accList" hidden></div>
       <div class="hands">
         <div class="hand" id="handLCard"><span class="hk">左手</span><span class="hv" id="handL">—</span></div>
         <div class="hand" id="handRCard"><span class="hk">右手</span><span class="hv" id="handR">—</span></div>

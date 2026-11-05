@@ -4,6 +4,7 @@
 
 import { FilesetResolver, PoseLandmarker } from '../vendor/vision_bundle.mjs';
 import { KPT, MP_INDEX, POSE_CONNECTIONS, IDX } from './kpt.js';
+import { tileRects, mergeTiledPoses } from './tiles.js';
 
 // 关键点格式定义在 kpt.js（纯数据，可被 Node 单测导入），这里只做转出
 export { KPT, MP_INDEX, POSE_CONNECTIONS };
@@ -76,6 +77,102 @@ export function detectImage(image) {
   if (!landmarker) throw new Error('estimator not ready');
   return landmarker.detect(image);
 }
+
+// —— 多人估计器（IMAGE 模式）—— -------------------------------------------------
+// 为什么要单开一个实例：VIDEO 模式的跟踪器只会锁定一个人（实测 numPoses=2 时
+// max_persons 恒为 1），多人必须走 IMAGE 模式逐帧独立推理 —— 代价是丢掉模型内部的
+// 帧间跟踪，所以 track_id 由我们自己维护（track.js）。两个实例共用同一份 wasm 运行时，
+// 不会重复下载。
+let multiLandmarker = null;
+let multiKey = '';
+
+export async function createMultiEstimator(opts = {}) {
+  const {
+    model = 'full', delegate = 'GPU', numPoses = 3,
+    // 0.3 而不是单人道默认的 0.5：多人场景里远处那个人置信度天然低，
+    // 实测同一张双人图 detConf=0.5 只回 1 人、0.3 回 2 人（docs 里记了这一条）。
+    detConf = 0.3, presenceConf = 0.3,
+  } = opts;
+  const key = `${model}|${delegate}|${numPoses}|${detConf}|${presenceConf}`;
+  if (multiLandmarker && key === multiKey) return multiLandmarker;
+
+  if (!vision) vision = await FilesetResolver.forVisionTasks(asset('../vendor/wasm'));
+  closeMultiEstimator();
+
+  multiLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: asset(`../models/pose_landmarker_${model}.task`), delegate },
+    runningMode: 'IMAGE',   // 关键：IMAGE 模式才会返回多个人
+    numPoses: Math.max(1, Math.min(4, numPoses | 0)),
+    minPoseDetectionConfidence: detConf,
+    minPosePresenceConfidence: presenceConf,
+  });
+  multiKey = key;
+  return multiLandmarker;
+}
+
+export function multiEstimatorInfo() {
+  return { ready: !!multiLandmarker, key: multiKey };
+}
+
+export function closeMultiEstimator() {
+  if (multiLandmarker) {
+    try { multiLandmarker.close(); } catch { /* ignore */ }
+    multiLandmarker = null;
+  }
+  multiKey = '';
+}
+
+/** IMAGE 模式下 detect() 可以直接吃 HTMLVideoElement / canvas / ImageBitmap，取当前帧 */
+export function detectMultiImage(source) {
+  if (!multiLandmarker) throw new Error('multi estimator not ready');
+  return multiLandmarker.detect(source);
+}
+
+/**
+ * 平铺版多人检测（IMAGE 模式）。块内检测 → 坐标映射回整帧 → 去重。
+ * 成本是 n² 次推理：tiles=2 约 4 倍耗时，只在"远/小目标多人"场景打开。
+ * 切块/去重几何在 tiles.js（纯函数，Node 可单测）。
+ */
+export function detectMultiTiled(source, w, h, { tiles = 2, overlap = 0.2, maxPoses = 3 } = {}) {
+  if (!multiLandmarker) throw new Error('multi estimator not ready');
+  const rects = tileRects(w, h, tiles, overlap);
+  if (rects.length === 1) return multiLandmarker.detect(source);
+
+  let canvas = tiledCanvas;
+  if (!canvas) canvas = tiledCanvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const poses = [];
+
+  for (const r of rects) {
+    const tw = Math.max(1, Math.round(r.w));
+    const th = Math.max(1, Math.round(r.h));
+    canvas.width = tw;
+    canvas.height = th;
+    ctx.drawImage(source, r.x, r.y, r.w, r.h, 0, 0, tw, th);
+    const res = multiLandmarker.detect(canvas);
+    const lms = res?.landmarks || [];
+    for (let i = 0; i < lms.length; i++) {
+      const lm = lms[i];
+      if (!lm || lm.length < 33) continue;
+      // 映射回整帧归一化坐标；visibility 等其余字段原样保留
+      const mapped = lm.map((p) => ({ ...p, x: (r.x + p.x * r.w) / w, y: (r.y + p.y * r.h) / h }));
+      const xs = mapped.map((p) => p.x);
+      const ys = mapped.map((p) => p.y);
+      const bbox = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+      const score = mapped.reduce((s, p) => s + (p.visibility ?? 0), 0) / mapped.length;
+      poses.push({ landmarks: mapped, worldLandmarks: res.worldLandmarks?.[i] || [], bbox, score });
+    }
+  }
+
+  const kept = mergeTiledPoses(poses, Math.max(1, maxPoses));
+  return {
+    landmarks: kept.map((p) => p.landmarks),
+    worldLandmarks: kept.map((p) => p.worldLandmarks),
+  };
+}
+
+let tiledCanvas = null;
+
 
 /** 尺度锚点：肩中点与髋中点的像素距离（躯干长）。全部距离类信号都除以它。 */
 function torsoScalePx(kp) {
