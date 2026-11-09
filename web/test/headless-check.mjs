@@ -222,7 +222,20 @@ async function main() {
       const mid = video.currentTime;
       const dur = video.duration;
       $('btnReplay').click();
-      await new Promise((r) => setTimeout(r, 1600));
+      // 冷启动 / 视频播完后再 seek 到 0 时，Chrome 会重新缓冲（readyState 回到 HAVE_METADATA）。
+      // 固定等 1.6s 在慢机上会读到 0 帧；这里轮询到有帧为止（最多 5s）。
+      for (let i = 0; i < 25 && window.__pose.state.frames === 0; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      // 无头环境偶发：ended 后 seek 回 0 停在 readyState=1 不再推进（真机上不会）。
+      // 兜底重新 load 一次，仍然没帧才让断言失败。
+      if (window.__pose.state.frames === 0) {
+        video.load();
+        video.play().catch(() => {});
+        for (let i = 0; i < 25 && window.__pose.state.frames === 0; i++) {
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
 
       // 设置持久化：切换镜像后应写入 localStorage
       const mirror = $('chkMirror');
@@ -261,7 +274,7 @@ async function main() {
       const sel = document.getElementById('hardcaseSel');
       const btn = document.getElementById('btnHardcase');
       const info = window.__pose && window.__pose.hardcaseInfo
-        ? window.__pose.hardcaseInfo('squat') : null;
+        ? window.__pose.hardcaseInfo('clap') : null;
       return {
         hasSelect: !!sel, options: sel ? sel.options.length : 0, value: sel ? sel.value : null,
         hasButton: !!btn, frames: info && info.frames,
@@ -281,7 +294,7 @@ async function main() {
     const clickStart = await cdp.eval(`(() => {
       const sel = document.getElementById('hardcaseSel');
       const btn = document.getElementById('btnHardcase');
-      sel.value = 'squat';
+      sel.value = 'clap';
       btn.click();
       return { disabled: btn.disabled, text: btn.textContent };
     })()`);
@@ -413,7 +426,7 @@ async function main() {
       && !!accuracyUi.hint
       && (!handWiring.handReady || handWiring.withHands > 0)
       && hardcase.options >= 10 && hardcase.hasButton && hardcase.frames > 0
-      && hardcase.segment && hardcase.action === 'squat'
+      && hardcase.segment && hardcase.action === 'clap'
       && clickStart.disabled === true && clickEnd.disabled === false
       && clickEnd.text === '判错了' && /已导出难例/.test(clickEnd.status)
       && layout.scrollHeight <= layout.viewport + 1;

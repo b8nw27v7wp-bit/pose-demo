@@ -22,19 +22,14 @@ const STAND = [
   [88, 380, 1], [112, 380, 1],
 ];
 
-function squatKp(t) {
-  const hipY = 220 + 40 * t;
-  const kneeX = 100 + 70 * t;
-  const kneeY = 300 + 30 * t;
-  return [
-    [100, 50 + 40 * t, 1],
-    [90, hipY - 120, 1], [110, hipY - 120, 1],
-    [85, 150 + 40 * t, 1], [115, 150 + 40 * t, 1],
-    [80, 200 + 40 * t, 1], [120, 200 + 40 * t, 1],
-    [92, hipY, 1], [108, hipY, 1],
-    [kneeX - 10, kneeY, 1], [kneeX + 10, kneeY, 1],
-    [88, 380, 1], [112, 380, 1],
-  ];
+// 13 点顺序（见 kpt.js / signals.js）：nose, shoulder L/R, elbow L/R, wrist L/R, hip L/R, knee L/R, ankle L/R
+// 腕是 index 5/6，y=200；躯干长（肩中点→髋中点）= 120，即 scale。
+/** 一次鼓掌：两腕从分开（腕距 1.33·scale）合到胸前（0.33·scale）再分开 */
+function clapKp(open) {
+  const dx = 20 + 60 * open;   // 20px（合）~ 80px（张）→ 腕距 40~160
+  return STAND.map((p, i) => (i === 5 || i === 6)
+    ? [100 + (i === 5 ? -dx : dx), 200, 1]
+    : p);
 }
 
 /** 一次开合跳式的举手：腕从髋抬到头顶再放下 */
@@ -72,12 +67,13 @@ const hold = (kp, ms) => { for (let i = 0; i < ms / 100; i++) { t += 100; push(k
 hold(STAND, 2000);
 const standEnd = t;
 
-// 2–4s  一次完整深蹲（下 0.8s → 停 0.4s → 上 0.8s）
-const squatStart = t;
-for (let i = 1; i <= 8; i++) { t += 100; push(squatKp(lerp(0, 1, i / 8))); }
-hold(squatKp(1), 400);
-for (let i = 7; i >= 0; i--) { t += 100; push(squatKp(lerp(0, 1, i / 8))); }
-const squatEnd = t;
+// 2–4s  一次完整鼓掌（张开 0.8s → 停 0.3s → 合拢 0.8s → 停 0.3s）
+const clapStart = t;
+for (let i = 1; i <= 8; i++) { t += 100; push(clapKp(lerp(0, 1, i / 8))); }
+hold(clapKp(1), 300);
+for (let i = 7; i >= 0; i--) { t += 100; push(clapKp(lerp(0, 1, i / 8))); }
+hold(clapKp(0), 300);
+const clapEnd = t;
 
 // 4–5s  站立
 hold(STAND, 1000);
@@ -98,8 +94,8 @@ const labels = {
   note: '合成姿态，仅用于验证评估链路。真实阈值必须用实拍素材拟合。',
   segments: [
     { action: 'stand', start: 500, end: standEnd - 100 },
-    { action: 'squat', start: squatStart, end: squatEnd, count: 1, tol: 0 },
-    { action: 'stand', start: squatEnd + 200, end: armStart - 100 },
+    { action: 'clap', start: clapStart, end: clapEnd, count: 1, tol: 0 },
+    { action: 'stand', start: clapEnd + 200, end: armStart - 100 },
     { action: 'armRaised', start: armStart + 400, end: armEnd },
   ],
 };

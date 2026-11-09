@@ -67,6 +67,10 @@ try {
     el.dispatchEvent(new Event('change'));
     return true;
   })()`);
+  // 素材只有 3 秒，等模型就绪 + 建多人估计器的时间里视频基本已经播完；
+  // 播完后主循环不再出帧，tracks 会永远是 0。无条件重播一次再等轨迹
+  // （重播会清空记录/跟踪器，之后重新检测；真机上换档后用户也要重播才能看到效果）。
+  await cdp.eval(`(() => { document.getElementById('btnReplay').click(); return true; })()`);
   const multiOk = await waitFor(cdp,
     'window.__pose && window.__pose.state.multiReady && window.__pose.state.tracks > 0',
     { label: '多人模型加载并产生轨迹' });

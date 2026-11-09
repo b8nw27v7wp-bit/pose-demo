@@ -48,19 +48,19 @@ console.log('\n[1] rangesFrom');
 console.log('\n[2] repSessions');
 {
   const timeline = [
-    { ts: 0, act: { repPhase: { squat: 'down' }, reps: { squat: 0 } } },
-    { ts: 500, act: { repPhase: { squat: 'down' }, reps: { squat: 0 } } },
-    { ts: 1000, act: { repPhase: { squat: 'up' }, reps: { squat: 1 } } },
-    { ts: 2000, act: { repPhase: { squat: 'down' }, reps: { squat: 1 } } },
-    { ts: 3000, act: { repPhase: { squat: 'up' }, reps: { squat: 2 } } },
+    { ts: 0, act: { repPhase: { clap: 'down' }, reps: { clap: 0 } } },
+    { ts: 500, act: { repPhase: { clap: 'down' }, reps: { clap: 0 } } },
+    { ts: 1000, act: { repPhase: { clap: 'up' }, reps: { clap: 1 } } },
+    { ts: 2000, act: { repPhase: { clap: 'down' }, reps: { clap: 1 } } },
+    { ts: 3000, act: { repPhase: { clap: 'up' }, reps: { clap: 2 } } },
   ];
-  const split = repSessions(timeline, 'squat', { mergeMs: 500, minMs: 300 });
+  const split = repSessions(timeline, 'clap', { mergeMs: 500, minMs: 300 });
   check('两次间隔大于 mergeMs → 两段', split.length === 2
     && split[0].count === 1 && split[1].count === 1, JSON.stringify(split));
-  const merged = repSessions(timeline, 'squat', { mergeMs: 1500, minMs: 300 });
+  const merged = repSessions(timeline, 'clap', { mergeMs: 1500, minMs: 300 });
   check('放宽 mergeMs → 合成一段，count 累加', merged.length === 1 && merged[0].count === 2,
     JSON.stringify(merged));
-  const noReps = repSessions([{ ts: 0, act: null }], 'squat');
+  const noReps = repSessions([{ ts: 0, act: null }], 'clap');
   check('没有计数 → 空', Array.isArray(noReps) && noReps.length === 0);
 }
 
@@ -72,7 +72,7 @@ console.log('\n[3] sample.frames.json');
   const by = (a) => segments.filter((s) => s.action === a);
   check('产出正例段', segments.length > 0, `n=${segments.length}`);
   check('含 stand', by('stand').length >= 1);
-  check('含 squat 且 count ≥1', by('squat').length === 1 && by('squat')[0].count === 1);
+  check('含 clap 且 count ≥1', by('clap').length === 1 && by('clap')[0].count === 1);
   check('含 armRaised', by('armRaised').length >= 1);
   check('绝不生成 none', by('none').length === 0);
   check('时间基为 ts 毫秒（样例无 video_time）',

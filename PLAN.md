@@ -1,6 +1,6 @@
 # 通用人体姿态识别 —— 感知 Demo + 动作识别引擎 落地计划
 
-版本 v1.1 ｜ 2026-10-29 ｜ 状态：P1 已交付；§12.3 的参数层与评估器已落地；**后续完善计划见 §13**
+版本 v1.2 ｜ 2026-11-05 ｜ 状态：P1 已交付；§12.3 的参数层与评估器已落地；§13 的 R0~R7 工具链已落地；**§16–§18 是审核后的两线补全与优化计划（姿态 / 物体·PPE）**
 （计划里的 v0.1 为「机场加油车作业合规识别」专用版，已废弃，本文件取代它；
 当前仓库的**初始版**是 `package.json` 0.1.0，只交付浏览器 Demo + 评估/采集工具链）
 
@@ -1166,4 +1166,485 @@ fps 3.7~5.2 是无头环境 + 三种模型同开的结果，真机需自测。
 
 ---
 
-*文档维护：每完成一个阶段，更新本文件对应阶段的状态与实测数据，不另建文档。§13 的状态列随 R0~R10 推进更新。*
+## 16. 姿态线补全与优化计划（2026-11-05，审核后）
+
+> 依据：对当前工作区（含未提交改动）的代码审核，逐条核对 `README.md`、本文件 §12–§15、`docs/*.md`、`web/js/*.js`、`web/test/*.mjs`。
+> 编号沿用 R 体系：已有阶段的剩余工作写「R2 收尾」这类；姿态线新工作为 **R12-n**，物体线新工作为 **R13-n**（§17）。
+> 所有「目标」值都是本计划设定的验收线；引用到的实测值均给出来源；没有数字的地方写「无实测」并给测法。
+
+### 16.1 审核口径修正
+
+| 审核说法 | 实际情况 | 依据 |
+|---|---|---|
+| 多人同时判最多 4 个 | 默认 `maxPersons=3`，4 只是工具栏/代码上限 | `web/js/params.js:159`、`web/js/app.js:522` |
+| 30fps 上限 + 多人3 + 手部约 26 帧/s | 这是 **640×480** 的数字；1080p 不开物体是 25.6 帧/s | `docs/multi-and-objects.md:162,167` |
+| 1080p 多人+物体+手部 3.7~8.8 fps | 这是 safety 档（物体检测开）的数字，**不能**和 26 帧/s 混用 | `docs/open-datasets.md:135` |
+
+另外，审核未提但会直接影响计划的四处缺口（均已在代码中核实）：
+
+1. **多人手势去抖是全局的**：`shapeStable` 只有 L/R/U 三个实例（`web/js/app.js:112,932-942`），`classifyHands()` 不按 track 区分，多人时两个人的手势 streak 互相污染。
+2. **导出契约在多人处就断了**：`pushLog()` 的 `persons` 恒为一元数组（`web/js/app.js:1662-1673`），`verdicts[]` 没有 kp/hands；`evaluate.mjs` 的 `personBoxes()`/手势归属只读 `persons[0]`（`web/test/evaluate.mjs:414-419,436`）。这比「评估口径没接」更靠前，必须先改导出契约。
+3. **手势数字没有上屏路径**：`accuracy-report.mjs:33` 只遍历 `ARM_ACTIONS`，页面也只渲染 12 行（`web/js/app.js:2088`）；即使 R7 算出 8 种手势，`accuracy.json` 里也不会出现。
+4. **文档滞后于代码**：`README.md:7` 仍写「多人实时跟踪……本版没有实现」；`README.md:420` 与 `docs/signals.md:451-455` 仍写「多人只保留目标人的手」，与 `multi.js` 的 `assignHands()` 不一致。
+
+### 16.2 现状与缺口
+
+| 能力 | 已验证 | 缺口 | 证据 |
+|---|---|---|---|
+| 单人姿态 33 点 + worldLandmarks | 无头页面、样例视频、上半身裁图 60/60 `ok=true` | 没有实拍动作准确率 | `README.md:142,416`；`web/js/pose.js:191-230` |
+| 多人 IMAGE + 跟踪 | 双人视频 2 条轨迹；MOT17 6 序列 | 3 人以上、交叉遮挡、长期 re-id 未量化 | `docs/multi-and-objects.md` §一；`web/js/track.js:236-298` |
+| 多人召回/夜景 | TopK 19.4%、精确 69.9%；04 整帧 0.3%、2×2 16.5% | 平铺无 NMS/置信度校准；detConf 权衡未定；heavy 未与平铺组合 | `docs/open-datasets.md:174-226`；`web/js/tiles.js:45-54` |
+| ID 稳定性 | 慢放 8.9%；centerMax 0.6/0.8、3/4 人无可测差异 | 实时 ~15% 主要是丢帧 | `docs/multi-and-objects.md:140-152` |
+| 吞吐 | 640×480 多人3+手部 25.3–26.4 fps；1080p 不开物体 25.6 fps | 1080p+物体+手部 3.7–8.8 fps；真机未测 | `docs/multi-and-objects.md:154-191`；`docs/open-datasets.md:120-140` |
+| 动作集与规则 | 2 姿态 + 12 手臂 + 8 手势 + 2 计数；716 项测试全绿 | 规则只证明「按设计跑」，不证明准 | `README.md:142`；`web/js/actions.js:319-348` |
+| 评估/采集工具链 | R0/R1/R2/R3/R4/R6/R7 工具均落地 | 没有实拍 `eval-data`；`--fit-out`/`--loso`/`--resample` 未跑过真实数据 | 本文件 §13.2.1 |
+| 手势 | 评估口径、弃权率、`--min-gesture-recall`/`--max-gesture-abstain` | 8 种手势 0 个数字；`accuracy.json` 不含手势 | 本文件 §13.2.1；`web/test/evaluate.mjs:469-560` |
+| 多人手部 | 整帧漏检 0/18 → ROI 18/18（单人/主目标） | ROI 只对主目标；逐人手势状态共用 | `README.md:418-420`；`web/js/app.js:1518-1545` |
+| 手-人归属 | 腕点最近人、0.8×躯干长 | 没有「手框在人体框内」二次门；没有次近人 margin | `web/js/multi.js:22-60` |
+| 导出契约 | 单人 `persons[0]` 可离线 replay | 多人只导主目标；逐 track 无法复算 | `web/js/app.js:1662-1673`；`web/test/evaluate.mjs:235` |
+| 上半身/远景 | 上半身 60/60 `ok=true`；远景 ROI 可检出 | 尺度锚点固定 1.4；`scale_source` 未导出；远景手部可信度无门槛 | `web/js/signals.js:524-532`；`web/js/pose.js:177-184` |
+| 2D/3D | R3 代码、双份导出、`signal-compare.mjs` | 没有实拍验收；`leg_vertical`/`ratios` 仍默认 2D | 本文件 §13.2.1；`docs/signals.md:434-441` |
+| 个体基线 | 未开始 | 且 R5 想用的 `--baseline` 已被评估器占用（`web/test/evaluate.mjs:56,111`） | 本文件 §13.2 |
+
+### 16.3 补全计划（P0）
+
+#### R2 收尾 · 实拍采集与标注
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 24 个可标项（2 姿态 + 12 手臂 + 8 手势 + 2 计数）只有规则与合成样例，没有能支撑 recall/precision 的实拍数据。 |
+| 做法 | 按 `docs/data-collection.md` §三/§五/§六：2 人 ×（front/side）+ close，每动作 10~15 次；录制用 `full` + 30fps；`manifest-check --init`；`autolabel` 出正例草稿，`evaluate --timeline` 改边界并补 `!动作`/`noArm`；每段 labels 填 `camera`/`subject`/`lighting`。 |
+| 验收 | `manifest-check --manifest eval-data/manifest.json` 退出码 0；每动作 ≥40 正例、≥20 反例；`subject` ≥2、`camera` ≥2；报告每行带 n 与 Wilson 95% 区间。 |
+| 依赖 / 人 / 工期 | 需 **2 人出镜**；拍摄 2 人日 + 标注 4 人日。 |
+| 风险 | 24 项一次拍完易漏反例；`none` 误用于单动作误报（`docs/eval.md:162-165`）；标注疲劳导致边界粗糙。 |
+
+#### R4 收尾 · 阈值拟合、LOSO、帧率敏感性
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `--fit-out`/`--loso`/`--resample` 只有工具，没在实拍上跑过；默认阈值仍是量级参考。 |
+| 做法 | `evaluate --dir eval-data --fit --margin 0.1 --fit-out web/profiles/fitness-fit.json`；人工复核工具不翻译的键（`onHips/head/carry`、有符号方位角）；`--loso --max-loso-drop 0.1`；`--resample 15`；对 3 个最敏感键跑 `--sweep`（如 `actions.posture.stand.kneeGt`、`signals.arm.elevTorso.raised`、`signals.arm.extend.minReach`）。 |
+| 验收 | 每动作 recall ≥0.90、precision ≥0.85；计数每 20 次绝对误差 ≤1；LOSO Δ ≥ −10 个百分点；15fps 的 recall Δ 写进报告并解释；`fitness-fit.json` 不放进 `--dir`。 |
+| 依赖 / 人 / 工期 | 依赖 R2、R3 的数据；不需要新拍摄；1~2 人日。 |
+| 风险 | 2 人样本的 LOSO 方差大；拟合到本人；full/lite 档混用导致阈值不可移植（profile 已带 `model`，必须核对）。 |
+
+#### R7 收尾 · 手势实拍数字与上屏
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 8 种手势只有评估口径，没有实拍 recall/precision，也没有进入页面「准确率」面板的路径。 |
+| 做法 | 按 `docs/data-collection.md` 的手势段格式标 `{"action":"gesture","hand":"L","shape":"fist"}`，每段 2~3s、每只手单独标；侧对帧不标（评估器按 `orient.facing==='edge'` 弃权）；`--min-gesture-recall 0.8 --max-gesture-abstain 0.2`；改 `accuracy-report.mjs:33` 增加 `SHAPE_IDS` 映射，`app.js:2088` 与 `accuracy.js` 增加手势行；`unknown` 仍只作弃权。 |
+| 验收 | 8 种手势各有 n≥20 的 recall/precision 与弃权率；每种 recall ≥0.80；弃权 <20%；页面能显示 8 行实测值；`npm test` 新增映射/容错断言。 |
+| 依赖 / 人 / 工期 | 需 **人出镜**（close 机位）、依赖 R2 的手势批次；标注 2 人日 + 代码 1 人日。 |
+| 风险 | 侧对帧多导致弃权高；手势段与手臂动作互相遮挡；`SHAPE_IDS` 新增后 labels 校验要同步。 |
+
+#### R12-1 · 多人评估口径（逐 track recall/precision）
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `evaluate.mjs` 只回放 `persons[0]`（`evaluate.mjs:235`），多人动作/手势无法按 track 评；MOT17 也只有帧级人框。 |
+| 做法 | ① `pushLog()` 在多人时导出全部 `persons`（含 `kp/kp_world/scale/score`），`hands` 保持全量；② `replay()` 按 `track_id` 各建一套 `SignalEngine/ActionEngine`，用 `assignHands()` 重建每帧手部归属；③ labels 段增加可选 `track`（手势段同样），缺省仍取面积最大的目标；④ `personBoxes()`/`gestureFrames()` 改为全量 `persons`，`handState()` 按「手框中心落在哪个 person bbox 内」归属；⑤ 多人口径把 `MAX_LOG` 降到 6000 帧并写进 meta，避免导出体积失控。 |
+| 验收 | 2 人合成帧（A 挥手、B 站立）→ A 的 `waving` recall=1、B 的 `!waving` precision=1；旧单人 JSONL 的指标与段判定不变；实拍 2 人片段每 track 有 n；`eval-test` 既有 253 项全绿，新增逐 track 用例。 |
+| 依赖 / 人 / 工期 | 不需要新拍摄；3 人日（契约 1d + replay 1d + 测试 1d）。 |
+| 风险 | `track_id` 在丢失 1.5s 后变化，段归属会断；导出体积仍可能大；改 `pushLog` 会与物体线的 `verdicts/objects` 改动冲突（见 §18.1 合并顺序）。 |
+
+#### R12-2 · 多人手部 ROI 与逐 track 手势状态
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `shapeStable` 是全局 L/R/U（`app.js:112,932-942`），多人时手势状态互相污染；ROI 补检只对主目标（`app.js:1534-1538`）。 |
+| 做法 | ① `shapeStable` 改为 `Map<track_id,{L,R,U}>`，`classifyHands(list, ts, trackId)` 移到 `assignHands()` 之后；② `completeHands` 按面积遍历 `judged`，新增 `signals.hand.roi.maxPersonsPerFrame`（默认 2）与 `maxPx` 预算；③ `assignHands` 增加「手 bbox 中心在 person bbox 内 + 与次近人的距离差 ≥0.15×scale」两道门；④ ROI 结果继续带 `side_from:'roi'`，导出 `verdicts[].hands`。 |
+| 验收 | `multi-test` 新增「两人不同手势交替 30 帧，各自 stabilizer 不互切」；交叉遮挡合成用例归属正确；640×480 多人3+手部 fps 下降 ≤10%（基线 25.3–26.4）；ROI 推理次数 ≤2/帧。 |
+| 依赖 / 人 / 工期 | 不需要新拍摄；2 人日（代码 1.5d + 测试 0.5d）。 |
+| 风险 | 每多一人多两次推理；手靠得近时归属仍可能错；`maxPersonsPerFrame` 太小会漏掉侧边的人。 |
+
+### 16.4 优化计划（P1）
+
+#### R3 收尾 · 2D/3D 数据验收
+
+| 项 | 内容 |
+|---|---|
+| 问题 | R3 代码已落地，但没有在实拍上比较 2D/3D；`leg_vertical`/`ratios` 仍默认 2D。 |
+| 做法 | `signal-compare.mjs` 增加 `--dir` 批量模式：按 `front/side` 配对，输出每条信号的 2D/3D 跨机位重合度、静止峰峰值、动作子集可分性；结论写回 `docs/signals.md`；通过 profile 的 `signals.world.legVertical`/`ratios` 逐信号切换，不改默认。 |
+| 验收 | 每条信号给出 2D/3D 重合度差与 n；切 3D 后对应动作 recall 不低于 2D 基线 1 个百分点；无 world 时退回 2D 的单测仍绿。 |
+| 依赖 / 人 / 工期 | 依赖 R2 的正/侧机位素材；1~2 人日。 |
+| 风险 | MediaPipe world 是估计值，抖动可能大于 2D；只有 2 人，结论外推有限。 |
+
+#### R5 收尾 · 个体基线校准
+
+| 项 | 内容 |
+|---|---|
+| 问题 | R5 未开始；且 R5 设想的 `--baseline` 已被 `evaluate.mjs:56,111` 用作「旧报告基线」，直接加会撞名。 |
+| 做法 | 新增 `signals.baseline`（`enabled:false`，记录站立 3s 的 `torsoLen/shoulderWidth/wristHip/uprightness/hipAnkle`）；页面加「校准」按钮，存 `localStorage`（按 profile 键），导出 meta 加 `baseline_hash`；阈值改为相对基线（如 `onHips.maxDist = k×基线腕髋距`）；评估器新增 `--person-baseline <json>`，**保留**现有 `--baseline` 语义。 |
+| 验收 | 同一人校准后 recall/precision 不降；另一人（未校准）退化 ≤5 个百分点；旧 `--baseline` CI 流程行为不变；无 baseline 时退回默认阈值。 |
+| 依赖 / 人 / 工期 | 需 **1 人出镜 3 秒 + 另 1 人验证**；3 人日（UI 1d + 评估 1d + 测试 1d）。 |
+| 风险 | 过拟合本人；默认开启会破坏「开箱即用」；基线长度会随衣物/姿态变。 |
+
+#### R12-3 · 多人召回与夜景：平铺去重、置信度、heavy、成本
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 2×2 把 04 从 0.3% 提到 16.5%，但 02 精确 64.0%→43.3%、耗时约 4 倍；`mergeTiledPoses` 只有 bbox IoU>0.5（`tiles.js:45-54`），没有 NMS/置信度校准；`score` 是平均可见度（`pose.js:162`），不是检测分数。 |
+| 做法 | ① `mergeTiledPoses` 改「中心距 <0.5×height 且尺寸比 0.6~1.67」聚簇，保留 `mean visibility × sqrt(area)` 高者，注释写明这是启发式；② 新增 `perception.multi.tileMode: 'off'|'always'|'auto'`，`auto` 在连续 5 帧整帧检出 <1 人时启用平铺 30 帧；③ `multiKey` 纳入 `tiles/tileOverlap`；④ `mot17-eval` 增 `--tiles/--overlap/--detConf` 并把配置写进输出；⑤ 测 `heavy+2×2` 与 `detConf 0.25/0.3`，只在 04 TopK 不降时采用。 |
+| 验收 | 04 TopK ≥16.5%（现 2×2 实测）；02 精确 ≥57.6%（整帧 64.0% 的 90%）；`--rate 0.4` 下 02+04 平均耗时 ≤整帧 2.5 倍；heavy+2×2 若 04 仍 0.0% 则不采用。 |
+| 依赖 / 人 / 工期 | MOT17 现成，不需要人出镜；3 人日。 |
+| 风险 | 无逐人检测分数，NMS 只能近似；MOT17 非商用（`docs/open-datasets.md:226`）；夜景结论换到自采素材可能不成立。 |
+
+#### R12-4 · ID 稳定性：先吞吐，后门控
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 慢放 8.9% 已接近匹配规则上限；实时 ~15% 主要是丢帧；1080p+物体+手部只有 3.7–8.8 fps。 |
+| 做法 | 不调 `centerMax`（0.6/0.8、3/4 人无可测差异，`docs/multi-and-objects.md:150`）；① `perception.objects.intervalMs` 150→300（多人时）；② 无人帧跳过物体检测（现在只跳手部，`app.js:1516-1518`）；③ 平铺 `auto` 时复用上一帧轨迹预测，不必每帧全图平铺；④ safety 档物体后端从 MediaPipe efficientdet 切到 ONNX worker，并保留降频；⑤ 用 `probe:throughput` 记录 pose/hands/objects 分项。 |
+| 验收 | 1080p safety 档（multi3+objects+hands）无头 ≥12 fps（**目标，非实测**；当前基线 3.7–8.8）；实时与慢放的 ID 切换率差 ≤3 个百分点（当前 ~15% vs 8.9%）；同一配置重复 3 次取中位。 |
+| 依赖 / 人 / 工期 | 不需要人出镜；2 人日。 |
+| 风险 | 真机性能与无头不同；降频可能拉长 PPE 时延；无头数字不是性能基准。 |
+
+#### R12-5 · 手势去抖、朝向与弃权口径
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `orient.facing==='edge'` 只做 UI 虚线提示（`handformat.js:21`），不参与 `HandShapeStabilizer`；边缘帧仍会推进 streak。 |
+| 做法 | `classifyHand(kp, orient)` 增加朝向参数；`HandShapeStabilizer.update(shape, ts, {edge})`：edge 帧不计 candidate、保持 last 到 `keepMs`，并返回 `abstain:'edge'`；`app.js` 的 `handState` 写 `abstain`；新增 `signals.gesture.edgeKeepMs`（默认 250）与 `minFacing`；评估器已按 edge 弃权，不改分母口径。 |
+| 验收 | 合成「front→edge→front」序列不切换手势；edge 帧全部记为弃权；页面虚线与 `abstain` 一致；手势弃权率 <20%（与 R7 验收同口径）。 |
+| 依赖 / 人 / 工期 | 依赖 R7 的手势素材；1.5 人日。 |
+| 风险 | 弃权口径变宽会掩盖错误；`edge` 阈值 0.55 未校准；连续 edge 时会长时间显示旧手势。 |
+
+#### R12-6 · 上半身/远景构图与尺度锚点
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 尺度锚点固定 `shoulderToTorso=1.4`（`params.js:32`），`scale` 来源没有导出；远景手小到什么程度该弃权没有门槛。 |
+| 做法 | `signals.js:524-532` 增加 `scale_source`（`torso`/`shoulder`/`world`/`bbox`），有 `scale_world` 时优先用于比值；`pushLog()` 导出 `scale_source`；`signals.hand.roi` 增加 `minScalePx`（默认 80），低于时 UI 提示「手太小，手势不可信」而不是硬判；`shoulderToTorso` 保留为兜底。 |
+| 验收 | 上半身样例 60/60 `ok=true`（现基线）且 `scale_source='shoulder'`；远景片段按 `minScalePx` 分档报告 ROI 命中率；站/坐仍为 null 且 UI 文案不变。 |
+| 依赖 / 人 / 工期 | 不需要新拍摄（现有样例 + 远景片段）；1.5 人日。 |
+| 风险 | 只有固定样例；远景手势真值缺失，命中率不等于准确率。 |
+
+#### R12-7 · 多人实拍与跨机位退化
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 多人只在双人样例和 MOT17 上验证过「能出 2 条轨迹」；3 人以上、交叉遮挡、夜间/逆光没有量化。 |
+| 做法 | 补拍 2/3/4 人、交叉进出、夜间/逆光各 1~2 段；用 R12-1 的逐 track 口径 + `mot17-eval` 的 TopK/ID 指标双跑；按 `camera`/`subject` 分组报告；把 `perception.multi.tiles/maxPersons` 写进 profile 注释。 |
+| 验收 | 每段有人数 max/中位、轨迹数、逐 track n；慢放 ID 切换报告；跨机位退化幅度可解释；4 人与 3 人的差异不超过 2 个百分点或给出原因。 |
+| 依赖 / 人 / 工期 | 需 **2~4 人出镜**（含夜间）；拍摄 1 人日 + 标注/评估 2 人日。 |
+| 风险 | 夜间素材难拍；多人标注一致性差；自采规模小，结论仍是方向性的。 |
+
+#### R12-8 · 文档收口
+
+| 项 | 内容 |
+|---|---|
+| 问题 | §16.1 的四处文档与代码不一致，会误导后续实现与验收。 |
+| 做法 | 修 `README.md:7,420`、`docs/signals.md:451-455`；把「多人只保留目标人的手」改成「手部按腕点归属到各 track，ROI 补检只对主目标」；测试计数以 `npm test` 实际输出为准。 |
+| 验收 | `grep` 不到「多人实时跟踪……本版没有实现」；文档描述与 `assignHands()`/ROI 行为一致。 |
+| 依赖 / 人 / 工期 | 无；0.5 人日。 |
+| 风险 | 文档改动容易与代码改动脱节，合并 PR 前跑一次一致性检查。 |
+
+### 16.5 排期表
+
+| 周 | 主线 | 可并行 | 需要人出镜 |
+|---|---|---|---|
+| W1 | R12-1/R12-2 代码（多人评估契约、逐 track 手势） | R2 拍摄（D1–D2）、R12-8 文档 | 是（2 人） |
+| W2 | R2 标注 + R4 第一批拟合 | R3 收尾 2D/3D 批量对比 | 否 |
+| W3 | R7 手势采集/标注 + 上屏 | R4 全量 LOSO/resample | 是（close 机位） |
+| W4 | R12-3 平铺/夜景 + R12-4 吞吐 | R12-7 多人实拍 | 是（2~4 人） |
+| W5 | R5 个体基线 + R12-5/R12-6 | R6 难例回流 | 是（基线 3 秒） |
+| W6 | 回归、报告、决定 R8/R9 是否开工 | 缓冲 | 可选 |
+
+**可并行项**：R12-1/R12-2 与 R2 拍摄互不阻塞；R12-3/R12-4 用 MOT17，不依赖实拍。
+**依赖人出镜的项**：R2、R7、R5、R12-7，以及 LOSO 所需的第二个 `subject`。这些不能靠加班压缩，只能提前约人。
+
+### 16.6 本线明确不做
+
+| 不做的事 | 理由 |
+|---|---|
+| 端到端动作分类（ST-GCN/PoseC3D）作为主路径 | 规则必须能从信号解释（§13.5）；R4 未达标前上模型是把标注/调参成本翻倍 |
+| 训练 person detector 替代姿态框 | 现有 pose 已给 bbox；换检测器会重做跟踪与评估，且 MOT17 的失败主因是夜景小目标，不是框来源（另见 §18.4 D5） |
+| ByteTrack / 长期 re-id | 慢放 A/B 外观重连 81/807、optimal 82/818，均差于贪心 72/810（`docs/multi-and-objects.md:144-148`） |
+| 恢复躺卧/下蹲/深蹲/俯卧撑 | 桌面机位没有膝踝证据（`README.md:80-83`）；恢复只会得到恒为 null 的列 |
+| 关键点 PCK 标注 | 成本高，且当前瓶颈是动作判定不是骨架（§13.4） |
+| fall/workstation profile（R8） | 没有负例就不要对外说能用（§13.3）；等 R4 达标后再排 |
+| 用 MOT17 数字做商业验收 | CC BY-NC-SA 3.0 非商用（`docs/open-datasets.md:226`） |
+| 把 `none` 当单动作反例 | `none` 要求姿态和手臂都不出现（`docs/eval.md:162-165`） |
+| 继续调 `centerMax`/外观权重 | 6 序列慢放无可测差异（`docs/multi-and-objects.md:150`） |
+
+---
+
+## 17. 物体识别 / PPE 线补全与优化计划（2026-11-05，审核后）
+
+> 范围：`web/js/objects.js`、`web/js/objects-onnx.js`、`web/js/ppe.js`、`web/js/multi.js`，以及 `evaluate.mjs` 的 PPE 评估部分。
+> 编号：R11 是本文件 §14.4 已提出的「PPE 数据与模型」，属于它的写 `R11-n`；新工作写 **R13-n**。
+
+### 17.1 一句话结论与关键数字
+
+链路和语义已经成立：两条后端统一 `{label, score, box}`，PPE 的三态、3s 门槛、unknown 暂停、手套只报疑似都有单测。但**尺子和模型同时缺位**：事件级 PPE 评估没接进 `evaluate.mjs`，训练数据只有本机子集，输入只有 320。下一步不是继续调阈值，而是先补齐「事件评估 + 正式数据 + 类别/模型指纹」。
+
+| # | 数字 | 含义 | 来源 |
+|---|---|---|---|
+| 1 | **0** | PPE 实拍准确率数字（没有任何 recall/precision/班次误报） | `README.md:460-464`、`docs/ppe-training.md:6-7` |
+| 2 | **0.40** | 冒烟模型 val mAP50；其中 glove **0.024**、no_boots **0.010** 基本没学会 | `docs/ppe-training.md` §4（252 图 / 2142 实例） |
+| 3 | **96 ms** | ONNX worker 单次 `session.run`；`intervalMs=150` 降频后摊薄 | `docs/multi-and-objects.md:189-191`、`web/js/params.js:178-181` |
+
+### 17.2 现状与缺口
+
+| 能力 | 已验证（仓库事实） | 缺口 | 证据 |
+|---|---|---|---|
+| 后端统一 | MediaPipe `.tflite` 与 ONNX 都输出 `{label,score,box}`；ONNX 逐类 NMS、letterbox 逆变换有 14 项单测 | 类别名来自 profile 顺序，写错只会在运行时张冠李戴 | `web/js/objects.js:202-222`、`web/js/objects-onnx.js:148-211`、`web/test/onnx-test.mjs` |
+| PPE 语义 | worn/missing/unknown；missing 连续 3s 才升；unknown 暂停不清零；手套默认 suspect；`requirePositive` 护栏 | 只有逻辑单测，无任何实拍事件数字 | `web/js/ppe.js:94-249`、`web/test/multi-test.mjs:281-390` |
+| 冒烟模型 | 875 图（623 train/252 val）、9 类、YOLOv8n@320、10 epoch、val mAP50 0.40 | 数据/机位/小目标未解决；不是 PPE 准确率 | `docs/ppe-training.md` §4、`eval-data/ppe-runs/smoke/results.csv` |
+| 数据 | 本机子集训练图 241/282/200；全量 Safety-helmet 7,035、construction 4,460；PPE_detection 仅 203 个 glove 框 | 类别名不统一、Safety-helmet 映射靠目测、手套实例太少 | `docs/open-datasets.md` §一·五、`eval-data/open/MANIFEST.json:41-96` |
+| 多人跟踪 | 双人样例稳定 2 条轨迹；慢放逐帧 ID 切换 72/810（8.9%） | 3 人以上/交叉/长期 re-id 无量化；换 id 会重置 PPE 计时 | `docs/multi-and-objects.md` §六 |
+| 评估口径 | MOT17 gt 帧级：TopK 召回 19.4%、精确 69.9%、ID 切换 67/453 | **只评人框**；`evaluate.mjs` 只读 `persons[0]`，无 PPE/多 track 事件 | `docs/open-datasets.md` §四、`web/test/evaluate.mjs:234-270` |
+| 导出契约 | 每帧有 `verdicts`（含 ppe 状态）与 `objects` 原始框 | `verdicts[]` **没有 kp/scale**，非主目标的 PPE 几何无法离线重放 | `web/js/app.js:1735-1748`、`docs/frame-schema.md:78-100` |
+| 性能 | ORT worker 后 26.4 fps（object 摊薄 0.46ms）；MediaPipe efficientdet CPU 18.3 fps；ORT 主线程 8.2 fps | 640/ROI 成本、WebGPU EP 均无实测 | `docs/multi-and-objects.md` §六 |
+| GPU 风险 | efficientdet GPU delegate 首次推理 trap 并污染运行时；默认 CPU + 黑图自检 | 换模型后能否上 GPU 未验证 | `web/js/objects.js:38-55`、`docs/multi-and-objects.md` §二 |
+| 许可 | YOLO 全系 AGPL-3.0；MediaPipe Apache-2.0；MOT17 非商用 | 商用路径未决；NC 数据不能进验收报告 | `README.md:481-492`、`docs/open-datasets.md` §二 |
+
+### 17.3 补全计划（P0，做完才有可验收的数字）
+
+#### R11-1 · 正式训练数据：全量、类别统一、来源台账
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 623 张训练图来自三份子集（241/282/200）；`scripts/prepare-ppe-dataset.py:59` 用目测把 Safety-helmet 的 `0/1` 映射成 `no_helmet/helmet`，而 `docs/open-datasets.md:72-74` 明确说「不能拿目测当类别表」；construction 与 PPE_detection 命名不一致；glove 全库仅 203 框。 |
+| 做法 | ① `scripts/fetch-eval-data.py` 增 `--ppe-full`，下全量 7,035 + 4,460 + PPE_detection 全量，沿用 `--repair-labels`；下载后把 `repo/license/split/sha256` 写入 `eval-data/open/MANIFEST.json`。② `scripts/prepare-ppe-dataset.py` 改为从 `eval-data/open/sources.json` 读显式映射，`--strict` 下缺映射直接退出；删掉硬编码 `HELMET_MAP`。③ 新增 `--balance`：按类上限/过采样，输出 `eval-data/ppe-yolo/balance.json`；val 不动，且同一源不能跨 split。④ glove 实例不足 300（工程门槛，非实测）就不训正类，只保留 `no_glove`，在 profile 里显式声明。 |
+| 验收 | `npm run report:ppe` 输出每类 train/val n；目标（待实测）：helmet ≥2,000、no_helmet ≥800、vest ≥800、person ≥2,000、glove ≥500、no_glove ≥500，val 每类 ≥100（glove ≥50）；报告必须带每类 n，不用 mAP 单独下结论。 |
+| 依赖 / 人 / 工期 | 下载带宽/磁盘；gated 数据需人工申请（可选）；2~3 人日。 |
+| 风险 | 映射错会导致 helmet/no_helmet 整体翻转（见 17.7 第 1 条）；跨源重复图造成 val 泄漏；许可需逐源核对。 |
+
+#### R11-2 · 输入分辨率与头部 ROI
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 默认 `inputSize=320`（`web/js/objects-onnx.js:19`、`web/js/params.js:176`），远景安全帽只有几十像素；`docs/ppe-training.md:146` 已建议 640 或 ROI，但未实现。 |
+| 做法 | ① 训练/导出改 `imgsz=640`，`web/profiles/safety-ppe.json` 的 `perception.objects.inputSize` 改 640。② 新增 `perception.objects.roi` 键 `{enabled, source:'head', expand:1.5, minPx:96, maxPerFrame:4}`；在 `web/js/app.js` 的 `loop()`（当前 1470-1509）里对每个 verdict 用 `headBox()` 扩框裁图，调用 `objects-onnx.js` 的新 `detectOnnxBatch()`（按 crop 循环 `session.run`，上限 4 个/帧，沿用 `intervalMs` 门控）。③ 无头远端场景再考虑 `perception.objects.tiles`（见 P2-1）。 |
+| 验收 | 远景子集（人框高 <15% 画面高）per-class recall 对比 320 整帧基线；事件 recall 由 R13-1 出数；`throughput-probe` 记录 `objectRunMs` 与 fps。目标（待实测）：远景 recall +10 个百分点，帧率不低于当前 26 fps 的 80%。 |
+| 依赖 / 人 / 工期 | R11-1 数据；R13-1 评估器；需 **人出镜**（远景/俯拍/逆光）；4~6 人日。 |
+| 风险 | 640 的推理成本按像素数上升（倍数**无实测**，必须用 `throughput-probe` 测）；每人一次 ROI 会成倍增加推理，需设上限和降级。 |
+
+#### R11-3 · ONNX 类别顺序与 profile 的运行时校验
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `objects-onnx.js:177-179` 只校验「labels 数量 ≤ 模型类别数」；数量相同但顺序错不会报错，只会张冠李戴。 |
+| 做法 | ① 导出时生成 sidecar `web/models/<model>.json`：`{labels, inputSize, numClasses, sha256, exported_at, data_yaml_hash}`；② `createOnnxDetector()` 加载 sidecar，`labels` 深比较、`inputSize`/`numClasses` 校验，不一致直接抛错并打印第一处差异；③ 新增 `perception.objects.requireManifest`（默认 `true`），sidecar 缺失即失败；④ `onnx-test.mjs` 增 3 项：顺序错、数量相同顺序错、缺 sidecar。 |
+| 验收 | 顺序错在 create 阶段失败，不进入推理；正确 sidecar 通过；`objectInfo` 暴露 `modelHash` 与 `manifest.ok`。 |
+| 依赖 / 人 / 工期 | R11-1 数据与训练产物；1~2 人日。 |
+| 风险 | 旧模型没有 sidecar 会无法加载，需要一次性迁移脚本。 |
+
+#### R13-1 · 多人 × PPE 事件评估接入
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `evaluate.mjs:234-247` 的 `personFromFrame()` 只取 `persons[0]`，`replay()` 只跑一条 `SignalEngine/ActionEngine`；labels 没有 PPE 段；导出 `verdicts[]` 只有 bbox/ppe，没有 kp/scale（`app.js:1735-1748`），非主目标无法离线重算几何。 |
+| 做法 | ① 新增 `personsFromFrame(frame)`，保留旧语义；② `persons[]` 导出全部人员（含 `kp/kp_world/scale`），`verdicts[]` 只加 `track_uid`/`hands` 与 ppe 状态（几何按 track 从 `persons[]` 关联，**不重复存 kp**）；③ labels 增段 `{action:"ppe", target:"helmet"|"glove", expect:"worn"|"missing"|"unknown", track?:number, startSec,endSec, camera, subject}`；④ 新增 `web/test/ppe-eval.mjs`（或 evaluate 内部 `ppeFrames()`）：从 `frames[].verdicts[].ppe` 读状态与 `streak_ms`，按 track 聚合；label 的 `track` 缺省时按段首 bbox IoU 绑定，绑不上则按「任一人」统计并单列；⑤ 报告新增「PPE 事件」节：per target × camera 的 worn/missing/unknown 混淆、事件 recall/precision + Wilson + n、unknown 弃权率、告警时延、误报事件/小时；⑥ 新 CLI `--min-ppe-recall`、`--max-ppe-fa-per-hour`，未达标退出码 2。 |
+| 验收 | 合成帧单测覆盖多 track、unknown 暂停、id 切换、负类混淆；实拍每 target 每机位 ≥30 段（worn/missing/unknown 各 ≥10）；目标（待实测）：helmet 事件 recall ≥0.90、precision ≥0.85、unknown ≤20%、误报 ≤1 次/8h；0 次误报时用 rule of three 报上界。 |
+| 依赖 / 人 / 工期 | R13-2 的 `track_uid`；R11-1 标注数据；`docs/eval.md` 增 PPE 标注规则；需 **人出镜**；3~4 人日。 |
+| 风险 | 「没戴」与「被遮挡」标注歧义；需在标注协议里写死 unknown 的判据，并抽样双人复核。 |
+
+#### R13-2 · 多目标跟踪 id 与 PPE 状态绑定
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `PpeMonitor.tracks` 以 `track_id` 为键（`web/js/ppe.js:155,181-191`）；跟踪器超时后发新 id，PPE 连续时长从 0 重新计；两个 profile 把 `maxLostMs` 改成 2000（`safety.json:28`、`safety-ppe.json:44`），与默认 1500 不一致；慢放 ID 切换 8.9%，一个真实缺帽事件可能被切成多段。 |
+| 做法 | ① `web/js/track.js` 给轨迹增 `track_uid`（首建分配；同一轨迹对象内不变，跟踪器重建轨迹仍是新 uid）；② `multi.js` 的 `PersonPipelines`、`ppe.js` 的 `PpeMonitor` 键改 `track_uid`，`prune()` 同步；③ `signals.ppe.linkAcrossIds`（默认 `false`）与 `reidWindowMs`（默认 0）保留为后续项：显式开启时，按中心距离/外观门控把新 id 接回旧 uid 并继承 streak；④ 导出与 UI 同时带 `track_uid`，保留 `track_id` 兼容旧评估。 |
+| 验收 | 脚本化两人交叉/换 id 单测：旧人的 violation 不转移，新人 streak 从 0；`track_uid` 在同一轨迹内稳定、无 uid 的旧数据回退到 `track_id`；MOT17 `--rate 0.4` A/B 的 ID 切换不劣化（当前基线 72/810）。`linkAcrossIds` 为后续项（默认关闭、未实现），实现前不承诺跨 id 续计时。 |
+| 依赖 / 人 / 工期 | R13-1 的导出字段；不需要人出镜；3~5 人日。 |
+| 风险 | 误继承会把 A 的违规算到 B 头上，必须有 `link_reason` 审计日志且默认关闭。 |
+
+#### R13-3 · 模型版本与阈值指纹
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `paramsHash()` 覆盖了 `perception.objects` 与 `signals.ppe` 配置（`params.js:263`），但导出 meta（`app.js:1761-1780`）没有物体后端/模型/权重哈希；两份报告无法回答「是不是同一个检测器」。 |
+| 做法 | ① `baseExportMeta()` 增 `objects:{backend, model, inputSize, labelsHash, modelHash}`；② profile 增可选 `perception.objects.modelVersion`；③ `evaluate.mjs`/`accuracy-report.mjs` 报告头打印；④ `--baseline` 在 `modelHash` 不同时警告，需 `--allow-model-change` 才继续比较。 |
+| 验收 | 同一参数、不同模型导出的指纹不同；报告显式打印模型与标签哈希；单测覆盖「同参不同模型」告警。 |
+| 依赖 / 人 / 工期 | R11-3 的 sidecar；1 人日。 |
+| 风险 | 哈希计算拖慢导出——只对模型文件算一次并缓存。 |
+
+### 17.4 优化计划（P1）
+
+#### R13-4 · 时序门槛的误报/漏报曲线
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `minMs=3000` 是量级参考，没有曲线；`intervalMs=150` 与 `runMs=96` 的关系也没验证。 |
+| 做法 | `ppe-eval --sweep-ppe signals.ppe.helmet.minMs=1000,2000,3000,5000,8000`：直接用导出里的 `streak_ms` 重算，不必重跑模型；`objects.intervalMs` 与几何参数需要重放，依赖 R13-1 的 per-track `kp/scale`。 |
+| 验收 | 每个阈值点输出事件 recall、误报/小时、n；选 knee 点写进 profile；报告必须同时给漏报和误报。 |
+| 依赖 / 人 / 工期 | R13-1、R13-2；需 **人出镜**（带负例的班次片段）；2~3 人日。 |
+| 风险 | 在非商用数据上调出的门槛不能直接进商用验收。 |
+
+#### R13-5 · PPE 几何归属 A/B（含跨人泄漏）
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 头部框半边 `0.55×scale`、腕部 `0.45×scale`（`params.js:137-138`），归属用「框中心落区」；头部框在两人靠近时可能覆盖到别人的帽子，且同一检测框会被多人重复消费（无独占）。 |
+| 做法 | ① `headBoxScale` 0.35~0.75、`gloveBoxScale` 0.30~0.65 扫描；② 新增 `signals.ppe.assignment`（`center` 默认 / `exclusive`）：`exclusive` 下每个 object 只归给「框中心到鼻尖/腕点距离 ÷ person.scale」最小的人，超过 `maxAssignDist` 丢弃；③ 保留 `visible=false` 的 bbox 兜底语义（`ppe.js:47-59`）。 |
+| 验收 | 两人贴近 ≥30 段（目标）：跨人误判 worn 的目标为 0；单人遮挡段 unknown 率；helmet 事件 recall 不降 >2 个百分点（目标）；按机位分组。 |
+| 依赖 / 人 / 工期 | R13-1 评估；需 **人出镜**（两人贴近、交叉、遮挡）；2~4 人日。 |
+| 风险 | 独占过严会把正确帽子判丢，表现为漏报。 |
+
+#### R13-6 · 模型选型与许可：Apache/BSD 检测器替代路径
+
+| 项 | 内容 |
+|---|---|
+| 问题 | Ultralytics YOLO 全系 AGPL-3.0（`README.md:487-492`）；MediaPipe Model Maker 在原生 Windows 装不上（`docs/ppe-training.md:11-16`），`.tflite` 自训路径在本机走不通。 |
+| 做法 | 候选：torchvision `ssdlite320_mobilenet_v3_large`（BSD-3）或 PaddleDetection RT-DETR（Apache-2.0，权重许可需逐个核对）。在 `objects-onnx.js` 增加输出格式分支（SSD 的 boxes/scores/labels 与 YOLO 不同）；用 R11-1 同一份数据训练/微调；`ppe-eval` 做 A/B。许可未核实前不写进验收结论。 |
+| 验收 | 事件 recall 与 YOLO 基线差 ≤3 个百分点（目标，待实测）；`web/models/` 与依赖树中无 AGPL 产物；`docs/open-datasets.md` 记录每个权重的许可原文链接。 |
+| 依赖 / 人 / 工期 | R11-1、R13-1；不需要人出镜；5~8 人日。 |
+| 风险 | 精度下降、导出/解码适配成本；RT-DETR 更重（无实测）。 |
+
+#### R13-7 · 跨机位退化与商用数据隔离
+
+| 项 | 内容 |
+|---|---|
+| 问题 | 只有「按 camera 分组」的动作口径；PPE 没有；MOT17 非商用，而验收报告可能混入 NC 数据。 |
+| 做法 | ① labels 的 `camera`（`docs/eval.md:131`）在 `ppe-eval` 里分组，报跨机位退化；② `MANIFEST.json` 增 `license` 字段；③ `ppe-eval --commercial-only` 拒绝 NC 源；④ 报告头打印数据许可清单；⑤ 新增 `scripts/license-audit.mjs`，扫描 `web/models/*.json` 的 `license` 与依赖树。 |
+| 验收 | NC 数据进商用报告时退出码非 0；每组 n 与退化幅度；跨机位退化 >10 个百分点（目标）要单列原因。 |
+| 依赖 / 人 / 工期 | R13-1、MANIFEST；1~2 人日。 |
+| 风险 | 许可判断需人工/法务复核。 |
+
+#### R13-8 · 推理性能：自适应降频与 WebGPU EP
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `intervalMs=150` 与 `runMs≈96ms` 的关系没有按机器自适应；ORT 主线程 8.2 fps、worker 26.4 fps 是既有实测，但 WebGPU EP 未验证。 |
+| 做法 | ① `intervalMs` 自适应：`max(intervalMs, 1.2×objectRunMs)`，上限 500ms；② `state.objectInfo` 暴露 `runMs`/`queueDrops`（`runMs` 已有，`objects-onnx.js:335`）；③ 试 WebGPU EP：`executionProviders:['webgpu','wasm']`，`scripts/fetch-ort.mjs` 增 `ort.webgpu.bundle.min.mjs` + jsep wasm，异常自动回退 wasm；④ 记录 warmup ms。 |
+| 验收 | `throughput-probe` 输出 CPU/WebGPU 各 100 帧的框数与 IoU 对比；runMs 降 ≥30%（目标）、fps 不降、零 trap；不达标保持 wasm。 |
+| 依赖 / 人 / 工期 | 无实拍依赖；2 人日。 |
+| 风险 | WebGPU 在部分机器不可用；降频会拉长 PPE 事件时延（由 R13-4 曲线给出代价）。 |
+
+#### R13-9 · GPU delegate trap 规避与换模型验证清单
+
+| 项 | 内容 |
+|---|---|
+| 问题 | MediaPipe efficientdet 在 GPU 上首次推理 `divide by zero` 并污染整个 wasm 运行时；换自训模型后能否上 GPU 没有流程。 |
+| 做法 | 把「换模型后的 GPU 验证清单」写进 `docs/ppe-training.md` §9：create → 黑图自检 → 真实帧 → 100 帧框数/IoU 对比 → 才写 profile；MediaPipe 后端只用 CPU，ONNX 只走 WebGPU EP；trap 后必须整页重载。 |
+| 验收 | 清单逐项打勾；失败自动降级且 `objectInfo.error` 可见；清单全绿才允许 `delegate:'GPU'`。 |
+| 依赖 / 人 / 工期 | R13-8；1 人日。 |
+| 风险 | 清单通过不等于长期稳定，仍需 24h 挂机观察（目标，无实测）。 |
+
+#### R13-10 · 误报护栏收紧：`requirePositive` 窗口化
+
+| 项 | 内容 |
+|---|---|
+| 问题 | `saw` 是整场 sticky（`ppe.js:156,173-179`）：只要全场任何一人任何时刻检出过一次正例，护栏对该类永久失效；类别名写错但偶尔误匹配时，会从「全场 unknown」直接翻成「全场 missing」。 |
+| 做法 | `saw` 增 `positiveWindowMs`（默认 0 = 现行为）与 `minPositive`（默认 3）；开启后只统计窗口内正例数，不足则维持 `unknown`；导出/UI 增 `reason`（`no_positive` / `config_mismatch` / `occluded`）。 |
+| 验收 | 合成用例：一次误匹配不再永久解锁护栏；负例班次误报 ≤1 次/8h（目标）；unknown 率 ≤20%；`reason` 可解释。 |
+| 依赖 / 人 / 工期 | R13-1（导出原因字段）；1 人日。 |
+| 风险 | 窗口太短会把正常遮挡判成 unknown，需用 R13-4 的曲线定值。 |
+
+### 17.5 P2（增强，暂不排入主线）
+
+| 编号 | 项 | 做法 | 验收 |
+|---|---|---|---|
+| P2-1 | 物体平铺 + 跨块去重/NMS | 现在 `tiles` 只用于姿态；若开，新增 `mergeTiledObjects()`：坐标映射→按类 NMS→跨块同 label、IoU>0.6 保留高分 | 远景 recall；重复框率 <2%（目标）；帧率代价 |
+| P2-2 | 班次级事件聚合 | 把逐帧 `alert` 合成「违规事件」（起止、持续、冷却 `cooldownMs`），输出班次报表 | 事件数与人工复核一致；跨班次不重复计数 |
+| P2-3 | person 检测器替代/补充姿态多人 | 用物体检测的 `person` 类或独立 person 检测器给多人框，姿态只做逐人推理 | 见 §18.4 D5，先不排期 |
+
+### 17.6 排期表
+
+| 周 | 主线 | 可并行 | 人出镜 / 数据申请 | 退出条件 |
+|---|---|---|---|---|
+| W1 | R11-1 数据全量与映射确认 | R11-3、R13-3（无需实拍）；提交 IITU/Aerial 申请 | 数据申请（不阻塞主线） | `report:ppe` 每类 n 达标；sidecar 校验通过 |
+| W2 | R13-1 评估器骨架（合成帧） | R13-2 `track_uid` | 写 PPE 标注协议 | `ppe-eval` 合成单测全绿；导出带 kp/scale |
+| W3 | R11-2 640 + 头部 ROI | R13-4 阈值扫描（先用旧数据） | **人出镜**：2 人 × 2 机位 | 首个 PPE 事件 recall/precision 数字 |
+| W4 | R13-5 几何 A/B | R13-7 许可隔离 | **人出镜**：贴近/交叉/遮挡 | 跨人 FP、unknown 率有数 |
+| W5~6 | R13-6 Apache/BSD 检测器 | P2-1 物体平铺、R13-10 护栏收紧 | 否 | 与 YOLO 基线差 ≤3 点（目标） |
+| W7 | R13-8 WebGPU / R13-9 GPU 清单 | P2-2 班次聚合 | 否 | 性能与无 trap 报告 |
+| W8 | 汇总验收报告 | — | — | 能给出「能不能商用」的结论 |
+
+### 17.7 本线明确不做
+
+- 不把 mAP 当 PPE 验收指标；验收只认事件 recall/precision、班次误报、unknown 弃权率与每类 n。
+- 不拿 COCO 模型的 `unknown` 当 PPE 结论（当前 `safety.json` 下全 unknown 是护栏生效，不是 bug）。
+- 不用检测器给 PPE 自动标注（模型标模型是循环论证）。
+- 不做人脸/身份识别；不做服务端/RTSP；不做端到端视频动作分类。
+- 不把 MOT17 等非商用数据写进商用验收报告。
+
+### 17.8 附录 A：审核结论未提到的新缺口
+
+| # | 缺口 | 证据 | 影响 / 建议 |
+|---|---|---|---|
+| 1 | **Safety-helmet 的类别映射两处说法冲突**：代码按目测硬编码 `0=no_helmet, 1=helmet`，文档却明确说目测不能当类别表 | `scripts/prepare-ppe-dataset.py:59` vs `docs/open-datasets.md:72-74` | 若映射反了，冒烟模型里最好看的 helmet 0.757 / no_helmet 0.531 本身就是标签翻转的产物；R11-1 必须先回源确认 |
+| 2 | **导出帧缺每人的 kp/scale**：`verdicts[]` 只有 bbox 与 ppe 结果，没有几何输入 | `web/js/app.js:1735-1748`、`docs/frame-schema.md:78-100` | 非主目标的 headBox/wristBox 无法离线重算，`headBoxScale`/`minMs` 扫描只能对主目标做；R13-1 必须先补导出字段 |
+| 3 | **PPE 归属没有「一人一物」约束**：检测框是全局列表，每个人都拿同一批框做中心点查询 | `web/js/ppe.js:74-84`、`web/js/app.js:1563-1565` | 两人靠近时一个人的安全帽中心可能落进另一个人的头部框，造成假 `worn`；R13-5 的 exclusive 归属就是为此 |
+| 4 | **`requirePositive` 的 `saw` 是整场 sticky**：只要全场任何一人任何时刻检出过一次正例，护栏对该类永久失效 | `web/js/ppe.js:156,173-179` | 类别名写错但偶尔误匹配时，会从「全场 unknown」直接翻成「全场 missing」；O5 的 `positiveWindowMs/minPositive` 用于收紧（R13-10） |
+
+---
+
+## 18. 两线共享依赖、合并顺序与待拍板事项
+
+### 18.1 合并顺序（契约先行，避免两条线各改一遍）
+
+1. **一次改导出契约**（合并 R12-1 + R13-1 + R13-3 的字段改动）：`pushLog()` 在多人时导出全部 `persons`（含 `kp/kp_world/scale/score`）、`verdicts[]` 增 `hands`/`track_uid` 与 ppe 状态（**几何统一从 `persons[]` 按 track 关联，不重复导出 kp**）、meta 增 `objects` 模型指纹。只加可选字段，schema 仍 `v0`；同步 `web/test/frame-io.mjs`、`autolabel.mjs`、`hardcase.js`、`docs/frame-schema.md`。
+2. **评估器分两步**：先在 `evaluate.mjs` 抽 `personsFromFrame()`/逐 track `replay()`（R12-1）；PPE 事件评估先独立为 `web/test/ppe-eval.mjs`（R13-1），跑通并稳定后再决定是否并入主报告，避免一次改动 253 项评估器单测。
+3. **跟踪器先加 `track_uid`、不改匹配**：R13-2 不改变 `track_id` 的分配与匹配逻辑，A/B 基线（慢放 72/810）不受影响；`maxLostMs` 在两份 safety profile 中统一回 1500 或写清差异理由。
+4. **参数与 profile**：`web/js/params.js` 新键默认关闭；`paramsHash` 必然变化，发布说明写清；profile 只写差分，拟合结果不要写进 `safety.json`。
+5. **采集一次拍摄覆盖两条线**：同一批素材同时标注动作/手势段与 PPE 段；`manifest.json` 增 `tasks:["pose","ppe"]`、`camera`、`subject`、`license`。
+
+### 18.2 冲突文件与分工
+
+| 共享面 | 姿态线改动 | 物体线改动 | 冲突文件 | 约定 |
+|---|---|---|---|---|
+| 评估器 | 逐 track replay、手势归属 | PPE 事件 recall/precision、objects 归属 | `web/test/evaluate.mjs` | 先合 R12-1 的抽象，再加 PPE 指标；同一人负责合并 |
+| 导出契约 | `persons` 全量、`verdicts[].hands` | `objects`/`ppe` 字段、`verdicts[].hands/track_uid` | `web/js/app.js` `pushLog()`、`docs/frame-schema.md` | 只增字段，schema 仍 `v0`；几何从 `persons[]` 关联，不重复存；多人口径写 meta |
+| 跟踪 | 逐 track 评估口径 | `track_uid`、PPE 计时 | `web/js/track.js`、`multi.js`、`ppe.js` | 先加 uid 不改匹配；A/B 复测用 `--rate 0.4` |
+| 参数 | `signals.track/hand/gesture`、`perception.multi` | `signals.ppe`、`perception.objects` | `web/js/params.js` | 分区编辑；新键默认关闭 |
+| Profile | `fitness-fit.json`、多人档 | `safety.json`（PPE 后端/类别） | `web/profiles/*.json` | 不要把拟合结果写进 `safety.json` |
+| 采集 | 动作/手势段、机位、subject | 安全帽/手套、光照、许可 | `docs/data-collection.md`、`manifest.json` | 同一天拍摄；清单先扩 schema 再加段类型 |
+| 测试 | `multi-test`、`eval-test` | `onnx-test`、`headless-ppe-onnx` | `web/test/*.mjs` | 共享 replay 夹具；新增用例分开命名 |
+| 准确率面板 | 12 手臂 + 8 手势 | PPE 单独报告 | `accuracy-report.mjs`、`accuracy.json` | 手势与 PPE 不共用同一个 `actions` 字段 |
+
+### 18.3 完成标志
+
+- 姿态线：24 个可标项（2 姿态 + 22 动作/手势/计数）从「0 个数字」变成带 n 与 Wilson 区间的实测值；多人评估能按 track 出数；实时与慢放的 ID 切换差 ≤3 个百分点；README/docs 不再自相矛盾。
+- 物体线：PPE 事件 recall/precision、unknown 弃权率、误报/小时按 target × 机位出数；ONNX 类别顺序在加载时校验；训练数据每类 n 达标；商用路径的许可结论明确。
+- 两线共同前提：**没有实拍数据就不写准确率**；所有「目标」值在报告里替换为实测值，未实测项显式标注。
+
+### 18.4 需要用户拍板
+
+| # | 问题 | 选项 | 影响 |
+|---|---|---|---|
+| D1 | 实拍优先级：先 12 手臂 + 2 计数，还是 24 项全量、手势单独一批？ | A 先动作；B 全量一次拍完；C 手势单独 | 影响 2 周排期与标注成本；22 个动作/手势 × 40 ≈ 880 段正例（姿态另算） |
+| D2 | 多人产品上限 3 还是 4？ | 3（默认）/ 4 | 3/4 人 ID 切换 8.9% vs 9.3%（无显著差异），但 4 人每帧多一次推理 |
+| D3 | 是否允许多人口径把 `MAX_LOG` 降到 6000 帧并导出全量 `persons`？ | 是 / 否 | 决定 R12-1 能否成立；否则多人评估只能做短片段 |
+| D4 | 个体校准默认开还是关？`--baseline` 是否改名 `--person-baseline`？ | 默认关 / 默认开；不改名（新增 `--person-baseline`）/ 改名 | 开会破坏「开箱即用」；改名会破坏现有 CI 脚本 |
+| D5 | 是否自训 person 检测器替代/补充姿态多人框？ | A 保持姿态 + 平铺；B 用物体检测的 `person` 类；C 独立 RT-DETR/person 检测器 | 夜景 TopK 召回 0.3%~4.2%，B/C 可能救远景，但增加延迟与许可审查 |
+| D6 | 是否现在上 WebGPU EP？ | 现在做 / 等 R13-6 模型定稿再做 | 有性能收益但验证面大 |
+| D7 | 是否接受 AGPL 依赖？ | 买 Ultralytics Enterprise / 换 Apache·BSD 重训 | 直接决定能否闭源商用 |
+| D8 | 是否允许跨 `track_id` 继承 PPE 计时（`track_uid` 的 `linkAcrossIds`）？ | 默认关闭 / 开启并审计 | 开启能减少事件被切碎，但有「把 A 的违规算给 B」的责任风险 |
+| D9 | 手套是否升级 violation？「班次」如何定义？ | 保持 suspect / 改 violation；8h / 12h；≤1 次/班次？ | 手小、遮挡多，升级会显著增加申诉；班次定义决定验收口径与样本量 |
+| D10 | 验收数据是否必须自有实拍？ | 是 / 允许开源数据做预验收 | 开源数据不能代表本项目机位；MOT17 非商用 |
+
+### 18.5 已拍板（2026-11-05）
+
+| 编号 | 决定 | 执行影响 |
+|---|---|---|
+| D1 | **C：动作优先，手势单独一批**。第一批 2 姿态 + 12 手臂 + 2 计数（2 人 × front/side）；第二批 8 手势（close 机位，1~2 人）；第三批多人/夜间实拍。 | R2 分两批交付；R7 不阻塞 R2 第一批；24 项全量的目标不变。 |
+| D3 | **是**。多人模式 `pushLog()` 导出全部 `persons`，`MAX_LOG=6000` 并写入 meta；单人模式维持 20000。 | R12-1 可开工；导出体积与评估样本量按 6000 帧上限设计。 |
+| D7 | **换 Apache/BSD 检测器**：主选 RTMDet（Apache-2.0，OpenMMLab），备选 torchvision SSDlite320（BSD-3）；YOLOv8n 仅作内部冒烟基线，不随产品分发；不购买 Ultralytics Enterprise。 | R13-6 先做输出格式抽象与 sidecar；每个权重许可逐个核对后才写进验收报告。 |
+
+### 18.6 进度记录（2026-11-05，首轮并行开工）
+
+| 编号 | 状态 | 落地 | 测试 |
+|---|---|---|---|
+| R12-1 | 🟡 代码✅ / 实拍⏳ | 多人导出全量 `persons`（kp/kp_world/scale）、`verdicts[]` 增 `track_uid`/`hands`、`MAX_LOG` 6000/20000 + meta；`evaluate.mjs` 逐 track replay、`label.track`、手势按 track 归属与次近人 margin | eval-test 270、multi-test 72 |
+| R12-8 | ✅ | README 版本状态/多人手部描述、`docs/signals.md`、frame-schema、eval.md | — |
+| R11-1 | 🟡 代码✅ / 数据⏳ | `prepare-ppe-dataset.py` 改读 `sources.json` 显式映射、`--strict` 缺映射退出、删硬编码 `HELMET_MAP`；全量数据未下载 | py_compile + CLI 冒烟 |
+| R11-3 | ✅ 代码 | `scripts/ppe-model-manifest.mjs`、sidecar 校验（labels 顺序/inputSize/numClasses/sha256）、`ppe_smoke.onnx.json` | onnx-test 27 |
+| R13-1 | 🟡 骨架✅ / 接入⏳ | `web/test/ppe-eval.mjs`：按 track 聚合事件、label.track 绑定、unknown 弃权、误报/小时、阈值退出码 | self-test 13 |
+| R13-2 | 🟡 部分 | `track_uid` 分配、`PpeMonitor` 按 uid 建键、旧数据回退；`linkAcrossIds` 未实现 | ppe-test 32 |
+| R13-10 | ✅ 代码 | `positiveWindowMs`/`minPositive`、`reason_code`（no_positive/config_mismatch/occluded） | ppe-test 32 |
+| R12-2 | ✅ 代码 | 逐 track 手势稳定器（`TrackShapeStabilizers`）、先归属后分类、多人 ROI 预算（`maxPersonsPerFrame`/`minScalePx`）、`assignHands` 的两道门（bbox 内 + 次近人 margin 0.15） | multi-test 98、logic-test 233 |
+| R13-3 | ✅ 代码 | `baseExportMeta().objects`（backend/model/inputSize/modelHash/labelsHash/manifestOk）、报告头打印、`--allow-model-change`、`accuracy-report` 透传 | eval-test 278 |
+| 集成 | ✅ | `requireManifest` 透传到 `createObjectDetector`、`pushLog` 导出 `reason_code`、新测试接入 `npm test` | 全量 **831 通过** |
+
+页面级回归（本机无头 Chrome，serve 8799）：`headless-check` 通过、`headless-multi` 19/19（首次冷启动曾因未跑满 20 帧失败，复跑通过）、`headless-ppe-onnx` 退出码 0。
+
+**仍未开工**：R2/R4/R7（需实拍）、R11-2（640 + 头部 ROI）、R13-4~R13-9、R12-3~R12-7。实拍与全量数据下载仍是两条线共同的阻塞项。
+R12-2 的遗留：ROI 预算按「人数」而非推理次数计（2 人各缺两侧最多 4 次/帧，PLAN 的 ≤2 次/帧与 fps 指标未实测）；margin 门对并肩/交叉会弃权偏多。
+
+---
+
+*文档维护：每完成一个阶段，更新本文件对应阶段的状态与实测数据，不另建文档。§13 的状态列随 R0~R10 推进更新；§16/§17 的 R12/R13 与 R11 状态随两线推进更新。*

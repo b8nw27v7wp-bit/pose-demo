@@ -53,7 +53,7 @@ node web/test/evaluate.mjs --dir eval-data
 
 按顺序：
 
-1. **按动作汇总**：TP / FN / FP、recall 与 precision（Wilson 95% 区间 + n）、计数误差（每 20 次的绝对误差）
+1. **按动作汇总**：TP / FN / FP、recall 与 precision（Wilson 95% 区间 + n）、计数误差（每 20 次的绝对误差）；多人素材按 `(track, 动作)` 出行
 2. **门槛**：配置了 `--min-recall` / `--min-precision` / `--max-count-err` / `--min-gesture-recall` / `--max-gesture-abstain` / `--max-loso-drop` / `--baseline` 时
 3. **留一人验证（LOSO）**（`--loso`）：每人留出一轮，报训练集 → 留出者的退化
 4. **帧率敏感性**（`--resample`）：重采样后的帧数与指标变化
@@ -103,14 +103,14 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 
 ```json
 {
-  "name": "squat-side-01",
+  "name": "clap-side-01",
   "camera": "side",
   "subject": "甲",
   "lighting": "顺光",
   "note": "自拍 · 侧面 · 3 米",
   "segments": [
     { "action": "stand",  "startSec": 0.0,  "endSec": 2.0 },
-    { "action": "squat",  "startSec": 2.1,  "endSec": 5.0, "count": 3, "tol": 0 },
+    { "action": "clap",   "startSec": 2.1,  "endSec": 5.0, "count": 3, "tol": 0 },
     { "action": "stand",  "startSec": 5.2,  "endSec": 7.0 },
     { "action": "armRaised", "startFrame": 70, "endFrame": 92 },
     { "action": "!onHips", "startSec": 7.5, "endSec": 9.0 },
@@ -129,16 +129,42 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 | `count` | 仅计数类：这段时间内**期望**完成几次；`!计数` 反例期望 0 次 |
 | `tol` | 仅计数类：允许误差，正例默认 1；反例默认 0 |
 | `camera` / `subject` / `lighting` / `note` | 可选。报告逐段回显；`camera`/`subject` 是后续分组统计与留一人验证的键 |
+| `track` | 可选。多人素材指定这段属于哪个 track（**优先 `track_uid`**，跨 id 稳定；找不到再按 `track_id`）。手势段同样支持。缺省时取段起点处**面积最大的主目标** |
 
 三种时间写法按 `startSec` → `start` → `startFrame` 的优先级取。
+
+### 多人素材（逐 track 评估）
+
+多人导出（`meta.export_mode = "multi"`）的每帧 `persons[]` 含全部判定人员，评估器会：
+
+- 按 `track_id` 各建一套 `SignalEngine/ActionEngine`（与页面 `PersonPipelines` 同一套逻辑，
+  缺席超过 `gapMs=1000ms` 重建状态机），逐帧用 `assignHands()` 重建手部归属；
+- 每个 label 段单独解析 `track`：**uid 优先、再按 `track_id`**（同一份数据里两套 id 空间
+  都从 1 起，混写时请统一用 uid）；不给就取段起点面积最大的主目标，写了不存在的 track
+  会明确报错（不会静默退回主目标）；
+- 汇总表按 `(track, 动作)` 出行，每行带自己的 n；报告里写 `#2 waving` 这种形式；
+- 抖动统计（`activity`）逐 track 各数一遍再相加，姿态混淆矩阵也按段的 `track` 取预测——
+  不再用「每帧面积最大的主目标」，否则主目标一换人就会把两个人的状态拼成一条；
+- 手势归属改用「手框中心落在哪个 person bbox 内 + 次近人 margin ≥ 0.15×scale」：
+  两人框重叠、手心离两人中心差不多近时判为未归属（弃权），不硬分给某个人。
+
+```jsonc
+{ "action": "waving", "track": 2, "startSec": 1.0, "endSec": 3.0 }
+{ "action": "!waving", "track": 3, "startSec": 1.0, "endSec": 3.0 }
+{ "action": "gesture", "track": 2, "hand": "L", "shape": "fist", "startSec": 1.0, "endSec": 3.0 }
+```
+
+旧单人导出（每帧只有 1 个 person、只有 1 个 `track_id`）仍走旧路径：一个引擎、整帧 hands、
+不做 gap 重置，指标与段判定与之前逐位一致。多人导出的帧数上限是 **6000**（单人 20000），
+评估长素材时要按 6000 帧切片。
 
 ### action 取值
 
 | 类别 | 取值 |
 |---|---|
-| 姿态 | `stand` / `sit` / `squat_static` / `lying` |
+| 姿态 | `stand` / `sit`（`squat_static` / `lying` 已下线，写了会被 `parseSegment` 拒绝）|
 | 手臂 | `armRaised` / `bothHandsUp` / `waving` / `crossed` / `onHips` / `armsOpen` / `handAtHead` / `reaching` / `carrying` / `pointing` / `armFront` / `armSide` |
-| 计数 | `squat` / `pushup` / `clap` / `grasp` |
+| 计数 | `clap` / `grasp`（`squat` / `pushup` 已下线）|
 | 手势 | `gesture` —— 另给 `hand`（`L` / `R` / `any`）与 `shape`（`fist` / `open` / `victory` / `pointing` / `thumbs_up` / `ok` / `gun` / `rock`） |
 | 复合反例 | `none` —— 姿态和手臂都不得出现（人不在场 / 完全无动作） |
 | 手臂反例 | `noArm` —— 姿态不限，但不得出现任何手臂动作 |
@@ -162,7 +188,7 @@ recall/precision，下一步给段加 `"side":"L"` 并让 `evaluate.mjs` 读逐�
 | 站着但没叉腰 | `{"action":"!onHips", "startSec":..,"endSec":..}` | 只否定叉腰；站立本身不算错误 |
 | 站着手臂自然下垂 | `{"action":"noArm", ...}` | 姿态任意，但不能有任何手臂动作 |
 | 这段时间什么都没做（人不在场/静止） | `{"action":"none", ...}` | **注意**：站着会被判成 `stand`，`none` 段必然失败。它适合空镜/无人 |
-| 坐下过程中不许计深蹲 | `{"action":"!squat", ...}` | 计数反例：期望 0 次，多计一次就是 1 个 FP |
+| 挥手时不许计鼓掌 | `{"action":"!clap", ...}` | 计数反例：期望 0 次，多计一次就是 1 个 FP |
 | 站立时乱计数也要算 | 标 `none` 段 | `none` 窗口内的计数增量会让该段失败，并归到对应动作的 FP |
 
 `none` 与 `noArm` 的差别：`noArm` 不把站立/坐下当成错误，也不追究计数；`none` 什么都不允许，并把窗口内的计数误报算进去。
@@ -183,8 +209,10 @@ recall/precision，下一步给段加 `"side":"L"` 并让 `evaluate.mjs` 读逐�
 - **分母只算有可用判定的帧**：`unknown`、手掌侧对（`orient.facing === "edge"`）、手未检出、手不在目标人框内的帧都是**弃权**，
   不算对也不算错，报告里单列计数与弃权率。弃权率的分母是「已判定帧（正例段 + 反例段）+ 弃权帧」，
   反例段里正常判出「不是目标手势」的帧不会被漏掉。这是刻意的：手势分类在侧对时本来就不可信。
-- 手-人归属：手 bbox 中心落在 `persons[0]`（页面导出的目标人）bbox 内、各边留 5% 余量，才算这个人的手。
-  当前导出每条记录只有目标人；多人素材请等导出侧支持多人后再谈。
+- 手-人归属：手 bbox 中心落在某个 person bbox 内、各边留 5% 余量，才算这个人的手；
+  两个 bbox 都命中时按手到各自 bbox 中心的距离，次近人必须比最近人远出 ≥0.15×scale，
+  否则判为未归属（弃权）。段写 `track` 时只看该 track 的手；缺省看主目标（面积最大者）。
+  旧导出每帧只有目标人，结果与旧版一致。
 - `none` 段窗口里判定出的手势记为该手势的 **FP**，但不会让 `none` 段本身失败。
 
 ## 难例回流（页面「判错了」按钮）
@@ -275,7 +303,7 @@ labels 里写 `camera` / `subject`，报告会分别给出：
 关键信号按动作选：姿态看 `uprightness / knee / leg_vertical`，抬臂看 `elev_* / elev_torso_*`，
 抱臂/鼓掌看 `hands_close`，叉腰看 `reach_*`。完整映射见 `evaluate.mjs` 的 `SIGNALS_FOR`。
 
-> 导出帧的 `actions.unreliable` 记录逐帧弃权原因（低置信 / 外推 / 换侧 / 骨骼异常 / 角度坏点，
+> 导出帧的 `actions.unreliable` 记录逐帧弃权原因（低置信 / 外推 / 骨骼异常 / 角度坏点，
 > 见 `docs/signals.md` §三·九）。**报告不按它筛选**——报告比的是「规则最终判定 vs 标注」。
 > 排查失败段时打开 JSONL 对照这一列，用来区分「动作确实没做出来」和「这一帧被判为不可靠」。
 
@@ -304,10 +332,12 @@ node web/test/evaluate.mjs --dir eval-data --fit --report eval-data/report.md
 
 报告最后一节是**按标注动作段分组**的信号分位。举例：
 
-- 深蹲下阈 `down`：看 `squat_static/knee` 的 **P95**（蹲到底那段里最高的膝角；
-  `down` 是「低于它才算蹲下」，取这段的上沿才能覆盖浅蹲）
-- 深蹲上阈 `up`：看 `stand/knee` 的 **P5**（站直时的最低角度；`up` 是「高于它才算站起」）
-- 两个阈值不要贴着分位写，各留 10~15° 余量，否则滤波器稍慢一点就漏计
+- 鼓掌下阈 `down`：看 `clap_baseline/hands_close` 的 **P5**（两手合拢时的腕距/躯干长；
+  `down` 是「低于它才算合手」）
+- 鼓掌上阈 `up`：看 `clap_baseline/hands_close` 的 **P95**（张开时的腕距比；
+  `up` 是「高于它才算张开」）
+- 两个阈值不要贴着分位写，按比例留 10% 余量，否则滤波器稍慢一点就漏计
+- 深蹲/俯卧撑的阈值拟合已随动作下线（`actions.reps.squat|pushup` 不再存在）
 
 拟合出来的值写进 profile（`web/profiles/*.json` 的 `params` 段），不要改源码。
 
@@ -328,14 +358,10 @@ node web/test/evaluate.mjs --dir eval-data --fit --fit-out /tmp/fitness-fit.json
 | 目标 | 来源 | 规则 |
 |---|---|---|
 | `stand.kneeGt` / `sit.kneeGt` | 对应 `knee.p5` | P5 − margin |
-| `squat.kneeLt` / `sit.kneeLt` / `lying.uprightnessLt` / `sit.legVerticalLt` | 对应 `p95` | P95 + margin |
-| `stand/squat/sit.uprightnessGt`、`stand.legVerticalGt`、`squat.legVerticalGt` | 对应 `p5` | P5 − margin |
-| `reps.squat.down` | `squat_baseline`（或 `squat_static`）`/knee.p95` | P95 + margin |
-| `reps.squat.up` | `stand/knee.p5` | P5 − margin |
-| `reps.pushup.down/up` | `pushup_baseline/elbow.p5/p95` | P5 − / P95 + margin（up 夹在 175°） |
+| `sit.kneeLt` / `sit.legVerticalLt` | 对应 `p95` | P95 + margin |
+| `stand/sit.uprightnessGt`、`stand.legVerticalGt` | 对应 `p5` | P5 − margin |
 | `reps.clap.down/up` | `clap_baseline/hands_close.p5/p95` | P5 − / P95 + margin |
-| `gates.squat.*` | 同 `stand` 的 `leg_vertical` / `uprightness` | P5 − margin |
-| `gates.pushup.uprightnessLt` | `pushup_baseline/uprightness.p95` | P95 + margin |
+| ~~`reps.squat.*` / `reps.pushup.*` / `gates.*`~~ | — | 动作已下线，不再拟合 |
 | `signals.arm.elevTorso.raised` | `armRaised/elev_torso_L/R.p95` | 取两侧**较低** P95 + margin（上限型） |
 | `signals.arm.extend.minReach` | `reaching/reach_L/R.p5` | 取两侧**较高** P5 − margin（下限型） |
 
@@ -414,6 +440,13 @@ node web/test/evaluate.mjs --dir eval-data --baseline base.json --max-drop 0.05
 - `--baseline` 读的是 `--json` 导出的报告（需要 `summary` 数组）。
 - **别把基线文件放进 `--dir` 目录**：目录扫描会把任何 `.json` 当成帧文件，空文件会直接报错。
 - 基线只比较 recall / precision 的下降；计数误差（每 20 次）用 `--max-count-err` 的绝对上限。
+- **多人素材按 (track, action) 比对**：baseline、灵敏度扫描、A/B 对比与 LOSO 的每一行都
+  带 `track`，同名动作的不同 track 不会互相覆盖；只按动作建键会让后一条 track 盖掉前一条，
+  回归检测会假绿（旧报告没有 `track` 字段时仍按动作比对）。
+- **跨模型基线**：数据的 `meta.objects.modelHash` 与 baseline 报告里的不同时，默认拒绝比较并报错；
+  确认要比较（例如只改了阈值）才加 `--allow-model-change`。旧报告没有 `objects` 段时不做判断。
+- 报告头会打印 `物体模型：backend/model @inputSize sha256:… labels:…`；同一批素材混用两套物体模型
+  时给出警告，PPE 指标不能跨模型合并。
 
 ## profile A/B 对比
 
@@ -430,7 +463,7 @@ node web/test/evaluate.mjs --dir eval-data \
 ## 灵敏度扫描
 
 ```bash
-node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.squat.down
+node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.clap.down
 node web/test/evaluate.mjs --dir eval-data --sweep actions.posture.stand.kneeGt --sweep-actions stand
 ```
 
@@ -444,11 +477,13 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.posture.stand.kneeGt 
 
 - 评估复算是**离线**的：滤波与短窗状态跨帧保留，但如果导出时中途「停止」过，滤波会重置，起止时间会偏；
   录素材时一口气录完，中间别停。
-- `replay()` 依赖导出里的 `persons[0].kp`（像素坐标）、`kp_world`（3D）与 `hands`（手部开合）。
+- `replay()` 依赖导出里的 `persons[].kp`（像素坐标）、`kp_world`（3D）与 `hands`（手部开合）；
+  多人导出按 `track_id` 逐人回放（见上文「多人素材」）。
   旧导出若没有 `hands`，手部动作按页面「手部未加载」处理（`reaching`/`carrying`/`pointing`/`grasp` 恒为 false）；
   若没有 `kp_world`，角度/直立度走 2D，与页面的 3D 默认不是同一套信号。报告头会回显数据的模型档位，
   但**不会**统计每段素材的 3D 覆盖率——混用新旧导出时要自己确认。
-- 导出上限是 20000 帧（`MAX_LOG`）；更长的素材尾部会被按批丢弃（页面会显示丢弃帧数），recall 会失真，请分段录。
+- 导出上限按模式取：单人 20000 帧、多人 6000 帧（`multi.js` 的 `LOG_LIMITS`，meta 的 `log_limit`）；
+  更长的素材尾部会被按批丢弃（页面会显示丢弃帧数），recall 会失真，请分段录。
 - `startSec/endSec` 只在**单次播放**的素材上唯一；循环/拖回导致 `video_time` 回绕时，评估器会报错并要求改用 `start/end`（ts）。
 - 合成样例（`make-sample.mjs`）只验证链路，不构成任何准确率结论。
 

@@ -698,10 +698,10 @@ export class SignalEngine {
     const pick = (a, b) => (Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2
       : Number.isFinite(a) ? a : b);
 
-    // 计数用的膝角/肘角：只在「角度有效」的一侧里挑可见性最高的；选中的那侧无效就退回另一侧
+    // 膝角/肘角：只在「角度有效」的一侧里挑可见性最高的；选中的那侧无效就退回另一侧。
     // 带滞回：上一帧选中的一侧仍然有效时，另一侧要明显更可信（≥ sideHysteresis）才换。
-    // 不设滞回时，两侧可见性在 0.7/0.72 之间抖动会让膝角在两条腿之间来回跳；
-    // 计数层拿到的是两条腿拼起来的角度序列，容易多数或漏数（见 actions.js 的换侧中止）。
+    // 不设滞回时，两侧可见性在 0.7/0.72 之间抖动会让角度在两条腿之间来回跳。
+    // （深蹲/俯卧撑计数下线后，换侧不再触发「中止半程」；选侧只影响后续信号。）
     const pickSide = (l, r, visL, visR, prevSide = null) => {
       const cand = [
         { side: 'L', v: l, vis: visL },

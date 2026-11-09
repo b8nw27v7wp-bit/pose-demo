@@ -62,10 +62,10 @@
 
 | 类别 | 动作 | 标注 action | 备注 |
 |---|---|---|---|
-| 姿态 | 站立 / 坐 / 下蹲 / 躺卧 | `stand` / `sit` / `squat_static` / `lying` | 每个姿态保持 2 s 以上 |
+| 姿态 | 站立 / 坐 | `stand` / `sit` | 每个姿态保持 2 s 以上。躺卧/下蹲已下线（需要膝踝可见+全身机位）|
 | 手臂 | 举手 / 挥手 / 抱臂 / 叉腰 / 张开双臂 / 双手高举 / 手在头部 / 前平举 / 侧平举 | `armRaised` / `waving` / `crossed` / `onHips` / `armsOpen` / `bothHandsUp` / `handAtHead` / `armFront` / `armSide` | 每个动作做 2~3 s；前/侧平举需要 world 坐标（3D 方位角） |
 | 手臂（需手部模型） | 伸手 / 持物 / 指向 | `reaching` / `carrying` / `pointing` | 手型要对：伸手=`open`、指向=`pointing/gun`、持物=`fist/ok`；指向还需要 3D 方位角。手部关掉、未检出或侧对时恒为 false |
-| 计数 | 深蹲 / 俯卧撑 / 鼓掌 / 拿取 | `squat` / `pushup` / `clap` / `grasp` | 一次一段，段内 `count` 写实际次数；拿取需要手部模型（伸手→合手） |
+| 计数 | 鼓掌 / 拿取 | `clap` / `grasp` | 一次一段，段内 `count` 写实际次数；拿取需要手部模型（伸手→合手）。深蹲/俯卧撑已下线 |
 | 手势（需手部模型） | 握拳 / 张开 / 剪刀手 / 指方向 / 竖拇指 / OK / 手枪 / 摇滚 | `gesture` + `hand` + `shape`（见下） | 每只手单独标；手掌侧对镜头（`orient.facing === "edge"`）的帧不要标，评估器会把它们算作弃权 |
 
 手势段的写法（每次只标**一只手**、一种手势，保持 2~3 s）：
@@ -95,8 +95,7 @@
 | 手在头部 | 摸头发 / 扶眼镜 / 走路手臂前摆 | `!handAtHead` |
 | 叉腰 | 手插口袋 / 手自然下垂 | `!onHips` |
 | 抱臂 | 抱文件夹 / 双手交叉放在身前 | `!crossed` |
-| 鼓掌 | 双手合十 / 抱臂 | `!clap` |
-| 深蹲 | 坐下 / 弯腰捡东西 / 单膝跪地 | `!squat` |
+| 鼓掌 | 双手合十 / 抱臂 / 挥手 / 举着东西晃 / 整理衣领 | `!clap` |
 | 挥手 | 走路摆臂 / 整理头发 | `!waving` |
 | 伸手 | 手没伸出但握着东西 | `!reaching` |
 | 持物 | 空手自然下垂 | `!carrying` |
@@ -149,7 +148,7 @@ eval-data/
       "lighting": "front",                     // front|back|low|side|mixed|unknown
       "model": "full",                         // full|heavy|lite
       "fps": 30,
-      "note": "深蹲 12 次，含 3 次半蹲变形"
+      "note": "鼓掌 12 次，含 3 次双手未完全合拢"
     }
   ]
 }

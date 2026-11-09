@@ -141,7 +141,10 @@ export async function createObjectDetector(opts = {}) {
 export function objectInfo() {
   if (backend === 'onnx') {
     if (onnxMod) return onnxMod.onnxInfo();
-    return { ready: false, backend: 'onnx', key: '', error: lastError, delegate: null };
+    return {
+      ready: false, backend: 'onnx', key: '', error: lastError, delegate: null,
+      modelHash: null, manifest: { ok: false, required: true },
+    };
   }
   return { ready: !!detector, backend: 'mediapipe', key: currentKey, error: lastError, delegate: usedDelegate };
 }

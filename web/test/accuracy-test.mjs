@@ -61,6 +61,22 @@ const empty = buildAccuracyReport({ summary: [], clips: [], totalFrames: 0 });
 check('空素材 → 全部 null 且注明',
   Object.values(empty.actions).every((v) => v === null) && /没有可评估/.test(empty.source.note));
 
+// 多人素材：同一动作每个 track 一行。必须池化 TP/FN/FP，不能让最后一条覆盖前一条。
+const multiRep = buildAccuracyReport({
+  ...evalReport,
+  summary: [
+    { action: 'armRaised', track: 0, tp: 10, fn: 10, fp: 0, nRecall: 20, nPrecision: 10 },
+    { action: 'armRaised', track: 1, tp: 20, fn: 0, fp: 5, nRecall: 20, nPrecision: 25 },
+  ],
+});
+const pooled = multiRep.actions.arm_raised;
+check('多 track 同行合并（池化，不是最后一条覆盖）',
+  pooled.tp === 30 && pooled.fn === 10 && pooled.fp === 5 && pooled.nRecall === 40 && pooled.nPrecision === 35,
+  JSON.stringify(pooled));
+check('池化后按合并样本重算 recall/precision 与 CI',
+  pooled.recall === 0.75 && pooled.precision === 0.857 && Array.isArray(pooled.recallCI),
+  `${pooled.recall}/${pooled.precision}`);
+
 // —— 2. 界面文案 ——
 console.log('\n[2] 文案与档位');
 const row = rep.actions.arm_raised;

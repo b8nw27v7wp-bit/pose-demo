@@ -3,9 +3,8 @@ import {
   createEstimator, detectVideo, toPersons, closeEstimator,
   createMultiEstimator, detectMultiImage, detectMultiTiled, closeMultiEstimator, multiEstimatorInfo,
 } from './pose.js';
-import { createHandEstimator, detectHandsVideo, detectHandsNearWrists, toHands, classifyHand, handsReady, closeHandEstimator } from './hands.js';
+import { createHandEstimator, detectHandsVideo, detectHandsNearWrists, toHands, handsReady, closeHandEstimator } from './hands.js';
 import { wristsToRetry } from './handroi.js';
-import { HandShapeStabilizer, SHAPE_LABELS } from './handshape.js';
 import { SignalEngine } from './signals.js';
 import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from './actions.js';
 import { explainArmActions, DEFAULT_HINT } from './armhint.js';
@@ -14,7 +13,10 @@ import { resolveParams, profileParams, profileName as profileNameOf, paramsHash 
 import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS, HARDCASE_BEFORE_MS } from './hardcase.js';
 import { drawSkeleton, drawHand, drawBoxes, drawTrackLabel, clearCanvas } from './draw.js';
 import { Tracker, area } from './track.js';
-import { PersonPipelines, assignHands } from './multi.js';
+import {
+  PersonPipelines, assignHands, logLimitFor,
+  TrackShapeStabilizers, classifyHandsByTrack, bindClassifiedHands, pickRoiPersons,
+} from './multi.js';
 import { PpeMonitor } from './ppe.js';
 import {
   createObjectDetector, detectObjects, closeObjectDetector, objectInfo,
@@ -30,7 +32,6 @@ const canvas = $('overlay');
 const ctx = canvas.getContext('2d');
 const stage = $('stage');
 const placeholder = $('placeholder');
-const spark = $('spark');
 const player = $('player');
 const seek = $('seek');
 
@@ -45,12 +46,19 @@ const PROFILES = [
   { id: 'safety', label: '安全合规', url: '/web/profiles/safety.json' },
 ];
 
-const MAX_LOG = 20000;   // 评估需要整段素材，截断会让 recall 失真；20k 帧 ≈ 11 分钟 @30fps
-// 溢出时按块丢弃（一次 splice 掉 10%），而不是每帧 shift()。
+// 帧数上限按导出模式取：单人 20000（整段素材，截断会让 recall 失真），
+// 多人 6000（每帧含全部 persons 的关键点，体积随人数线性增长；PLAN §18.5 D3）。
+// 模式在运行时切换（工具栏），所以上限要动态取，不能只算一次。
+const exportMulti = () => multiOn && multiReady;
+// 本段记录使用的导出模式：录制期间只升不降，Stop 释放模型后不再跟着变。
+// 否则「多人录完 → 停止 → 导出」会把实际按 6000 截断的帧标成单人 20000，
+// 评估器据此判断「帧被截断是否正常」时就会误判。
+let logMode = 'single';
+const logLimit = () => logLimitFor(logMode === 'multi');
+// 溢出时按块丢弃（一次 splice 掉上限的 10%），而不是每帧 shift()。
 // shift() 在 20000 元素上是每帧 O(n) 的整体复制（实测 57~69 µs/帧），
 // 从 600 提到 20000 时这个开销从"免费"变成了实打实的每帧成本。
-const LOG_TRIM = Math.round(MAX_LOG * 0.1);
-const SPARK_SPAN_MS = 5000;
+const logTrim = () => Math.round(logLimit() * 0.1);
 
 // 推理帧率上限：默认 30fps。摄像头 30fps + rAF 60Hz 会对同一帧反复推理，白烧 CPU/GPU；
 // 但 15fps 在 25/30fps 素材上会丢掉约一半帧（ID 切换被放大，见 docs/multi-and-objects.md）。
@@ -102,14 +110,11 @@ let lastObjects = [];
 let lastVerdicts = [];
 
 
-// 手势稳定器：左右手各一个，互不影响。streak/keepMs 从 params 读，profile 才能调
+// 手势稳定器：**按 track_id 各一套** L/R/U。streak 是连续命中计数，全局一套时
+// A 的手势会推着 B 的状态走（PLAN §16.3 R12-2）；单人道固定用 track 0，行为不变。
+// streak/keepMs 从 params 读，profile 才能调。
 function makeShapeStable(params) {
-  const cfg = resolveParams(params).signals.gesture;
-  return {
-    L: new HandShapeStabilizer(cfg),
-    R: new HandShapeStabilizer(cfg),
-    U: new HandShapeStabilizer(cfg),
-  };
+  return new TrackShapeStabilizers(resolveParams(params).signals.gesture);
 }
 let shapeStable = makeShapeStable(activeParams);
 
@@ -162,10 +167,8 @@ function applyParams(params, name = 'default') {
   $('chkMulti').checked = multiOn;
   $('chkObjects').checked = objectOn;
   $('multiSel').hidden = !multiOn;
-  squatCfg = resolved.actions.reps.squat;
   handRoiCfg = resolved.signals.hand.roi;
   handVisMin = resolved.signals.visMin;
-  updateSparkLegend();
   resetRuntime();
   // 阈值变了，准确率报告可能过期：重算提示文案里的参数指纹比对
   refreshAccuracy();
@@ -280,11 +283,6 @@ async function initProfile() {
   }
 }
 
-function updateSparkLegend() {
-  const el = $('sparkThresh');
-  if (el) el.textContent = `下阈 ${squatCfg.down}° / 上阈 ${squatCfg.up}°`;
-}
-
 let estimatorReady = false;
 let handReady = false;
 // 动作准确率：只来自标注数据上的评估报告（web/accuracy.json，npm run accuracy 生成）。
@@ -298,7 +296,6 @@ let lastInferTs = 0;
 let lastUiTs = 0;
 let lastResult = null;
 let frameLog = [];
-let sparkSamples = [];
 let fps = 0;
 let fpsFrames = 0;
 let fpsWindowTs = 0;
@@ -315,11 +312,10 @@ let cameraDevices = [];         // 当前可用的 videoinput
 let customProfileUrl = null;    // ?profile= 或上次保存的自定义 profile
 let lastProfileId = 'default';  // 最近一次成功应用的 profile（失败时回退用）
 let activeParamsHash = paramsHash({});
-let squatCfg = resolveParams({}).actions.reps.squat;
 // 腕部 ROI 补检参数：每帧都要用，不能在主循环里 deepMerge 一次参数树
 let handRoiCfg = resolveParams({}).signals.hand.roi;
 let handVisMin = resolveParams({}).signals.visMin;
-let logDropped = 0;             // 超过 MAX_LOG 被裁掉的帧数（会话摘要要如实显示）
+let logDropped = 0;             // 超过当前模式上限被裁掉的帧数（会话摘要要如实显示）
 let seeking = false;            // 正在拖进度条：syncPlayer 不要覆盖用户拖动
 let resumeAfterSeek = false;
 let dragDepth = 0;
@@ -591,6 +587,7 @@ async function ensureObjectDetector() {
         model: cfg.model, delegate: cfg.delegate,
         maxResults: cfg.maxResults, scoreThreshold: cfg.scoreThreshold,
         labels: cfg.labels, inputSize: cfg.inputSize, iouThreshold: cfg.iouThreshold,
+        requireManifest: cfg.requireManifest,
         runningMode: 'VIDEO',
       });
       if (gen !== objectGen) {
@@ -619,7 +616,6 @@ function resetRuntime() {
   lastVerdicts = [];
   lastObjects = [];
   frameLog = [];
-  sparkSamples = [];
   lastVideoTime = -1;
   lastObjectTs = 0;
   for (const k of Object.keys(stageMs)) stageMs[k] = 0;
@@ -630,11 +626,13 @@ function resetRuntime() {
   resumeAfterSeek = false;
   lastInferTs = 0;
   handFails = 0;
-  for (const k of Object.keys(shapeStable)) shapeStable[k].reset();
+  // 新的一段记录：按当前判定路径定模式（之后只升不降，见 logMode 的说明）
+  logMode = exportMulti() ? 'multi' : 'single';
+  shapeStable.reset();
   // 引擎和计数都重置了，上一帧的判定结果就不再属于这套参数/输入：
   // 不清掉的话，暂停中的视频或切换 profile 后面板会继续显示旧结论。
   lastResult = null;
-  renderReps({ squat: 0, pushup: 0, clap: 0, grasp: 0 });
+  renderReps({ clap: 0, grasp: 0 });
   updateUI();
 }
 
@@ -919,7 +917,7 @@ async function useVideoFile(file) {
 // 单张图片没有时间窗，而姿态/手臂判定里的 Hold、streak 都要求「持续了多久」。
 // 只判一帧会全部输出 false（看起来像「识别不出来」）。这里把同一帧在信号层/动作层
 // 重复喂 12 次（合成 100ms 步长）让它们收敛，再显示结果。
-// 需要运动的动作（挥手、深蹲/俯卧撑计数）在单张图上本来就不适用，不会凭空出现。
+// 需要运动的动作（挥手、鼓掌/拿取计数）在单张图上本来就不适用，不会凭空出现。
 const STILL_SETTLE_FRAMES = 12;
 let photoUrl = null;
 
@@ -940,17 +938,22 @@ function clearPhoto() {
   }
 }
 
-/** 手势分类 + 去抖：实时与静态两条路径共用 */
-function classifyHands(list, ts) {
-  return list.map((hd) => {
-    const cls = classifyHand(hd.kp);
-    // 手势去抖：连续 N 帧命中才切换，否则「张开↔剪刀手」会来回闪
-    const stable = shapeStable[hd.handedness === 'Left' ? 'L'
-      : hd.handedness === 'Right' ? 'R' : 'U'].update(cls.shape, ts);
-    // 中文名只从 handshape.js 的 SHAPE_LABELS 来（之前 app.js 又抄了一份 SHAPE_ZH）
-    const label = SHAPE_LABELS[stable] || '—';
-    return { ...hd, cls: { ...cls, shape: stable, label, raw: cls.shape } };
-  });
+/**
+ * 手势分类 + 去抖：实时与静态两条路径共用。
+ * **必须在 assignHands() 之后调用**（顺序反了就会用错人的稳定器，见 PLAN §16.3 R12-2）。
+ * 单人道 ownerOf 恒为 0（与旧版全局一套稳定器逐位一致）；多人的未归属手不做去抖——
+ * 它们不进任何人的动作层，只是整帧绘制/导出用。
+ */
+function classifyAndBind(rawHands, ts, assigned, single) {
+  const ownerByHand = new Map();
+  for (const [trackId, slot] of assigned) {
+    for (const hd of slot.list || []) ownerByHand.set(hd, trackId);
+  }
+  const ownerOf = single
+    ? () => 0
+    : (hd) => (ownerByHand.has(hd) ? ownerByHand.get(hd) : null);
+  const cls = classifyHandsByTrack(rawHands, ts, shapeStable, ownerOf);
+  return { hands: cls.list, handsByTrack: bindClassifiedHands(assigned, cls.byOriginal) };
 }
 
 /**
@@ -1075,8 +1078,13 @@ function handsOfTarget(list, target) {
   });
 }
 
-/** 整帧漏检的手用姿态腕点补检（实时与静态共用） */
-function completeHands(fullHands, target, source, w, h) {
+const nearHand = (a, b) => Math.hypot(a.kp[0][0] - b.kp[0][0], a.kp[0][1] - b.kp[0][1]) < 8;
+
+/**
+ * 整帧漏检的手用姿态腕点补检（实时与静态共用）。
+ * ownerTrackId 非空时给补检结果打上归属，assignHands 会据此只分给这个人。
+ */
+function completeHands(fullHands, target, source, w, h, ownerTrackId = null) {
   if (!target || !handsReady('IMAGE')) return fullHands;
   // 注意 handedness 是 'Left'/'Right'，腕点侧是 'L'/'R'，必须换算后再比较，
   // 否则每一侧都会被当成「没检出」而重复补检（多人画面上会多出两只手）。
@@ -1088,9 +1096,37 @@ function completeHands(fullHands, target, source, w, h) {
     { side: 'R', x: target.kp[6][0], y: target.kp[6][1], vis: target.kp[6][2], scale: target.scale },
   ];
   const retry = wristsToRetry(wrists, have, handVisMin);
-  return retry.length
-    ? fullHands.concat(detectHandsNearWrists(source, retry, handRoiCfg, { w, h }, wrists))
-    : fullHands;
+  if (!retry.length) return fullHands;
+  const added = detectHandsNearWrists(source, retry, handRoiCfg, { w, h }, wrists);
+  if (ownerTrackId != null) for (const hd of added) hd.owner_track_id = ownerTrackId;
+  return fullHands.concat(added);
+}
+
+/**
+ * 多人：按预算给面积最大的前 N 人做腕部 ROI 补检（主目标优先）。
+ * 预算 = min(perception.multi.maxPersons, signals.hand.roi.maxPersonsPerFrame)；
+ * scale < minScalePx 的人跳过（远景裁太小，放大也没信息，属正常跳过而非错误）。
+ * 结果按「腕点距离 < 8px 视为同一只手」并回整帧列表，同一个 ROI 结果不会归属给两个人
+ * （每条结果带 owner_track_id，见 assignHands）。
+ */
+function completeHandsMulti(fullHands, judged, target, source, w, h) {
+  if (!handsReady('IMAGE')) return fullHands;
+  const { picked } = pickRoiPersons(judged, target, {
+    maxPersons: multiCfg.maxPersons,
+    maxPersonsPerFrame: handRoiCfg.maxPersonsPerFrame,
+    minScalePx: handRoiCfg.minScalePx,
+  });
+  // 「已检出」必须用与最终归属同一套判据（assignHands），否则会出现
+  // 「补检时以为 A 已有这只手、归属时又判给别人」→ A 这一侧既没有手也没补检。
+  // 先按整帧归属一次，直接取每个人的槽位；ROI 结果按 owner_track_id 并回。
+  const preAssigned = assignHands(judged, fullHands);
+  for (const person of picked) {
+    const own = preAssigned.get(person.track_id)?.list || [];
+    for (const hd of completeHands(own, person, source, w, h, person.track_id)) {
+      if (!fullHands.some((x) => nearHand(x, hd))) fullHands.push(hd);
+    }
+  }
+  return fullHands;
 }
 
 /** 单张图片：推理一次，然后在信号/动作层收敛后绘制 */
@@ -1125,16 +1161,13 @@ async function analyzeStill(img) {
   let rawHands = [];
   if (show.hands && handReady) {
     try { rawHands = toHands(detectHandsVideo(img, ts), w, h); } catch { /* 手部失败不影响姿态 */ }
-    // 先按目标人筛，再补检：否则「整帧检出了旁边那个人的左右手」会让补检以为目标人已经齐全
-    const near = (a, b) => Math.hypot(a.kp[0][0] - b.kp[0][0], a.kp[0][1] - b.kp[0][1]) < 8;
-    const own = completeHands(handsOfTarget(rawHands, target), target, img, w, h);
     if (multiOn) {
-      // 多人：补检只针对主目标，结果并回整帧手部列表，再按人归属
-      for (const hd of own) if (!rawHands.some((x) => near(x, hd))) rawHands.push(hd);
+      // 多人：按预算给前 N 人（主目标优先）补检，结果并回整帧列表再按人归属
+      completeHandsMulti(rawHands, judged, target, img, w, h);
     } else {
-      // 单人：只保留主目标的手（导出/绘制/判定都只该有他的）。以前把别人的手留在这里，
-      // lastResult/导出会把旁边那个人的手算进目标人。
-      rawHands = own;
+      // 单人：先按目标人筛，再补检；只保留主目标的手（导出/绘制/判定都只该有他的）。
+      // 以前把别人的手留在这里，lastResult/导出会把旁边那个人的手算进目标人。
+      rawHands = completeHands(handsOfTarget(rawHands, target), target, img, w, h);
     }
   }
 
@@ -1160,13 +1193,16 @@ async function analyzeStill(img) {
   let hands = [];
   let verdicts = [];
   if (judged.length) {
+    // 归属只依赖手/人几何，与合成时间戳无关：先算一次，再逐帧分类。
+    // 顺序必须是「先归属、再分类」——手势稳定器按 track 隔离（PLAN §16.3 R12-2）。
+    const assigned = assignHands(judged, rawHands);
     for (let i = 0; i < STILL_SETTLE_FRAMES; i++) {
       const t = ts + i * 100;
-      hands = classifyHands(rawHands, t);
+      const cls = classifyAndBind(rawHands, t, assigned, !multiOn);
+      hands = cls.hands;
       // 单人也必须走一遍归属：ActionEngine 拿的是「每个人每只手」的 map，
       // 之前单人模式传 null，导致伸手/持物/指向/拿取在默认单人道里永远不成立。
-      const handsByTrack = assignHands(judged, hands);
-      verdicts = pipelines.update(judged, t, handsByTrack);
+      verdicts = pipelines.update(judged, t, cls.handsByTrack);
     }
     const primaryV = pipelines.primary(verdicts);
     sig = primaryV ? primaryV.sig : null;
@@ -1176,7 +1212,9 @@ async function analyzeStill(img) {
       for (const vd of verdicts) ppeById.set(vd.track_id, ppeMonitor.update(vd.track_id, vd.person, objects, ts));
     }
     lastVerdicts = verdicts.map((vd) => ({
-      track_id: vd.track_id, bbox: vd.bbox, sig: vd.sig, act: vd.act, hands: vd.hands,
+      track_id: vd.track_id,
+      track_uid: vd.person?.track_uid ?? vd.track_uid,
+      bbox: vd.bbox, sig: vd.sig, act: vd.act, hands: vd.hands,
       ppe: ppeById.get(vd.track_id) || null,
     }));
     if (show.skeleton) {
@@ -1542,18 +1580,18 @@ function loop() {
     }
     // 整帧漏检的手用姿态腕点补检。全身/远景构图里手只有几十像素，整帧 HandLandmarker
     // 实测 0 命中；腕点裁一块放大后同一模型能稳定检出。只在漏检且腕点可见时才付这次推理。
-    const near = (a, b) => Math.hypot(a.kp[0][0] - b.kp[0][0], a.kp[0][1] - b.kp[0][1]) < 8;
     if (multi) {
-      // 多人：ROI 补检只对主目标做（每多一人多一次推理），补出来的手并回整帧结果
-      for (const hd of completeHands(handsOfTarget(hands, target), target, v, w, h)) {
-        if (!hands.some((x) => near(x, hd))) hands.push(hd);
-      }
-      hands = classifyHands(hands, ts);
+      // 多人：按预算给面积最大的前 N 人补检（主目标优先，见 completeHandsMulti）
+      completeHandsMulti(hands, judged, target, v, w, h);
     } else {
-      hands = classifyHands(completeHands(handsOfTarget(hands, target), target, v, w, h), ts);
+      hands = completeHands(handsOfTarget(hands, target), target, v, w, h);
     }
     // 单人也必须归属：否则 ActionEngine 拿到的是空手，伸手/持物/指向/拿取恒为 false。
-    handsByTrack = assignHands(judged, hands);
+    // 顺序必须是「先归属、再分类」：手势稳定器按 track 隔离（PLAN §16.3 R12-2）。
+    const assigned = assignHands(judged, hands);
+    const cls = classifyAndBind(hands, ts, assigned, !multi);
+    hands = cls.hands;
+    handsByTrack = cls.handsByTrack;
   }
   const handsMs = performance.now() - tHands;
 
@@ -1565,6 +1603,9 @@ function loop() {
     const live = new Set(tracker.tracks.keys());
     pipelines.prune(live);
     ppeMonitor.prune(live);
+    // 逐 track 的手势稳定器同样要清：人离开画面后 track 不会回来，留着只会让
+    // 长会话的 Map 只增不减（单人道只有 track 0，不受影响）。
+    shapeStable.prune(live);
   }
   const primaryV = pipelines.primary(verdicts);
   const sig = primaryV ? primaryV.sig : null;
@@ -1577,6 +1618,8 @@ function loop() {
   }
   lastVerdicts = verdicts.map((vd) => ({
     track_id: vd.track_id,
+    // 稳定标识由 track.js 产出（物体线加）；这里只透传，不分配。
+    track_uid: vd.person?.track_uid ?? vd.track_uid,
     bbox: vd.bbox,
     sig: vd.sig,
     act: vd.act,
@@ -1628,8 +1671,13 @@ function loop() {
   for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
   const drawMs = performance.now() - tDraw;
 
-  if (mayLogFrame()) pushLog(ts, target, sig, act, persons.length, hands, { verdicts: lastVerdicts, objects: lastObjects, ppeById });
-  pushSpark(ts, sig ? sig.knee_pick : null);
+  if (mayLogFrame()) {
+    // persons 必须是**判定人员**（多人=judged 全体，单人=主目标），不是画面里所有人：
+    // 单人走的还是旧路径，其余人只画骨架，不应进导出。
+    pushLog(ts, target, sig, act, persons.length, hands, {
+      verdicts: lastVerdicts, objects: lastObjects, ppeById, persons: judged,
+    });
+  }
 
   lastResult = { ts, persons, sig, act, hands, verdicts: lastVerdicts, objects: lastObjects, primaryId: primaryV?.track_id ?? null };
 
@@ -1662,7 +1710,49 @@ function countFps(ts) {
 
 // —— 记录与导出 ---------------------------------------------------------
 
+/**
+ * 导出用的单手记录。动作层内部的手带 `cls` 等临时字段，这里只挑契约里的字段。
+ * 与帧级 `hands[]` 同结构（docs/frame-schema.md）。
+ */
+function exportHand(hd) {
+  return {
+    handedness: hd.handedness,
+    shape: hd.cls?.shape ?? hd.shape ?? null,
+    shape_raw: hd.cls?.raw ?? hd.shape_raw ?? null,
+    score: r2(hd.score),
+    orient: hd.orient,
+    spread: hd.spread,
+    bbox: Array.isArray(hd.bbox) ? hd.bbox.map(r1) : null,
+    kp: Array.isArray(hd.kp) ? hd.kp.map(([x, y]) => [r1(x), r1(y)]) : null,
+  };
+}
+
+/**
+ * 导出用的人记录。单人路径与旧版逐字段一致；多人时每个判定人员一条。
+ * `track_uid` 是轨迹内部的稳定 uid（同一轨迹对象内不变；跨 track_id 的继承尚未实现）：
+ * 有就透传，没有就不写（只增可选字段）。
+ */
+function exportPerson(p) {
+  return {
+    track_id: p.track_id,
+    ...(p.track_uid !== undefined ? { track_uid: p.track_uid } : {}),
+    bbox: p.bbox.map(r1),
+    kp_format: p.kp_format,
+    kp: p.kp.map(([x, y, v]) => [r1(x), r1(y), r2(v)]),
+    // 世界坐标（米制）：3D 抬臂角/举手判定依赖它。不导出的话，离线评估永远只能走 2D 分支，
+    // 评估结果就和页面实际执行的规则不是一回事（见 evaluate.mjs 文件头）。
+    kp_world: p.kp_world && p.kp_world.length
+      ? p.kp_world.map(([x, y, z]) => [r2(x), r2(y), r2(z)]) : null,
+    scale: r2(p.scale),
+    score: r2(p.score),
+  };
+}
+
 function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
+  // 这一帧走的是多人判定路径就锁定为 multi（录制中切换也只升不降，
+  // 保证 meta 与按 6000 截断的 frameLog 一致）
+  if (exportMulti()) logMode = 'multi';
+  const logPersons = extra?.persons || (p ? [p] : []);
   frameLog.push({
     ts: Math.round(ts),
     // 视频/摄像头画面的时间（秒）。ts 是 performance.now，录完对不上人眼看到的时间；
@@ -1672,18 +1762,9 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
     // 离线按帧对齐 gt（web/test/mot17-eval.mjs）会系统性错位。
     video_time: mode === 'file' ? Math.round(lastVideoTime * 1000) / 1000 : null,
     person_count: personCount,
-    persons: p ? [{
-      track_id: p.track_id,
-      bbox: p.bbox.map(r1),
-      kp_format: p.kp_format,
-      kp: p.kp.map(([x, y, v]) => [r1(x), r1(y), r2(v)]),
-      // 世界坐标（米制）：3D 抬臂角/举手判定依赖它。不导出的话，离线评估永远只能走 2D 分支，
-      // 评估结果就和页面实际执行的规则不是一回事（见 evaluate.mjs 文件头）。
-      kp_world: p.kp_world && p.kp_world.length
-        ? p.kp_world.map(([x, y, z]) => [r2(x), r2(y), r2(z)]) : null,
-      scale: r2(p.scale),
-      score: r2(p.score),
-    }] : [],
+    // 多人时是全部判定人员（每人带 kp/kp_world/scale/score），单人时仍是 1 个元素、字段不变。
+    // 迁移旧数据的工具不需要知道模式：只看数组长度即可。
+    persons: logPersons.map(exportPerson),
     signals: sig ? {
       knee: r1(sig.knee_pick),
       knee_side: sig.knee_side,
@@ -1730,37 +1811,46 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       grasp_phase: act.repPhase?.grasp ?? null,
       unreliable: act.unreliable ?? [],
     } : null,
-    hands: hands.map((hd) => ({
-      handedness: hd.handedness,
-      shape: hd.cls.shape,
-      shape_raw: hd.cls.raw,
-      score: r2(hd.score),
-      orient: hd.orient,
-      spread: hd.spread,
-      bbox: hd.bbox.map(r1),
-      kp: hd.kp.map(([x, y]) => [r1(x), r1(y)]),
-    })),
+    hands: hands.map(exportHand),
     // —— 多人与物体（新增字段；老数据没有它，评估器按"没有多人信息"处理）——
     // persons[0] 仍是主目标，signals/actions 仍是主目标的判定，老流程与评估器完全不受影响。
+    // 几何统一放在 persons[]（按 track_id 关联），verdicts 里不重复存 kp/scale；
+    // hands 是「该 track 被归属到的手」，与帧级 hands 同结构。
     verdicts: (extra?.verdicts || []).map((vd) => ({
       track_id: vd.track_id,
+      ...(vd.track_uid !== undefined ? { track_uid: vd.track_uid } : {}),
       bbox: vd.bbox.map(r1),
       posture: vd.act?.postureId ?? null,
       frozen: !!vd.act?.frozen,
       flags: vd.act?.flags ?? null,
       reps: vd.act?.reps ?? null,
+      hands: vd.hands
+        ? (vd.hands.list || [vd.hands.L, vd.hands.R].filter(Boolean)).map(exportHand)
+        : [],
       ppe: vd.ppe ? {
-        helmet: { state: vd.ppe.helmet.state, alert: vd.ppe.helmet.alert, streak_ms: vd.ppe.helmet.streak_ms },
-        glove: { state: vd.ppe.glove.state, alert: vd.ppe.glove.alert, streak_ms: vd.ppe.glove.streak_ms },
+        helmet: {
+          state: vd.ppe.helmet.state, alert: vd.ppe.helmet.alert, streak_ms: vd.ppe.helmet.streak_ms,
+          ...(vd.ppe.helmet.reason ? { reason: vd.ppe.helmet.reason } : {}),
+          ...(vd.ppe.helmet.reason_code ? { reason_code: vd.ppe.helmet.reason_code } : {}),
+        },
+        glove: {
+          state: vd.ppe.glove.state, alert: vd.ppe.glove.alert, streak_ms: vd.ppe.glove.streak_ms,
+          ...(vd.ppe.glove.reason_code ? { reason_code: vd.ppe.glove.reason_code } : {}),
+        },
       } : null,
     })),
     objects: (extra?.objects || []).map((o) => ({
       label: o.label, score: r2(o.score), box: o.box.map(r1),
     })),
   });
-  // 溢出时一次丢一批，摊薄成本（每帧 shift 会变成 O(n)）
-  if (frameLog.length > MAX_LOG) {
-    const removed = frameLog.splice(0, LOG_TRIM);
+  // 溢出时一次丢一批，摊薄成本（每帧 shift 会变成 O(n)）。
+  // 正常溢出只丢 10%；如果上限刚从 20000 切到 6000，len 远大于 limit+trim，
+  // 这时一次丢到 limit-trim，避免要花几十帧才降到新上限（UI 的丢弃计数照样累加）。
+  const limit = logLimit();
+  const trim = logTrim();
+  if (frameLog.length > limit) {
+    const drop = frameLog.length > limit + trim ? frameLog.length - (limit - trim) : trim;
+    const removed = frameLog.splice(0, Math.min(drop, frameLog.length));
     logDropped += removed.length;
   }
 }
@@ -1773,6 +1863,9 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
  */
 /** 常规导出与难例导出共用的 meta 基底 */
 function baseExportMeta() {
+  // 物体模型指纹（PLAN §17 R13-3）：PPE 指标跨模型不可比，baseline 用它拒绝跨模型比较。
+  // 关闭物体检测时为 null；MediaPipe 后端没有 sidecar，modelHash 为 null。
+  const oi = objectOn ? objectInfo() : null;
   return {
     exported_at: new Date().toISOString(),
     schema: 'frame.jsonl v0',
@@ -1793,6 +1886,20 @@ function baseExportMeta() {
     params_hash: paramsHash(activeParams),
     params: activeParams,
     frame_count: frameLog.length,
+    // 多人口径的帧数上限与本次导出走的是哪条判定路径（PLAN §18.5 D3）。
+    // 评估器据此判断「帧被截断」是否正常：多人 6000 是为了控制体积，不是数据丢失。
+    log_limit: logLimit(),
+    export_mode: logMode,
+    objects: oi ? {
+      backend: objectCfg.backend ?? null,
+      model: objectCfg.model ?? null,
+      inputSize: objectCfg.inputSize ?? null,
+      modelHash: oi.modelHash ?? null,
+      // 类别顺序错了比模型错了更难查：把顺序本身也指纹化（evaluate 的 baseline 校验会用）
+      labelsHash: Array.isArray(objectCfg.labels) && objectCfg.labels.length
+        ? paramsHash({ labels: objectCfg.labels }) : null,
+      manifestOk: oi.manifest?.ok ?? null,
+    } : null,
   };
 }
 
@@ -1961,70 +2068,6 @@ function hardcaseActionName(id) {
   return hit ? hit.name : id;
 }
 
-// —— 角度曲线（校准阈值用）---------------------------------------------
-
-function pushSpark(ts, v) {
-  sparkSamples.push([ts, Number.isFinite(v) ? v : null]);
-  while (sparkSamples.length && ts - sparkSamples[0][0] > SPARK_SPAN_MS) sparkSamples.shift();
-}
-
-function drawSpark(now) {
-  const c = spark;
-  const g = c.getContext('2d');
-  const W = c.width, H = c.height;
-  const padL = 34;
-  g.clearRect(0, 0, W, H);
-
-  const LO = 50, HI = 190;
-  const yOf = (v) => H - ((Math.min(HI, Math.max(LO, v)) - LO) / (HI - LO)) * (H - 6) - 3;
-
-  g.font = '600 20px Bahnschrift, "DIN Alternate", Consolas, monospace';
-  g.textBaseline = 'middle';
-  for (const v of [60, 120, 180]) {
-    const y = yOf(v);
-    g.strokeStyle = 'rgba(27, 30, 25, .08)';
-    g.lineWidth = 1;
-    g.beginPath(); g.moveTo(padL, y); g.lineTo(W, y); g.stroke();
-    g.fillStyle = '#6e746a';
-    g.fillText(String(v), 2, y);
-  }
-
-  // 阈值线用琥珀色：与骨架的「中等置信」同一个语义色，不引入新颜色
-  g.strokeStyle = 'rgba(168, 116, 26, .45)';
-  g.setLineDash([6, 6]);
-  for (const v of [squatCfg.down, squatCfg.up]) {
-    if (!Number.isFinite(v)) continue;
-    const y = yOf(v);
-    g.beginPath(); g.moveTo(padL, y); g.lineTo(W, y); g.stroke();
-  }
-  g.setLineDash([]);
-
-  if (sparkSamples.length < 2) return;
-
-  const t0 = now - SPARK_SPAN_MS;
-  const xOf = (t) => padL + ((t - t0) / SPARK_SPAN_MS) * (W - padL);
-
-  g.strokeStyle = '#1b1e19';
-  g.lineWidth = 3;
-  g.lineJoin = 'round';
-  g.beginPath();
-  let started = false;
-  for (const [t, v] of sparkSamples) {
-    if (v === null) { started = false; continue; }
-    const x = xOf(t), y = yOf(v);
-    if (!started) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
-  }
-  g.stroke();
-
-  const last = sparkSamples[sparkSamples.length - 1];
-  if (last && last[1] !== null) {
-    g.fillStyle = '#1b1e19';
-    g.beginPath();
-    g.arc(xOf(last[0]), yOf(last[1]), 4, 0, Math.PI * 2);
-    g.fill();
-  }
-}
-
 // —— 播放控制与输入状态 ------------------------------------------------
 
 const fmtTime = (s) => {
@@ -2100,12 +2143,12 @@ function replayVideo() {
 }
 
 function clearLog() {
-  if (!frameLog.length && !sparkSamples.length) {
+  if (!frameLog.length) {
     setStatus('没有可清空的记录', 'busy');
     return;
   }
   resetRuntime();
-  setStatus('已清空记录（计数与曲线一起重置）', 'ok');
+  setStatus('已清空记录（计数一起重置）', 'ok');
 }
 
 function resetPlaceholder() {
@@ -2142,8 +2185,6 @@ function updateModelInfo() {
 // —— UI -----------------------------------------------------------------
 
 function renderReps(reps) {
-  $('repSquat').textContent = reps.squat ?? 0;
-  $('repPushup').textContent = reps.pushup ?? 0;
   $('repClap').textContent = reps.clap ?? 0;
   $('repGrasp').textContent = reps.grasp ?? 0;
 }
@@ -2195,7 +2236,7 @@ function updateUI() {
   const { sig, act, hands } = lastResult || {};
 
   const postureEl = $('posture');
-  // 只有上半身在画面里时，站/坐/蹲/躺都判不了（缺膝、踝）。这不是「没识别」，
+  // 只有上半身在画面里时，站/坐判不了（缺膝、踝）。这不是「没识别」，
   // 而是信息不足——明确写出来，别让用户以为模型挂了。
   const upperOnly = !!(sig && sig.ok && !Number.isFinite(sig.leg_vertical));
   postureEl.textContent = act?.posture
@@ -2288,7 +2329,7 @@ function updateUI() {
   const lowerHidden = !!vis && (vis.hip < 0.4 || vis.knee < 0.3 || vis.ankle < 0.3);
   // 判定不可靠的原因：让用户知道这一帧别太当真，而不是把误判当成结论
   const UNRELIABLE = {
-    low_confidence: '低置信', extrapolated: '外推', side_switched: '换侧',
+    low_confidence: '低置信', extrapolated: '外推',
     bone_blocked: '骨骼异常', angle_outlier: '角度坏点',
   };
   const unrel = (act?.unreliable || []).map((r) => UNRELIABLE[r] || r);
@@ -2299,7 +2340,7 @@ function updateUI() {
 
   if (act?.reps) renderReps(act.reps);
   $('repMeta').textContent = act
-    ? `门控 深蹲${act.gates?.squat ? '✓' : '—'} 俯卧撑${act.gates?.pushup ? '✓' : '—'} 鼓掌${act.gates?.clap ? '✓' : '—'}`
+    ? `门控 鼓掌${act.gates?.clap ? '✓' : '—'}`
     : '—';
 
   // —— 人员列表（多人 / PPE）——
@@ -2346,11 +2387,11 @@ function updateUI() {
       : videoWrapDetected ? '记录已停止（时间回退）'
         : mode === 'camera' ? '记录中'
           : (videoEl.paused ? '已暂停' : '记录中');
-  const dropped = logDropped ? ` · 已丢弃 ${logDropped} 帧（上限 ${MAX_LOG}）` : '';
+  const dropped = logDropped ? ` · 已丢弃 ${logDropped} 帧（上限 ${logLimit()}）` : '';
   $('logInfo').textContent = frameLog.length
     ? `${frameLog.length} 帧 / ${span.toFixed(1)}s · ${recState}${dropped}`
     : (mode === 'idle' ? '—' : `0 帧 · ${recState}${dropped}`);
-  $('logInfo').title = `profile=${profileName} · ${activeParamsHash} · 模型 ${activeModel ? `${activeModel}/${activeDelegate || '?'}` : '—'} · 上限 ${MAX_LOG} 帧`;
+  $('logInfo').title = `profile=${profileName} · ${activeParamsHash} · 模型 ${activeModel ? `${activeModel}/${activeDelegate || '?'}` : '—'} · 上限 ${logLimit()} 帧`;
 
   // 无帧时导出/清空/难例都不该可点；难例采样中保持禁用直到 finishHardcase 复位
   $('btnExport').disabled = !frameLog.length;
@@ -2358,10 +2399,9 @@ function updateUI() {
   $('btnHardcase').disabled = !frameLog.length || !!hardcasePending;
 
   // 曲线图例已有数值，这里给悬停说明当前门限与参数指纹
-  $('signalMeta').title = `深蹲门限 下阈 ${squatCfg.down}° / 上阈 ${squatCfg.up}° · ${activeParamsHash}`;
+  $('signalMeta').title = `参数指纹 ${activeParamsHash}`;
 
   syncPlayer();
-  drawSpark(performance.now());
 }
 
 // —— 事件绑定 -----------------------------------------------------------
@@ -2561,7 +2601,7 @@ $('chkObjects').addEventListener('change', async (e) => {
 });
 $('btnReset').addEventListener('click', () => {
   for (const p of pipelines.map.values()) p.act.reset();
-  renderReps({ squat: 0, pushup: 0, clap: 0, grasp: 0 });
+  renderReps({ clap: 0, grasp: 0 });
 });
 $('btnAccuracy').addEventListener('click', () => {
   const box = $('accList');

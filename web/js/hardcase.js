@@ -131,7 +131,7 @@ export function buildHardcase(frames, clickTs, {
       : `${ended ? '视频已结束，' : ''}窗口锚到最后记录帧（实际点击 ${Math.round(anchoredFrom)}ms）`,
     `窗口 ${win.length} 帧`,
     detected
-      ? `当时判定 ${detected.posture ?? '—'}，计数 蹲${detected.reps?.squat ?? 0}/俯${detected.reps?.pushup ?? 0}/掌${detected.reps?.clap ?? 0}`
+      ? `当时判定 ${detected.posture ?? '—'}，计数 掌${detected.reps?.clap ?? 0}/拿${detected.reps?.grasp ?? 0}`
       : '无判定',
   ].filter((s) => s !== null).join('；');
   const labels = {

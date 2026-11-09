@@ -15,6 +15,7 @@ import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ARM_ACTIONS } from '../js/actions.js';
+import { wilson } from './evaluate.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const DEFAULT_MIN_SAMPLES = 20;
@@ -23,9 +24,44 @@ const DEFAULT_MIN_SAMPLES = 20;
  * @param {object} evalReport evaluate.mjs --json 的输出
  * @param {{dir?:string, minSamples?:number, generatedAt?:string}} opts
  */
+/**
+ * 按动作把 summary 行合并成一行。多人素材每行带 track，同一动作会有多行；
+ * 只按 action 建 Map 会让后一条覆盖前一条，页面显示的就是「最后一个 track 的准确率」。
+ * 合并口径是池化 TP/FN/FP（不是平均各 track 的比率），n 与 Wilson 区间按合并后的样本量重算。
+ */
+function poolByAction(rows) {
+  const groups = new Map();
+  for (const r of rows) {
+    if (!r || typeof r.action !== 'string') continue;
+    if (!groups.has(r.action)) groups.set(r.action, []);
+    groups.get(r.action).push(r);
+  }
+  const by = new Map();
+  for (const [action, list] of groups) {
+    // 单行（单人素材/旧报告）：原样透传，CI 与 n 一个数都不动。
+    if (list.length === 1) { by.set(action, list[0]); continue; }
+    const b = { tp: 0, fn: 0, fp: 0 };
+    for (const r of list) {
+      b.tp += r.tp ?? 0;
+      b.fn += r.fn ?? 0;
+      b.fp += r.fp ?? 0;
+    }
+    const nRecall = b.tp + b.fn;
+    const nPrecision = b.tp + b.fp;
+    const recall = nRecall ? +(b.tp / nRecall).toFixed(3) : null;
+    const precision = nPrecision ? +(b.tp / nPrecision).toFixed(3) : null;
+    by.set(action, {
+      tp: b.tp, fn: b.fn, fp: b.fp, nRecall, nPrecision, recall, precision,
+      recallCI: nRecall ? wilson(b.tp, nRecall) : null,
+      precisionCI: nPrecision ? wilson(b.tp, nPrecision) : null,
+    });
+  }
+  return by;
+}
+
 export function buildAccuracyReport(evalReport, { dir = 'eval-data', minSamples = DEFAULT_MIN_SAMPLES, generatedAt = new Date().toISOString() } = {}) {
   const rows = Array.isArray(evalReport?.summary) ? evalReport.summary : [];
-  const byFlag = new Map(rows.map((r) => [r.action, r]));
+  const byFlag = poolByAction(rows);
 
   // 评估器的 summary 用 flag 名（armRaised），页面用动作 id（arm_raised）。
   // 在这里映射一次，页面就不需要知道两套命名。
@@ -67,6 +103,8 @@ export function buildAccuracyReport(evalReport, { dir = 'eval-data', minSamples 
     paramsHash: evalReport?.paramsHash ?? null,
     profile: evalReport?.profile ?? null,
     models: evalReport?.models ?? [],
+    objects: evalReport?.objects ?? [],
+    objectWarning: evalReport?.objectWarning ?? null,
     actions,
   };
 }

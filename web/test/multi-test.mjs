@@ -5,7 +5,11 @@
 // 不代表真实场景精度——准确率必须用实拍素材测（docs/eval.md）。
 
 import { Tracker, iou, area, optimalAssign } from '../js/track.js';
-import { PersonPipelines, assignHands } from '../js/multi.js';
+import {
+  PersonPipelines, assignHands, logLimitFor, LOG_LIMITS,
+  TrackShapeStabilizers, classifyHandsByTrack, bindClassifiedHands, pickRoiPersons,
+} from '../js/multi.js';
+import { readFile } from 'node:fs/promises';
 import { matchLabel, headBox, wristBox, assessPpe, PpeMonitor } from '../js/ppe.js';
 import { tileRects, mergeTiledPoses } from '../js/tiles.js';
 import { resolveParams } from '../js/params.js';
@@ -278,6 +282,225 @@ console.log('\n[6] assignHands');
   check('scale 无效的人不参与归属', assignHands([{ ...a, scale: 0 }], [leftOfA]).get(1) === undefined);
 }
 
+// —— 6b. assignHands 的两道门（R12-2）——
+console.log('\n[6b] assignHands 门控');
+{
+  // 单人手部样本。bbox 与 kp 分开给：门控只看 bbox 中心，归属距离仍看 kp[0]（腕点）。
+  const mkHand = (x, y, handedness = 'Left', extra = {}) => ({
+    handedness, score: 0.9, bbox: [x - 10, y - 10, x + 10, y + 10], kp: [[x, y]], ...extra,
+  });
+
+  // 门 1：手 bbox 中心在 A 的框内，但腕点离 B 的腕点更近 → 归 A（不能归 B）。
+  // 两个 person 的 bbox 故意改成不重叠，才能把「bbox 中心在谁框内」和「腕点离谁近」
+  // 这两个判据分开；用 mkPerson 默认框时两个人会挤在一起，测不出门控。
+  const A = mkPerson({ id: 1, cx: 300 });
+  const B = mkPerson({ id: 2, cx: 500 });
+  A.bbox = [0, 0, 420, 700];
+  B.bbox = [440, 0, 800, 700];
+  B.kp[5] = [420, 150, 0.9];           // B 的左手腕故意贴到手的位置
+  const inAboxNearB = mkHand(420, 150);  // bbox 中心 420 在 A 框内、不在 B 框内
+  const m1 = assignHands([A, B], [inAboxNearB]);
+  check('bbox 门：手框中心在 A 框内 → 不因离 B 腕近而归 B',
+    m1.get(1).list.includes(inAboxNearB) && !m1.get(2).list.includes(inAboxNearB));
+  // 同一只手没有 bbox（旧数据）→ 跳过这道门，按距离归 B（向后兼容）
+  const noBbox = { handedness: 'Left', score: 0.9, kp: [[420, 150]] };
+  const m1b = assignHands([A, B], [noBbox]);
+  check('没有 bbox 的旧数据跳过 bbox 门', m1b.get(2).list.includes(noBbox));
+
+  // 门 1 的腕部外扩：pose bbox 的极值点是腕，不含手指。手伸向体侧时手框中心天然
+  // 在框外，只做整框包含会把手直接丢掉（多人模式下 reaching/pointing 整段失效）。
+  const EA = mkPerson({ id: 1, cx: 300 });   // bbox 右界 ≈ 369.6，腕点 x ≈ 355.2，scale = 120
+  const EB = mkPerson({ id: 2, cx: 500 });
+  const extended = mkHand(390, 188, 'Right'); // 中心比 A 框右界远 20px，离 A 右腕 35px < 0.4×120
+  const mx = assignHands([EA, EB], [extended]);
+  check('腕部外扩 0.4×scale：伸出去的手仍归 A',
+    mx.get(1).list.includes(extended) && !mx.get(2).list.includes(extended),
+    `A=${mx.get(1).list.length} B=${mx.get(2).list.length}`);
+  // 外扩只绑在腕上、且有上限：离两只腕都很远的手仍被丢弃
+  const tooFar = mkHand(300, 500, 'Right');
+  const my = assignHands([EA, EB], [tooFar]);
+  check('外扩不是无上限：离腕太远的手仍被丢弃',
+    !my.get(1).list.includes(tooFar) && !my.get(2).list.includes(tooFar));
+
+  // 门 2：离 A、B 的归一化距离几乎相同（margin < 0.15）→ 弃权
+  const P = mkPerson({ id: 1, cx: 300 });
+  const Q = mkPerson({ id: 2, cx: 500 });
+  // 不带 bbox：只测 margin 门（有 bbox 时会先被 bbox 门筛掉，测不到这一道）
+  const tie = { handedness: 'Left', score: 0.9, kp: [[400, 188]] };  // 离两人腕点各 44.8px / scale 120
+  const mt = assignHands([P, Q], [tie]);
+  check('次近人 margin 不足 → 不归属给任何人',
+    !mt.get(1).list.includes(tie) && !mt.get(2).list.includes(tie));
+  // margin 足够 → 正常归属
+  const nearP = { handedness: 'Left', score: 0.9, kp: [[350, 188]] };
+  const mn = assignHands([P, Q], [nearP]);
+  check('margin 足够 → 归最近的人', mn.get(1).list.includes(nearP) && !mn.get(2).list.includes(nearP));
+
+  // ROI 补检结果带 owner_track_id：即使腕点离别人更近，也只归补检它的人
+  const owned = mkHand(350, 188, 'Left', { side_from: 'roi', owner_track_id: 2 });
+  const mo = assignHands([P, Q], [owned]);
+  check('ROI owner 优先于距离',
+    mo.get(2).list.includes(owned) && !mo.get(1).list.includes(owned));
+
+  // 单人不受两道门影响：bbox 在人框外、腕点够近 → 仍归属（旧行为）
+  const singleOutside = mkHand(P.kp[5][0], P.kp[5][1], 'Left', { bbox: [1000, 1000, 1100, 1100] });
+  const ms = assignHands([P], [singleOutside]);
+  check('单人：bbox 门外的手仍按旧距离规则归属', ms.get(1).list.includes(singleOutside));
+}
+
+// —— 6c. 单人路径回归：新实现与旧算法逐项一致 ——
+console.log('\n[6c] 单人归属回归');
+{
+  // 旧版 assignHands（R12-2 之前）的逐字复刻，用来确认单人路径没有被门控改动。
+  const legacyAssign = (persons, hands, maxDist = 0.8) => {
+    const out = new Map();
+    for (const p of persons) {
+      if (!p || !p.kp || !(p.scale > 0)) continue;
+      out.set(p.track_id, { L: null, R: null, list: [] });
+    }
+    for (const hd of hands) {
+      if (!hd || !hd.kp || !hd.kp.length) continue;
+      const [hx, hy] = hd.kp[0];
+      let best = null;
+      let bestD = Infinity;
+      for (const p of persons) {
+        if (!p.kp || !(p.scale > 0)) continue;
+        for (const wi of [5, 6]) {
+          const w = p.kp[wi];
+          if (!w || !(w[2] >= 0.3)) continue;
+          const d = Math.hypot(w[0] - hx, w[1] - hy) / p.scale;
+          if (d < bestD) { bestD = d; best = p.track_id; }
+        }
+      }
+      if (best == null || bestD > maxDist) continue;
+      out.get(best)?.list.push(hd);
+    }
+    for (const slot of out.values()) {
+      for (const hd of slot.list) {
+        const key = hd.handedness === 'Left' ? 'L' : hd.handedness === 'Right' ? 'R' : null;
+        if (!key) continue;
+        if (!slot[key] || (hd.score ?? 0) > (slot[key].score ?? 0)) slot[key] = hd;
+      }
+    }
+    return out;
+  };
+
+  const p = mkPerson({ id: 0, cx: 320, s: 120 });
+  let seed = 7;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const hands = [];
+  for (let i = 0; i < 60; i++) {
+    const x = rand() * 640;
+    const y = rand() * 480;
+    const handedness = rand() < 0.45 ? 'Left' : rand() < 0.8 ? 'Right' : 'Unknown';
+    const hd = { handedness, score: rand(), kp: [[x, y]] };
+    // 一半带 bbox（有的故意在 person 框外），确认单人路径完全不看它
+    if (i % 2 === 0) hd.bbox = [x - 12, y - 12, x + 12, y + 12];
+    else hd.bbox = [1000, 1000, 1100, 1100];
+    hands.push(hd);
+  }
+  hands.push({ handedness: 'Left', score: 0.9, kp: [[p.kp[5][0], p.kp[5][1]]] });
+  hands.push({ handedness: 'Right', score: 0.9, kp: [[p.kp[6][0], p.kp[6][1]]] });
+
+  const now = assignHands([p], hands);
+  const old = legacyAssign([p], hands);
+  const sameSlot = (a, b) => {
+    const sa = a.get(0);
+    const sb = b.get(0);
+    if (!sa || !sb) return !sa && !sb;
+    return sa.L === sb.L && sa.R === sb.R
+      && sa.list.length === sb.list.length
+      && sa.list.every((h, i) => h === sb.list[i]);
+  };
+  check('单人归属与旧算法逐只手一致', sameSlot(now, old),
+    `new=${now.get(0)?.list.length} old=${old.get(0)?.list.length}`);
+}
+
+// —— 6d. 手势稳定器按 track 隔离 ——
+console.log('\n[6d] 逐 track 手势稳定器');
+{
+  // 用假分类器把「手势」直接写在 kp 上，避免构造 21 点几何；去抖逻辑是真的。
+  const fake = (kp) => ({ shape: kp.shape, label: '', fingers: {}, pinch: 0, score: 1 });
+  const hand = (track, shape) => ({ handedness: 'Left', kp: { shape }, track, score: 0.9 });
+
+  const st = new TrackShapeStabilizers({ streak: 3, keepMs: 250 });
+  const a = hand(1, 'fist');
+  const b = hand(2, 'open');
+  let isolated = true;
+  let lastA = null;
+  let lastB = null;
+  // 30 帧两人做不同手势：共用一个稳定器时两者会互相清候选，永远到不了 streak。
+  for (let i = 0; i < 30; i++) {
+    const cls = classifyHandsByTrack([a, b], i * 33, st, (hd) => hd.track, fake);
+    lastA = cls.list[0].cls.shape;
+    lastB = cls.list[1].cls.shape;
+    if (i >= 2 && (lastA !== 'fist' || lastB !== 'open')) isolated = false;
+  }
+  check('两人不同手势 30 帧：各自稳定器不互切', isolated, `${lastA}/${lastB}`);
+  check('每个 track 各一套稳定器', st.size() === 2, String(st.size()));
+
+  // 对照：所有手都推同一个 track 0 → 交替手势永远凑不满 streak（复现旧 bug）
+  const shared = new TrackShapeStabilizers({ streak: 3, keepMs: 250 });
+  for (let i = 0; i < 30; i++) {
+    classifyHandsByTrack([i % 2 ? a : b], i * 33, shared, () => 0, fake);
+  }
+  check('对照：共用一套稳定器时交替手势无法稳定', shared.forTrack(0).L.last === 'unknown',
+    shared.forTrack(0).L.last);
+
+  // 分类后的对象要回填到槽位，PersonPipelines 才能读到 hands.L.cls.shape
+  const assigned = new Map([[1, { L: a, R: null, list: [a] }], [2, { L: b, R: null, list: [b] }]]);
+  const cls = classifyHandsByTrack([a, b], 5000, st, (hd) => hd.track, fake);
+  const bound = bindClassifiedHands(assigned, cls.byOriginal);
+  check('槽位结构 {L,R,list} 不变且带 cls.shape',
+    bound.get(1).L.cls.shape === 'fist' && bound.get(2).L.cls.shape === 'open'
+    && Array.isArray(bound.get(1).list));
+
+  // 随 track prune 清理，避免长会话泄漏
+  st.prune(new Set([1]));
+  check('prune 清掉已消失 track 的稳定器', st.size() === 1 && !st.map.has(2));
+  const fresh = st.forTrack(2);
+  check('prune 后再出现是同 track 的全新状态', fresh.L.last === 'unknown');
+
+  // 单人道：ownerOf 恒为 0 时，结果与「一套全局稳定器」逐帧一致（回归）
+  const singleNew = new TrackShapeStabilizers({ streak: 3, keepMs: 250 });
+  const singleOld = new TrackShapeStabilizers({ streak: 3, keepMs: 250 });
+  const seq = ['fist', 'fist', 'open', 'fist', 'unknown', 'open', 'open', 'open'];
+  let same = true;
+  seq.forEach((shape, i) => {
+    const hd = hand(0, shape);
+    const got = classifyHandsByTrack([hd], i * 100, singleNew, () => 0, fake).list[0].cls.shape;
+    // 旧实现等价于「直接把这个 track 的稳定器喂一遍」
+    const oldShape = singleOld.forTrack(0).L.update(shape, i * 100);
+    if (got !== oldShape) same = false;
+  });
+  check('单人（track 0）分类与旧实现逐帧一致', same);
+}
+
+// —— 6e. 多人 ROI 预算 ——
+console.log('\n[6e] ROI 补检预算');
+{
+  const p = (id, bbox, scale) => ({ track_id: id, bbox, scale });
+  const big = p(1, [0, 0, 600, 600], 120);
+  const mid = p(2, [0, 0, 500, 500], 110);
+  const small = p(3, [0, 0, 400, 400], 100);
+
+  const r1 = pickRoiPersons([big, mid, small], big, { maxPersons: 3, maxPersonsPerFrame: 2, minScalePx: 80 });
+  check('3 人 + 预算 2 → 最多补检 2 人', r1.picked.length === 2 && r1.budget === 2, String(r1.picked.length));
+  check('主目标优先排第一', r1.picked[0] === big);
+  check('按面积取前 N（mid 入选、small 落选）',
+    r1.picked.includes(mid) && !r1.picked.includes(small));
+
+  const r2 = pickRoiPersons([big, mid, small], big, { maxPersons: 1, maxPersonsPerFrame: 2 });
+  check('multi.maxPersons 收窄预算', r2.picked.length === 1 && r2.picked[0] === big);
+
+  const far = p(4, [0, 0, 700, 700], 60);   // 面积最大但 scale 太小
+  const r3 = pickRoiPersons([far, big, mid], far, { maxPersons: 3, maxPersonsPerFrame: 2, minScalePx: 80 });
+  check('scale < minScalePx → 跳过补检',
+    !r3.picked.includes(far) && r3.skipped.includes(far), `picked=${r3.picked.length} skipped=${r3.skipped.length}`);
+
+  const r4 = pickRoiPersons([small], small, { maxPersons: 0, maxPersonsPerFrame: 2 });
+  check('预算 0 → 不补检', r4.picked.length === 0 && r4.budget === 0);
+}
+
 // —— 7. PPE 标签与几何 ——
 console.log('\n[7] PPE 几何');
 {
@@ -390,6 +613,44 @@ console.log('\n[9] PpeMonitor 时序');
   mon5.prune(new Set([1]));
   check('prune 丢掉离场轨迹的计时器',
     mon5.tracks.size === 1 && mon5.tracks.has(1) && !mon5.tracks.has(2), String(mon5.tracks.size));
+}
+
+// —— 导出体积口径（R12-1 / PLAN §18.5 D3）——
+// pushLog 在浏览器里，Node 不能直接 import（顶层就摸 DOM）；这里验证纯函数与源码接线，
+// 真正的导出行为由无头页面（headless-multi / headless-check）覆盖。
+console.log('\n[导出契约] 多人口径的帧数上限与 meta');
+{
+  check('单人上限 20000 / 多人 6000', LOG_LIMITS.single === 20000 && LOG_LIMITS.multi === 6000,
+    JSON.stringify(LOG_LIMITS));
+  check('logLimitFor 按模式取上限', logLimitFor(false) === 20000 && logLimitFor(true) === 6000);
+  const src = await readFile(new URL('../js/app.js', import.meta.url), 'utf8');
+  check('meta 写 log_limit 与 export_mode',
+    /log_limit:\s*logLimit\(\)/.test(src) && /export_mode:\s*logMode/.test(src));
+  check('上限按本段记录的模式取（不是编译期常量，也不读导出时的 multiReady）',
+    /const logLimit = \(\) => logLimitFor\(logMode === 'multi'\)/.test(src));
+  // Stop 会置 multiReady=false 但保留 frameLog：meta 不能因此翻成 single/20000。
+  check('导出模式在录制期间冻结（Stop 后不跟着 multiReady 变）',
+    /export_mode:\s*logMode/.test(src) && !/export_mode:\s*exportMulti/.test(src)
+    && /if \(exportMulti\(\)\) logMode = 'multi'/.test(src)
+    && /logMode = exportMulti\(\) \? 'multi' : 'single'/.test(src));
+  check('多人导出全部判定人员（persons: judged）', /persons:\s*judged/.test(src));
+  check('verdicts 透传 track_uid 与逐 track hands',
+    /vd\.track_uid !== undefined/.test(src) && /hands:\s*vd\.hands/.test(src)
+    && /track_uid:\s*vd\.person\?\.track_uid/.test(src));
+}
+
+// —— R12-2 接线：两条输入路径都要「先归属、再按 track 分类」——
+console.log('\n[R12-2 接线]');
+{
+  const src = await readFile(new URL('../js/app.js', import.meta.url), 'utf8');
+  check('视频路径多人 ROI 走预算补检', /completeHandsMulti\(hands, judged, target/.test(src));
+  check('图片路径多人 ROI 走预算补检', /completeHandsMulti\(rawHands, judged, target/.test(src));
+  check('归属先于分类（assigned → classifyAndBind）',
+    /const assigned = assignHands\(judged, hands\);\s*\n\s*const cls = classifyAndBind\(hands, ts, assigned, !multi\)/.test(src));
+  check('图片路径同样先归属', /const assigned = assignHands\(judged, rawHands\);\s*\n\s*for \(let i = 0; i < STILL_SETTLE_FRAMES/.test(src));
+  check('手势稳定器随 track prune', /shapeStable\.prune\(live\)/.test(src));
+  check('换 profile / 重置时清空逐 track 稳定器',
+    /shapeStable = makeShapeStable\(activeParams\)/.test(src) && /shapeStable\.reset\(\)/.test(src));
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

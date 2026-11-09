@@ -71,13 +71,13 @@ console.log('\n[1] extractWindow');
 console.log('\n[2] video_time 时间基');
 {
   const frames = Array.from({ length: 11 }, (_, i) => frameAt(i * 1000, i));
-  const r = buildHardcase(frames, 5000, { action: 'squat', now: 123 });
+  const r = buildHardcase(frames, 5000, { action: 'clap', now: 123 });
   check('帧数正确', r.frames.length === 6 && r.meta.frame_count === 6);
   check('label 起点/终点取实际帧的秒数', r.labels.segments[0].startSec === 2
     && r.labels.segments[0].endSec === 7,
   JSON.stringify(r.labels.segments[0]));
-  check('label 动作原样保留', r.labels.segments[0].action === 'squat');
-  check('meta 带 hardcase 记录', r.meta.hardcase.action === 'squat'
+  check('label 动作原样保留', r.labels.segments[0].action === 'clap');
+  check('meta 带 hardcase 记录', r.meta.hardcase.action === 'clap'
     && r.meta.hardcase.before_ms === 3000 && r.meta.hardcase.after_ms === 2000);
   check('name 可追溯到点击', r.labels.name === 'hardcase-123');
 }
@@ -97,7 +97,7 @@ console.log('\n[3] ts 时间基');
 console.log('\n[4] 校验');
 {
   const frames = [frameAt(0, 0), frameAt(1000, 1)];
-  const det = { posture: 'stand', reps: { squat: 0, pushup: 0, clap: 0 } };
+  const det = { posture: 'stand', reps: { clap: 0, grasp: 0 } };
   const r = buildHardcase(frames, 500, { action: 'stand', detected: det });
   check('detected 进 meta', r.meta.hardcase.detected.posture === 'stand');
   check('detected 进 note', r.labels.note.includes('stand'));
@@ -108,7 +108,7 @@ console.log('\n[4] 校验');
   // P1-4：反例语法与 evaluate.mjs 的 parseSegment 对齐。
   check('!onHips 合法', isValidHardcaseAction('!onHips'));
   check('!姿态 也合法', isValidHardcaseAction('!stand'));
-  check('!计数 也合法', isValidHardcaseAction('!squat'));
+  check('!计数 也合法', isValidHardcaseAction('!clap'));
   check('noArm 合法', isValidHardcaseAction('noArm'));
   check('!nope 非法', !isValidHardcaseAction('!nope'));
   check('!none 非法', !isValidHardcaseAction('!none'));
@@ -116,13 +116,13 @@ console.log('\n[4] 校验');
   check('!!onHips 非法', !isValidHardcaseAction('!!onHips'));
   check('空串非法', !isValidHardcaseAction(''));
   check('非字符串非法', !isValidHardcaseAction(null) && !isValidHardcaseAction(undefined));
-  const empty = buildHardcase(frames, 100000, { action: 'squat' });
+  const empty = buildHardcase(frames, 100000, { action: 'clap' });
   check('空窗口 → 0 帧、无 label 段', empty.frames.length === 0 && empty.labels.segments.length === 0);
-  check('segmentFor 空数组返回 null', segmentFor([], 'squat') === null);
+  check('segmentFor 空数组返回 null', segmentFor([], 'clap') === null);
 
   // 视频循环：video_time 回绕（2.9 → 0.1）时不能用秒数标
   const looped = [frameAt(0, 2.9), frameAt(33, 3.0), frameAt(66, 0.1)];
-  const seg = segmentFor(looped, 'squat');
+  const seg = segmentFor(looped, 'clap');
   check('video_time 回绕 → 退回 ts 毫秒', seg.start === 0 && seg.end === 66 && seg.startSec === undefined,
     JSON.stringify(seg));
 }
@@ -169,7 +169,7 @@ console.log('\n[6] 尾部锚点');
   check('暂停时仍说明窗口锚到最后记录帧', /窗口锚到最后记录帧/.test(paused.labels.note),
     paused.labels.note);
   check('尾部锚点仍导出窗口内的帧', tail.frames.length > 0, `frames=${tail.frames.length}`);
-  const plain = buildHardcase(frames, 5000, { action: 'squat' });
+  const plain = buildHardcase(frames, 5000, { action: 'clap' });
   check('普通点击不写尾部提示', !/视频已结束/.test(plain.labels.note), plain.labels.note);
 }
 

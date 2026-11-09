@@ -102,18 +102,24 @@ export function assessPpe(person, objects, cfg = {}, ctx = {}) {
   const noHelmetLabels = classes.noHelmet || [];
   let helmet;
   if (!helmetLabels.length) {
-    helmet = { state: 'unknown', reason: '未配置安全帽类别', box: head.box };
+    helmet = {
+      state: 'unknown', reason: '未配置安全帽类别', reason_code: 'config_mismatch', box: head.box,
+    };
   } else if (!head.visible) {
-    helmet = { state: 'unknown', reason: '头部不可见（背影/低头/出画）', box: head.box };
+    helmet = {
+      state: 'unknown', reason: '头部不可见（背影/低头/出画）', reason_code: 'occluded', box: head.box,
+    };
   } else {
     const hit = bestInRegion(objects, head.box, helmetLabels, minScore);
     // 负类框是直接证据：模型明确检出"未戴安全帽"，比"没检出正类"更强
     const neg = !hit && noHelmetLabels.length
       ? bestInRegion(objects, head.box, noHelmetLabels, minScore, { positive: false }) : null;
-    if (hit) helmet = { state: 'worn', reason: '检出安全帽', box: head.box, obj: hit };
-    else if (neg) helmet = { state: 'missing', reason: '检出未戴安全帽', box: head.box, obj: neg };
-    else if (requirePositive && !saw.helmet) helmet = { state: 'unknown', reason: '模型本场未检出过安全帽（先确认类别名/模型）', box: head.box };
-    else helmet = { state: 'missing', reason: '头部可见但区域内无安全帽', box: head.box };
+    if (hit) helmet = { state: 'worn', reason: '检出安全帽', reason_code: null, box: head.box, obj: hit };
+    else if (neg) helmet = { state: 'missing', reason: '检出未戴安全帽', reason_code: null, box: head.box, obj: neg };
+    else if (requirePositive && !saw.helmet) helmet = {
+      state: 'unknown', reason: '模型本场未检出过安全帽（先确认类别名/模型）', reason_code: 'no_positive', box: head.box,
+    };
+    else helmet = { state: 'missing', reason: '头部可见但区域内无安全帽', reason_code: null, box: head.box };
   }
 
   const gloveLabels = classes.glove || [];
@@ -122,17 +128,23 @@ export function assessPpe(person, objects, cfg = {}, ctx = {}) {
   for (const side of ['L', 'R']) {
     const wb = wristBox(person, side, cfg);
     if (!gloveLabels.length) {
-      glove[side] = { state: 'unknown', reason: '未配置手套类别', box: wb.box };
+      glove[side] = {
+        state: 'unknown', reason: '未配置手套类别', reason_code: 'config_mismatch', box: wb.box,
+      };
     } else if (!wb.visible) {
-      glove[side] = { state: 'unknown', reason: '该侧腕不可见', box: wb.box };
+      glove[side] = {
+        state: 'unknown', reason: '该侧腕不可见', reason_code: 'occluded', box: wb.box,
+      };
     } else {
       const hit = bestInRegion(objects, wb.box, gloveLabels, minScore);
       const neg = !hit && noGloveLabels.length
         ? bestInRegion(objects, wb.box, noGloveLabels, minScore, { positive: false }) : null;
-      if (hit) glove[side] = { state: 'worn', reason: '检出手套', box: wb.box, obj: hit };
-      else if (neg) glove[side] = { state: 'missing', reason: '检出未戴手套', box: wb.box, obj: neg };
-      else if (requirePositive && !saw.glove) glove[side] = { state: 'unknown', reason: '模型本场未检出过手套', box: wb.box };
-      else glove[side] = { state: 'missing', reason: '腕可见但区域内无手套', box: wb.box };
+      if (hit) glove[side] = { state: 'worn', reason: '检出手套', reason_code: null, box: wb.box, obj: hit };
+      else if (neg) glove[side] = { state: 'missing', reason: '检出未戴手套', reason_code: null, box: wb.box, obj: neg };
+      else if (requirePositive && !saw.glove) glove[side] = {
+        state: 'unknown', reason: '模型本场未检出过手套', reason_code: 'no_positive', box: wb.box,
+      };
+      else glove[side] = { state: 'missing', reason: '腕可见但区域内无手套', reason_code: null, box: wb.box };
     }
   }
   return { helmet, glove, head };
@@ -152,41 +164,98 @@ const alertFor = (streakMs, cfg = {}) => {
 export class PpeMonitor {
   constructor(cfg = {}) {
     this.cfg = cfg;
-    this.tracks = new Map(); // track_id -> { helmet:{since, streak, last}, glove:{L:{...},R:{...}} }
+    // 键优先用 track_uid，旧数据没有 uid 时退回 track_id。
+    // 同一轨迹对象内 uid 不变，因此调用方重映射 track_id 时计时不会丢；
+    // 但跟踪器 prune 后重建的是新 uid（linkAcrossIds 未实现），跨 id 的计时继承不在本版范围。
+    this.tracks = new Map(); // track_uid ?? track_id -> { helmet:{since,streak}, glove:{L,R}, track_id, track_uid }
     this.saw = { helmet: false, glove: false };
+    // requirePositive 的窗口化（R13-10）：positiveWindowMs=0 时保持旧行为（整场 sticky）。
+    this.positiveWindowMs = Math.max(0, Number(cfg.positiveWindowMs ?? 0) || 0);
+    this.minPositive = Math.max(1, Math.round(Number(cfg.minPositive ?? 3) || 1));
+    this.positives = { helmet: [], glove: [] }; // 窗口内正例的 ts 列表
+    this.lastTs = null;
+    this.lastPositiveTs = null; // 上次记正例的帧时间（同一时刻的多人调用只计一次）
   }
 
   reset() {
     this.tracks.clear();
     this.saw = { helmet: false, glove: false };
+    this.positives = { helmet: [], glove: [] };
+    this.lastTs = null;
+    this.lastPositiveTs = null;
   }
 
-  /** 丢弃跟踪器已放弃的 track（否则长会话里按 track_id 的计时器只增不减） */
+  /**
+   * 丢弃跟踪器已放弃的 track（否则长会话里计时器只增不减）。
+   * active 里既可能是 track_id（旧调用方）也可能是 track_uid（新调用方），
+   * 只要命中 entry 记录过的任一 id 就保留，避免调用方还没改完时误删。
+   */
   prune(activeIds) {
     const keep = activeIds instanceof Set ? activeIds : new Set(activeIds);
-    for (const id of [...this.tracks.keys()]) {
-      if (!keep.has(id)) this.tracks.delete(id);
+    for (const [key, e] of [...this.tracks]) {
+      if (keep.has(key) || keep.has(e.track_id) || keep.has(e.track_uid)) continue;
+      this.tracks.delete(key);
+    }
+  }
+
+  /** 正例计数（窗口模式）：过期的 ts 先丢掉，再按窗口内数量更新 saw */
+  refreshPositive(ts) {
+    if (this.positiveWindowMs <= 0) return;
+    const cutoff = ts - this.positiveWindowMs;
+    for (const cls of ['helmet', 'glove']) {
+      const arr = this.positives[cls];
+      while (arr.length && arr[0] < cutoff) arr.shift();
+      this.saw[cls] = arr.length >= this.minPositive;
     }
   }
 
   /** 统计本场是否真的检出过该类正例：模型类别名写错时，防止把全场判成"都没戴" */
-  noteObjects(objects) {
+  noteObjects(objects, ts = this.lastTs ?? 0) {
     const classes = this.cfg.classes || {};
-    for (const o of objects || []) {
-      if (!this.saw.helmet && matchLabel(o.label, classes.helmet || [])) this.saw.helmet = true;
-      if (!this.saw.glove && matchLabel(o.label, classes.glove || [])) this.saw.glove = true;
+    const t = Number.isFinite(ts) ? ts : (this.lastTs ?? 0);
+    this.lastTs = t;
+    const list = objects || [];
+    if (this.positiveWindowMs > 0) {
+      // 同一时刻只记一次：update() 是每帧每人调用一次，objects 还是检测间隔内
+      // 复用的缓存框——按调用次数计数会把同一个框按「人数 × 帧数」重复累加，
+      // minPositive=3 会在单个误匹配的一帧内被凑满，护栏等于没有。
+      // 按「帧次」计数，minPositive 才是「窗口内至少 N 帧看到正例」。
+      if (this.lastPositiveTs !== t) {
+        this.lastPositiveTs = t;
+        for (const cls of ['helmet', 'glove']) {
+          if (list.some((o) => matchLabel(o.label, classes[cls] || []))) this.positives[cls].push(t);
+        }
+      }
+      this.refreshPositive(t);
+      return;
+    }
+    for (const o of list) {
+      for (const cls of ['helmet', 'glove']) {
+        // 旧行为：整场 sticky，一次正例永久解锁护栏
+        if (!this.saw[cls] && matchLabel(o.label, classes[cls] || [])) this.saw[cls] = true;
+      }
     }
   }
 
-  entry(trackId) {
-    let e = this.tracks.get(trackId);
+  entry(trackId, person = null) {
+    const uid = person?.track_uid;
+    // uid 优先：调用方把同一条轨迹的 track_id 重映射时，仍命中同一条计时器。
+    // 不在这里做 linkAcrossIds 的跨 id 继承——该功能默认关闭，尚未实现；
+    // 跟踪器 prune 后重新出现的人是新 uid，计时从 0 开始。
+    const key = uid ?? trackId;
+    let e = this.tracks.get(key);
     if (!e) {
       e = {
         helmet: { since: null, streak: 0 },
         glove: { L: { since: null, streak: 0 }, R: { since: null, streak: 0 } },
+        track_id: trackId,
+        track_uid: uid ?? null,
       };
-      this.tracks.set(trackId, e);
+      this.tracks.set(key, e);
     }
+    // 同 uid 的 id 更新后保留最新 track_id，供 prune(activeIds) 的旧调用方匹配
+    e.track_id = trackId;
+    if (uid != null) e.track_uid = uid;
     return e;
   }
 
@@ -204,17 +273,21 @@ export class PpeMonitor {
   }
 
   /**
-   * @returns {{helmet:{state,streak_ms,alert,reason}, glove:{state,alert,streak_ms,reason,L:object,R:object}}}
+   * @returns {{helmet:{state,streak_ms,alert,reason,reason_code}, glove:{state,alert,streak_ms,reason,reason_code,L:object,R:object}}}
    */
   update(trackId, person, objects, ts) {
-    this.noteObjects(objects);
+    this.lastTs = ts;
+    // 窗口模式先把过期正例清掉（没有新框的帧也要让护栏重新生效）
+    this.refreshPositive(ts);
+    this.noteObjects(objects, ts);
     const a = assessPpe(person, objects, this.cfg, { sawClasses: this.saw });
-    const e = this.entry(trackId);
+    const e = this.entry(trackId, person);
 
     const hStreak = this.step(e.helmet, a.helmet.state, ts);
     const helmet = {
       state: a.helmet.state,
       reason: a.helmet.reason,
+      reason_code: a.helmet.reason_code,
       streak_ms: Math.round(hStreak),
       alert: a.helmet.state === 'missing' ? alertFor(hStreak, this.cfg.helmet) : 'none',
       box: a.helmet.box,
@@ -227,6 +300,7 @@ export class PpeMonitor {
       per[side] = {
         state: st.state,
         reason: st.reason,
+        reason_code: st.reason_code,
         streak_ms: Math.round(sStreak),
         alert: st.state === 'missing' ? alertFor(sStreak, this.cfg.glove) : 'none',
         box: st.box,
@@ -241,10 +315,14 @@ export class PpeMonitor {
     const gStreak = Math.max(per.L.streak_ms, per.R.streak_ms);
     const gAlert = [per.L.alert, per.R.alert].includes('violation') ? 'violation'
       : [per.L.alert, per.R.alert].includes('suspect') ? 'suspect' : 'none';
+    // 合并后的 glove 也带 reason_code：取导致 unknown 的那一侧，便于导出后解释弃权原因
+    const gReason = glove === 'unknown'
+      ? (['L', 'R'].map((s) => per[s]).find((p) => p.state === 'unknown' && p.reason_code)?.reason_code ?? null)
+      : null;
 
     return {
       helmet,
-      glove: { state: glove, streak_ms: gStreak, alert: gAlert, L: per.L, R: per.R },
+      glove: { state: glove, streak_ms: gStreak, alert: gAlert, reason_code: gReason, L: per.L, R: per.R },
     };
   }
 }

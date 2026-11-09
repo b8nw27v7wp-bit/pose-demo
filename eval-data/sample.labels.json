@@ -9,21 +9,21 @@
       "end": 1900
     },
     {
-      "action": "squat",
+      "action": "clap",
       "start": 2000,
-      "end": 4000,
+      "end": 4200,
       "count": 1,
       "tol": 0
     },
     {
       "action": "stand",
-      "start": 4200,
-      "end": 4900
+      "start": 4400,
+      "end": 5100
     },
     {
       "action": "armRaised",
-      "start": 5400,
-      "end": 6700
+      "start": 5600,
+      "end": 6900
     }
   ]
 }

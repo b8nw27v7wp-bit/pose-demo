@@ -127,11 +127,17 @@ export class Tracker {
     this.appearWeight = appearWeight;
     this.assignment = assignment;
     this.nextId = 1;
-    this.tracks = new Map(); // id -> { id, bbox, center, vel, desc, lastTs, matchDt, hits, firstTs }
+    // track_uid：与 track_id 同时分配，但**不参与匹配**，track_id 的分配/匹配逻辑完全不动
+    // （A/B 基线不变）。下游（PpeMonitor）用 uid 作键，为跨 id 继承留锚点；
+    // linkAcrossIds 尚未实现，跟踪器 prune 后重新出现的人仍会得到新 uid、PPE 计时从 0 开始。
+    this.nextUid = 1;
+    this.tracks = new Map(); // id -> { id, uid, bbox, center, vel, desc, lastTs, matchDt, hits, firstTs }
   }
 
   reset() {
     this.nextId = 1;
+    // nextUid 刻意不重置：reset 后如果 PPE 监视器没有同步清空，旧 uid 不能再发一次。
+    // 单次会话内 uid 全局单调，才满足「不随 track_id 变化」的语义。
     this.tracks.clear();
   }
 
@@ -231,7 +237,7 @@ export class Tracker {
   /**
    * @param {Array<{bbox:number[]}>} persons 本帧检测（无需 track_id）
    * @param {number} ts 毫秒时间戳
-   * @returns {Array} 新数组，带 track_id / track_age_ms / is_new，按面积降序（第 0 个是最大的人）
+   * @returns {Array} 新数组，带 track_id / track_uid / track_age_ms / is_new，按面积降序（第 0 个是最大的人）
    */
   update(persons, ts) {
     const dets = persons.filter((p) => p && Array.isArray(p.bbox) && area(p.bbox) > 0);
@@ -271,7 +277,7 @@ export class Tracker {
       let tr = assigned.get(di);
       if (!tr) {
         tr = {
-          id: this.nextId++, bbox: det.bbox, center: center(det.bbox),
+          id: this.nextId++, uid: this.nextUid++, bbox: det.bbox, center: center(det.bbox),
           vel: null, desc: det.desc || null, lastTs: ts, hits: 0, firstTs: ts,
         };
         this.tracks.set(tr.id, tr);
@@ -289,7 +295,13 @@ export class Tracker {
       tr.center = center(det.bbox);
       tr.hits += 1;
       tr.lastTs = ts;
-      out.push({ ...det, track_id: tr.id, track_age_ms: Math.round(ts - tr.firstTs), is_new: tr.hits === 1 });
+      out.push({
+        ...det,
+        track_id: tr.id,
+        track_uid: tr.uid,
+        track_age_ms: Math.round(ts - tr.firstTs),
+        is_new: tr.hits === 1,
+      });
     }
 
     this.prune(ts);

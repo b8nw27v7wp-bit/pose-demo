@@ -4,7 +4,10 @@
 // 这里只验证**几何与解码**，不碰 onnxruntime-web（浏览器里跑，见
 // web/test/headless-ppe-onnx.mjs）。模型真实输出是否对，要靠无头检查。
 
-import { decodeYolo } from '../js/objects-onnx.js';
+import {
+  decodeYolo, createOnnxDetector, verifyOnnxManifest, loadOnnxManifest, manifestPathFor,
+} from '../js/objects-onnx.js';
+import { readLabels, parseYamlNames } from '../../scripts/ppe-model-manifest.mjs';
 
 let pass = 0;
 let fail = 0;
@@ -120,6 +123,97 @@ console.log('[5] 缺省参数');
   const out = decodeYolo(data, dims, {}, ID, 320, 320);
   check('缺省 cfg 也能解码', out.length === 1, JSON.stringify(out.map((o) => o.label)));
   check('没有 labels 时标签为 null（不按 index 猜）', out[0]?.label === null);
+}
+
+console.log('[6] sidecar 校验（R11-3）');
+{
+  const manifest = {
+    labels: ['helmet', 'no_helmet', 'person'],
+    inputSize: 320,
+    numClasses: 3,
+    sha256: 'deadbeef',
+    exportedAt: '2026-11-05T00:00:00.000Z',
+  };
+  const good = verifyOnnxManifest(manifest, { labels: [...LABELS], inputSize: 320 });
+  check('正确 sidecar 通过', good.ok, good.error || '');
+  check('通过时返回 labels/numClasses', good.numClasses === 3 && good.labels[1] === 'no_helmet');
+
+  const order = verifyOnnxManifest(manifest, {
+    labels: ['no_helmet', 'helmet', 'person'], inputSize: 320,
+  });
+  check('数量相同、顺序错 → 失败', !order.ok);
+  check('错误消息定位第一处差异', /第 0 个/.test(order.error || ''), order.error);
+
+  const count = verifyOnnxManifest(manifest, {
+    labels: [...LABELS, 'vest'], inputSize: 320,
+  });
+  check('labels 数量不一致 → 失败', !count.ok && /数量/.test(count.error || ''), count.error);
+
+  const size = verifyOnnxManifest(manifest, { labels: [...LABELS], inputSize: 640 });
+  check('inputSize 不一致 → 失败', !size.ok && /inputSize/.test(size.error || ''), size.error);
+
+  const broken = verifyOnnxManifest({ ...manifest, numClasses: 9 }, { labels: [...LABELS], inputSize: 320 });
+  check('sidecar 自身 numClasses 与 labels 矛盾 → 失败', !broken.ok);
+
+  const missing = await loadOnnxManifest('nope.onnx', {
+    fetchImpl: async () => ({ status: 404, ok: false }),
+  });
+  check('缺 sidecar 被识别为 missing', missing.ok === false && missing.reason === 'missing');
+
+  const loaded = await loadOnnxManifest('ppe_smoke.onnx', {
+    fetchImpl: async (url) => {
+      check('sidecar 与模型同目录同名', url === manifestPathFor('ppe_smoke.onnx')
+        && /ppe_smoke\.onnx\.json$/.test(url), url);
+      return { status: 200, ok: true, json: async () => manifest };
+    },
+  });
+  check('正确 sidecar 可加载', loaded.ok && loaded.manifest.sha256 === 'deadbeef');
+
+  const err = await loadOnnxManifest('ppe_smoke.onnx', {
+    fetchImpl: async () => { throw new Error('network down'); },
+  });
+  check('取 sidecar 网络错误可解释', err.ok === false && err.reason === 'fetch_error');
+
+  // create 阶段就失败：不进入 ORT 创建/推理（Node 里也能测）
+  let createErr = null;
+  try {
+    await createOnnxDetector({
+      model: 'fake.onnx',
+      labels: ['no_helmet', 'helmet', 'person'],
+      loadManifest: async () => ({ ok: true, manifest }),
+    });
+  } catch (e) { createErr = e.message; }
+  check('create 阶段拒绝类别顺序错', /第 0 个/.test(createErr || ''), createErr);
+
+  createErr = null;
+  try {
+    await createOnnxDetector({
+      model: 'fake.onnx',
+      labels: [...LABELS],
+      loadManifest: async () => ({ ok: false, reason: 'missing' }),
+    });
+  } catch (e) { createErr = e.message; }
+  check('requireManifest 默认 true：缺 sidecar 在 create 阶段失败',
+    /sidecar/.test(createErr || '') && /ppe-model-manifest/.test(createErr || ''), createErr);
+}
+
+console.log('[7] sidecar 生成脚本：--labels 来源');
+{
+  // 路径写错必须报错，不能把路径当内联单类——否则会生成一份 label 就是路径的 sidecar，
+  // 并覆盖掉已有的正确 sidecar（web/models 不进 git，覆盖后无法恢复）。
+  let err = null;
+  try { await readLabels('definitely-missing.yaml'); } catch (e) { err = e.message; }
+  check('缺 labels 文件 → 明确报错（不当内联）', /读不到 --labels 文件/.test(err || ''), err);
+
+  const inline = await readLabels('helmet,no_helmet,glove');
+  check('逗号列表 → 内联标签', inline.source === 'inline' && inline.labels.length === 3,
+    JSON.stringify(inline.labels));
+
+  check('names 行尾注释不影响缩进列表',
+    JSON.stringify(parseYamlNames('names:  # 3 类\n  0: helmet\n  1: no_helmet\n'))
+      === '["helmet","no_helmet"]');
+  check('names 行尾注释不影响内联列表',
+    JSON.stringify(parseYamlNames("names: ['a','b']  # x")) === '["a","b"]');
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

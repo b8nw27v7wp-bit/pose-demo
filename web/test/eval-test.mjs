@@ -12,8 +12,11 @@ import {
   evaluateGates, sweepVariants, diffSummary, compareSummaries, compareSegments,
   temporalStats, gestureFrames, gestureSummary, gestureSummaryIfAny,
   fitToParams, resampleFrames, FIT_MIN_SAMPLES,
+  objectsInfo, objectModelChange, formatObject,
 } from './evaluate.mjs';
 import { DEFAULT_PARAMS, mergeParams, profileParams, profileName, paramsHash } from '../js/params.js';
+import { SignalEngine } from '../js/signals.js';
+import { ActionEngine } from '../js/actions.js';
 import { videoTimeMonotonic } from './frame-io.mjs';
 import { ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
 import { writeFile, readFile, mkdtemp, rm } from 'node:fs/promises';
@@ -62,6 +65,14 @@ function squatKp(t) {
   ];
 }
 
+/** 腕位（index 5/6，胸前 y=200）：open=0 两手合 0.33·scale，open=1 张开 1.33·scale */
+function clapKp(open) {
+  const dx = 20 + 60 * open;
+  return STAND.map((p, i) => (i === 5 || i === 6)
+    ? [100 + (i === 5 ? -dx : dx), 200, 1]
+    : p);
+}
+
 function frame(ts, kp, score = 0.92) {
   const xs = kp.map((p) => p[0]);
   const ys = kp.map((p) => p[1]);
@@ -89,13 +100,13 @@ const RAISED = STAND.map((p) => [...p]);
 RAISED[5] = [80, 60, 1];
 RAISED[6] = [120, 60, 1];
 
-/** 站 1s → 蹲 1s → 站起 1s，返回帧与结束时间；用于计数与自动标注的用例 */
-function squatClip(n = 10) {
+/** 站 1s → 张开两手 1s（渐变，穿过 down/up 两个阈值）→ 放下 1s；应计 1 次鼓掌 */
+function clapClip(n = 8) {
   const recs = [];
   let t = 0;
-  for (let i = 0; i < n; i++) recs.push(frame(t += 100, STAND));
-  for (let i = 0; i < n; i++) recs.push(frame(t += 100, squatKp(1)));
-  for (let i = 0; i < n; i++) recs.push(frame(t += 100, STAND));
+  for (let i = 0; i < 10; i++) recs.push(frame(t += 100, STAND));
+  for (let i = 1; i <= n; i++) recs.push(frame(t += 100, clapKp(i / n)));
+  for (let i = 0; i < 10; i++) recs.push(frame(t += 100, STAND));
   return { recs, end: t };
 }
 
@@ -119,7 +130,7 @@ console.log('\n[1] 静态姿态评估');
   check('标注正确 → 通过', good.segments[0].pass === true);
 
   const wrong = evaluateClip(recs, {
-    segments: [{ action: 'lying', start: 1500, end: 5500 }],
+    segments: [{ action: 'sit', start: 1500, end: 5500 }],
   }, tl);
   check('标注错误 → 不通过（抓漏）', wrong.segments[0].pass === false);
 
@@ -129,41 +140,39 @@ console.log('\n[1] 静态姿态评估');
   check('站着却标"无动作" → 不通过（抓错）', noneWrong.segments[0].pass === false);
 }
 
-// —— 2. 重复计数：一次深蹲必须计 1 ---------------------------------------
-console.log('\n[2] 深蹲计数评估');
+// —— 2. 重复计数：一次鼓掌必须计 1 ---------------------------------------
+console.log('\n[2] 鼓掌计数评估');
 {
-  // 站立 1s → 蹲 1s → 站起 1s，共 3 秒，应计 1 次
+  // 站 1s（合手）→ 张开两手 1s → 放下 1s，应计 1 次
   const recs = [];
   let t = 0;
   for (let i = 0; i < 10; i++) recs.push(frame(t += 100, STAND));
-  for (let i = 0; i < 10; i++) recs.push(frame(t += 100, squatKp(1)));
+  for (let i = 1; i <= 8; i++) recs.push(frame(t += 100, clapKp(i / 8)));
   for (let i = 0; i < 10; i++) recs.push(frame(t += 100, STAND));
 
   const tl = replay(recs);
-  const sq = tl[tl.length - 1].act.reps.squat;
-  check('复算出 1 次深蹲', sq === 1, `squat=${sq}`);
+  const sq = tl[tl.length - 1].act.reps.clap;
+  check('复算出 1 次鼓掌', sq === 1, `clap=${sq}`);
 
-  const ok = evaluateClip(recs, { segments: [{ action: 'squat', start: 0, end: t, count: 1 }] }, tl);
+  const ok = evaluateClip(recs, { segments: [{ action: 'clap', start: 0, end: t, count: 1 }] }, tl);
   check('标 1 次 → 通过', ok.segments[0].pass === true, `got=${ok.segments[0].got}`);
 
-  const bad = evaluateClip(recs, { segments: [{ action: 'squat', start: 0, end: t, count: 3 }] }, tl);
+  const bad = evaluateClip(recs, { segments: [{ action: 'clap', start: 0, end: t, count: 3 }] }, tl);
   check('标 3 次 → 不通过', bad.segments[0].pass === false, `got=${bad.segments[0].got}`);
 
-  // 门控：蹲下去但腿变水平（像坐），不该计数
-  const sitRecs = [];
+  // 门控：手抬到胸前才算鼓掌。两腕垂在髋高度时开合不该计数。
+  const lowRecs = [];
   t = 0;
-  for (let i = 0; i < 10; i++) sitRecs.push(frame(t += 100, STAND));
-  for (let i = 0; i < 10; i++) {
-    const kp = squatKp(1);
-    // 把踝拉到和髋一样高 → leg_vertical ≈ 0（坐姿/腿水平）
-    kp[11] = [88, kp[7][1], 1];
-    kp[12] = [112, kp[8][1], 1];
-    sitRecs.push(frame(t += 100, kp));
+  for (let i = 0; i < 10; i++) lowRecs.push(frame(t += 100, STAND));
+  for (let i = 1; i <= 8; i++) {
+    const dx = 20 + 60 * (i / 8);
+    const low = STAND.map((p, k) => ((k === 5 || k === 6) ? [100 + (k === 5 ? -dx : dx), 380, 1] : p));
+    lowRecs.push(frame(t += 100, low));
   }
-  for (let i = 0; i < 10; i++) sitRecs.push(frame(t += 100, STAND));
-  const sitTl = replay(sitRecs);
-  check('腿水平的下蹲过程不计深蹲', sitTl[sitTl.length - 1].act.reps.squat === 0,
-    `squat=${sitTl[sitTl.length - 1].act.reps.squat}`);
+  for (let i = 0; i < 10; i++) lowRecs.push(frame(t += 100, STAND));
+  const lowTl = replay(lowRecs);
+  check('两腕在髋高度开合不计鼓掌', lowTl[lowTl.length - 1].act.reps.clap === 0,
+    `clap=${lowTl[lowTl.length - 1].act.reps.clap}`);
 }
 
 // —— 3. 汇总指标：命中与漏判要能区分 -------------------------------------
@@ -174,10 +183,10 @@ console.log('\n[3] 逐段判定');
   const tl = replay(recs);
 
   const c1 = evaluateClip(recs, { name: 'a', segments: [{ action: 'stand', start: 1000, end: 2000 }] }, tl);
-  const c2 = evaluateClip(recs, { name: 'b', segments: [{ action: 'lying', start: 3000, end: 4000 }] }, tl);
+  const c2 = evaluateClip(recs, { name: 'b', segments: [{ action: 'sit', start: 3000, end: 4000 }] }, tl);
 
   check('stand 命中', c1.segments[0].pass === true);
-  check('lying 漏判', c2.segments[0].pass === false);
+  check('sit 漏判', c2.segments[0].pass === false);
 }
 
 // —— 4. 空帧 / 未检出人体不能崩 ------------------------------------------
@@ -226,7 +235,7 @@ console.log('\n[6] 标注时间基准');
   const bySec = evaluateClip(recs, { segments: [{ action: 'stand', startSec: 1.0, endSec: 4.0 }] }, tl);
   check('秒数标注能命中站立', bySec.segments[0].pass === true);
 
-  const bySecMiss = evaluateClip(recs, { segments: [{ action: 'lying', startSec: 1.0, endSec: 4.0 }] }, tl);
+  const bySecMiss = evaluateClip(recs, { segments: [{ action: 'sit', startSec: 1.0, endSec: 4.0 }] }, tl);
   check('秒数标注能判出漏判', bySecMiss.segments[0].pass === false);
 
   const byFrame = evaluateClip(recs, { segments: [{ action: 'stand', startFrame: 10, endFrame: 40 }] }, tl);
@@ -422,22 +431,22 @@ console.log('\n[11] 负例语法');
 // —— 12. 计数误报：反例段与 none 窗口都要归因 ——
 console.log('\n[12] 计数误报归因');
 {
-  const { recs, end } = squatClip();
+  const { recs, end } = clapClip();
   const tl = replay(recs);
 
-  const neg = evaluateClip(recs, { segments: [{ action: '!squat', start: 0, end }] }, tl);
-  check('!squat 在真有一次深蹲时失败', neg.segments[0].pass === false && neg.segments[0].got === 1,
+  const neg = evaluateClip(recs, { segments: [{ action: '!clap', start: 0, end }] }, tl);
+  check('!clap 在真有一次鼓掌时失败', neg.segments[0].pass === false && neg.segments[0].got === 1,
     `got=${neg.segments[0].got}`);
-  const row = summarize([neg]).find((r) => r.action === 'squat');
-  check('反例计数的增量记为 squat 的 FP', row?.fp === 1, `fp=${row?.fp}`);
+  const row = summarize([neg]).find((r) => r.action === 'clap');
+  check('反例计数的增量记为 clap 的 FP', row?.fp === 1, `fp=${row?.fp}`);
 
   const noneClip = evaluateClip(recs, { segments: [{ action: 'none', start: 0, end }] }, tl);
-  check('none 段记录窗口内的计数误报', noneClip.segments[0].repFalseAlarms?.squat === 1,
+  check('none 段记录窗口内的计数误报', noneClip.segments[0].repFalseAlarms?.clap === 1,
     `repFP=${JSON.stringify(noneClip.segments[0].repFalseAlarms)}`);
-  const row2 = summarize([noneClip]).find((r) => r.action === 'squat');
-  check('汇总把 none 窗口的乱计数记到 squat 的 FP', row2?.fp === 1, `fp=${row2?.fp}`);
+  const row2 = summarize([noneClip]).find((r) => r.action === 'clap');
+  check('汇总把 none 窗口的乱计数记到 clap 的 FP', row2?.fp === 1, `fp=${row2?.fp}`);
 
-  // 手臂反例不替计数背锅：!onHips 窗口里发生深蹲，不应算 squat 的 FP
+  // 手臂反例不替计数背锅：!onHips 窗口里发生鼓掌，不应算 clap 的 FP
   const armNeg = evaluateClip(recs, { segments: [{ action: '!onHips', start: 0, end }] }, tl);
   check('手臂反例不算计数的 FP', !armNeg.segments[0].repFalseAlarms,
     `repFP=${JSON.stringify(armNeg.segments[0].repFalseAlarms)}`);
@@ -450,7 +459,7 @@ console.log('\n[13] 失败区间');
   for (let i = 0; i < 60; i++) recs.push(frame(i * 100, STAND));
   const tl = replay(recs);
 
-  const fn = evaluateClip(recs, { segments: [{ action: 'lying', start: 2000, end: 4000 }] }, tl);
+  const fn = evaluateClip(recs, { segments: [{ action: 'sit', start: 2000, end: 4000 }] }, tl);
   const seg = fn.segments[0];
   check('漏判带上帧区间', seg.pass === false && Array.isArray(seg.fail.frames)
     && seg.fail.frames[1] >= seg.fail.frames[0], `frames=${JSON.stringify(seg.fail.frames)}`);
@@ -471,14 +480,14 @@ console.log('\n[13] 失败区间');
 // —— 14. 自动标注草稿 ——
 console.log('\n[14] 自动标注');
 {
-  const { recs } = squatClip();
+  const { recs } = clapClip();
   const tl = replay(recs);
   const draft = autoLabelClip(recs, tl, { name: 'auto' });
 
   check('草稿有名字与说明', draft.name === 'auto' && draft.note.includes('反例'));
   check('草稿含姿态段', draft.segments.some((s) => s.action === 'stand'));
-  check('草稿含计数段且次数对', draft.segments.some((s) => s.action === 'squat' && s.count === 1),
-    `seg=${JSON.stringify(draft.segments.filter((s) => s.action === 'squat'))}`);
+  check('草稿含计数段且次数对', draft.segments.some((s) => s.action === 'clap' && s.count === 1),
+    `seg=${JSON.stringify(draft.segments.filter((s) => s.action === 'clap'))}`);
   check('草稿只写正例（无反例段）', draft.segments.every((s) => !String(s.action).startsWith('!')
     && s.action !== 'none' && s.action !== 'noArm'));
 
@@ -528,7 +537,7 @@ console.log('\n[15] 元数据与报告');
   const tl = replay(recs2);
   const clip = evaluateClip(recs2, {
     name: 'r', camera: 'side', subject: '甲',
-    segments: [{ action: 'lying', start: 1000, end: 4000 }],
+    segments: [{ action: 'sit', start: 1000, end: 4000 }],
   }, tl);
   const md = toMarkdown({
     clips: [clip], totalFrames: recs2.length, profile: 'p', profileModel: 'lite',
@@ -602,25 +611,25 @@ console.log('\n[11] 负例语法');
   }, tlSquat);
   check('!stand 在非站立段 → 通过', negPass.segments[0].pass === true);
 
-  // 计数反例：!squat 期望 0 次
+  // 计数反例：!clap 期望 0 次
   const negRepOk = evaluateClip(standRecs, {
-    segments: [{ action: '!squat', start: 0, end: 3000 }],
+    segments: [{ action: '!clap', start: 0, end: 3000 }],
   }, tlStand);
-  check('!squat 0 次 → 通过', negRepOk.segments[0].pass === true);
+  check('!clap 0 次 → 通过', negRepOk.segments[0].pass === true);
 
   const repRecs = [];
   let t = 0;
   for (let i = 0; i < 10; i++) repRecs.push(frame(t += 100, STAND));
-  for (let i = 0; i < 10; i++) repRecs.push(frame(t += 100, squatKp(1)));
+  for (let i = 1; i <= 8; i++) repRecs.push(frame(t += 100, clapKp(i / 8)));
   for (let i = 0; i < 10; i++) repRecs.push(frame(t += 100, STAND));
   const tlRep = replay(repRecs);
   const negRepBad = evaluateClip(repRecs, {
-    segments: [{ action: '!squat', start: 0, end: t }],
+    segments: [{ action: '!clap', start: 0, end: t }],
   }, tlRep);
-  check('!squat 出现 1 次 → 不通过', negRepBad.segments[0].pass === false
+  check('!clap 出现 1 次 → 不通过', negRepBad.segments[0].pass === false
     && negRepBad.segments[0].want === 0 && negRepBad.segments[0].got === 1,
   JSON.stringify(negRepBad.segments[0]));
-  const sumRep = summarize([negRepBad]).find((r) => r.action === 'squat');
+  const sumRep = summarize([negRepBad]).find((r) => r.action === 'clap');
   check('计数反例失败记 FP', sumRep.fp === 1 && sumRep.fn === 0, JSON.stringify(sumRep));
 }
 
@@ -671,7 +680,7 @@ console.log('\n[19] 混淆矩阵');
   const labels = {
     segments: [
       { action: 'stand', start: 0, end: 900 },
-      { action: 'squat_static', start: 1000, end: 2000 },
+      { action: 'none', start: 1000, end: 1900 },
       { action: 'stand', start: 2100, end: 2900 },
       { action: 'none', start: 3000, end: 3900 },
       { action: '!stand', start: 3950, end: 4050 },
@@ -680,8 +689,8 @@ console.log('\n[19] 混淆矩阵');
   };
   const conf = postureConfusion(tl, labels, recs);
   const idx = (name) => conf.labels.indexOf(name);
-  check('矩阵是 5×5 且标签固定', conf.labels.length === 5 && conf.matrix.length === 5
-    && conf.matrix.every((r) => r.length === 5));
+  check('矩阵是 3×3 且标签固定（stand/sit/none）', conf.labels.length === 3 && conf.matrix.length === 3
+    && conf.matrix.every((r) => r.length === 3), `labels=${conf.labels}`);
   check('统计到姿态帧', conf.frames > 0, `frames=${conf.frames}`);
   check('stand 行对角线最大', conf.matrix[idx('stand')][idx('stand')]
     >= Math.max(...conf.matrix[idx('stand')]),
@@ -693,7 +702,7 @@ console.log('\n[19] 混淆矩阵');
 
   // 同一帧被标成两个姿态 → 冲突，跳过（这是标注错误，不是模型错误）
   const clash = postureConfusion(tl, {
-    segments: [{ action: 'stand', start: 1000, end: 3000 }, { action: 'lying', start: 2000, end: 4000 }],
+    segments: [{ action: 'stand', start: 1000, end: 3000 }, { action: 'sit', start: 2000, end: 4000 }],
   }, recs);
   check('重叠标注记为冲突', clash.ambiguous > 0, `ambiguous=${clash.ambiguous}`);
 
@@ -757,11 +766,11 @@ console.log('\n[21] 灵敏度与对比');
     return r;
   }
 
-  const s = sweepVariants({ actions: { reps: { squat: { down: 100 } } } }, 'actions.reps.squat.down');
-  check('扫描基准值正确', s.baseValue === 100);
-  check('扫描值为 ±10%/±20%', s.variants.map((v) => v.value).join(',') === '80,90,110,120',
+  const s = sweepVariants({ actions: { holds: { arm: 300 } } }, 'actions.holds.arm');
+  check('扫描基准值正确', s.baseValue === 300);
+  check('扫描值为 ±10%/±20%', s.variants.map((v) => v.value).join(',') === '240,270,330,360',
     `vals=${s.variants.map((v) => v.value)}`);
-  check('每个变体真的改了参数', s.variants.every((v) => v.params.actions.reps.squat.down === v.value));
+  check('每个变体真的改了参数', s.variants.every((v) => v.params.actions.holds.arm === v.value));
 
   const st = sweepVariants({ signals: { gesture: { streak: 3 } } }, 'signals.gesture.streak');
   check('整数参数取整并去重', st.variants.map((v) => v.value).join(',') === '2,4',
@@ -881,7 +890,7 @@ console.log('\n[23] 时延与抖动');
     `latency=${clip.segments[1].latencyMs}`);
   check('clip 记录每个动作的状态段数', clip.activity.stand >= 1, `runs=${clip.activity.stand}`);
 
-  const failClip = evaluateClip(recs, { segments: [{ action: 'lying', start: 0, end: 2000 }] }, tl);
+  const failClip = evaluateClip(recs, { segments: [{ action: 'sit', start: 0, end: 2000 }] }, tl);
   check('失败段没有时延', failClip.segments[0].latencyMs === undefined);
 
   const t = temporalStats([clip]);
@@ -896,12 +905,13 @@ console.log('\n[23] 时延与抖动');
   check('抖动按分钟折算', standFlicker?.perMinute === +(standFlicker.runs / mins).toFixed(2),
     `flicker=${JSON.stringify(standFlicker)}`);
 
-  const { recs: sqRecs } = squatClip();
+  const { recs: sqRecs } = clapClip();
   const sqClip = evaluateClip(sqRecs, { segments: [] }, replay(sqRecs));
-  check('深蹲过程把 stand 切成两段', sqClip.activity.stand === 2,
+  // 鼓掌不改变姿态：站姿应是一整段（深蹲下线后不再有「蹲下把 stand 切开」的语义）
+  check('鼓掌全程保持站立 → stand 只有一段', sqClip.activity.stand === 1,
     `runs=${sqClip.activity.stand}`);
-  check('深蹲静态姿态只触发一次', sqClip.activity.squat_static === 1,
-    `runs=${sqClip.activity.squat_static}`);
+  check('鼓掌过程不再产生已下线的姿态档', !('squat_static' in sqClip.activity),
+    `keys=${Object.keys(sqClip.activity)}`);
 
   const raisedRecs = [];
   for (let i = 0; i < 30; i++) raisedRecs.push(frame(i * 100, RAISED));
@@ -982,24 +992,24 @@ console.log('\n[25] 计数误差口径（每 20 次）');
 {
   const repClip = (...pairs) => ({
     segments: pairs.map(([want, got]) => ({
-      type: 'rep', action: 'squat', expect: true, want, got, pass: Math.abs(got - want) <= 1,
+      type: 'rep', action: 'clap', expect: true, want, got, pass: Math.abs(got - want) <= 1,
     })),
   });
 
-  const doubled = summarize([repClip([10, 20])]).find((r) => r.action === 'squat');
+  const doubled = summarize([repClip([10, 20])]).find((r) => r.action === 'clap');
   check('want 10 / got 20（多算一倍）→ 每 20 次误差 20', doubled.countErr === 20,
     `countErr=${doubled.countErr}`);
   check('多算一倍在 maxCountErr=1 时门槛失败',
     !evaluateGates([doubled], { maxCountErr: 1 }).passed);
 
-  const missed = summarize([repClip([3, 0])]).find((r) => r.action === 'squat');
+  const missed = summarize([repClip([3, 0])]).find((r) => r.action === 'clap');
   check('want 3 / got 0（完全漏数）→ 每 20 次误差 20', missed.countErr === 20,
     `countErr=${missed.countErr}`);
   check('完全漏数在 maxCountErr=1 时门槛失败',
     !evaluateGates([missed], { maxCountErr: 1 }).passed);
 
   // 两段各 10 次，只错 1 次：|0| + |1| = 1，1/20 * 20 = 1
-  const oneOff = summarize([repClip([10, 10], [10, 11])]).find((r) => r.action === 'squat');
+  const oneOff = summarize([repClip([10, 10], [10, 11])]).find((r) => r.action === 'clap');
   check('20 次里错 1 次 → 每 20 次误差 1', oneOff.countErr === 1, `countErr=${oneOff.countErr}`);
   check('20 次里错 1 次在 maxCountErr=1 时通过',
     evaluateGates([oneOff], { maxCountErr: 1 }).passed);
@@ -1231,19 +1241,11 @@ console.log('\n[28] R4 拟合工具');
   // 分位 → profile：方向约定见 evaluate.fitToParams 的注释
   const fit = {
     'stand/knee': { n: 50, p5: 160, p50: 168, p95: 175 },
-    'squat_static/knee': { n: 50, p5: 95, p50: 105, p95: 110 },
     'sit/knee': { n: 30, p5: 70, p50: 100, p95: 130 },
     'stand/uprightness': { n: 50, p5: 0.9, p50: 0.95, p95: 0.98 },
-    'squat_static/uprightness': { n: 50, p5: 0.5, p50: 0.55, p95: 0.6 },
-    'squat_static/leg_vertical': { n: 50, p5: 1.0, p50: 1.2, p95: 1.4 },
     'sit/uprightness': { n: 30, p5: 0.6, p50: 0.7, p95: 0.8 },
-    'lying/uprightness': { n: 30, p5: 0.15, p50: 0.2, p95: 0.3 },
     'stand/leg_vertical': { n: 50, p5: 0.95, p50: 1.0, p95: 1.1 },
     'sit/leg_vertical': { n: 30, p5: 0.4, p50: 0.6, p95: 0.8 },
-    'lying/leg_vertical': { n: 30, p5: 0.7, p50: 0.8, p95: 0.9 },
-    'squat_baseline/knee': { n: 40, p5: 95, p50: 105, p95: 115 },
-    'pushup_baseline/elbow': { n: 20, p5: 70, p50: 120, p95: 160 },
-    'pushup_baseline/uprightness': { n: 20, p5: 0.1, p50: 0.2, p95: 0.3 },
     'clap_baseline/hands_close': { n: 20, p5: 0.3, p50: 0.45, p95: 0.6 },
     'armRaised/elev_torso_L': { n: 30, p5: 20, p50: 30, p95: 40 },
     // 单臂动作：另一侧是「放下/未伸出」的高位/低位，拟合必须排除它
@@ -1255,31 +1257,24 @@ console.log('\n[28] R4 拟合工具');
   const P = fp.params;
   check('姿态下限型：stand.kneeGt = P5 − 10%', P.actions?.posture?.stand?.kneeGt === 144,
     `got=${P.actions?.posture?.stand?.kneeGt}`);
-  check('姿态上限型：squat.kneeLt = P95 + 10%', P.actions?.posture?.squat?.kneeLt === 121,
-    `got=${P.actions?.posture?.squat?.kneeLt}`);
   check('sit 区间同时拟合', P.actions?.posture?.sit?.kneeGt === 63
     && P.actions?.posture?.sit?.kneeLt === 143);
-  check('uprightness 按比例留余量', P.actions?.posture?.stand?.uprightnessGt === 0.81
-    && P.actions?.posture?.lying?.uprightnessLt === 0.33);
-  check('站姿/计数门控同源', P.actions?.posture?.stand?.legVerticalGt === 0.855
-    && P.actions?.gates?.squat?.legVerticalGt === 0.855
-    && P.actions?.gates?.squat?.uprightnessGt === 0.81);
-  check('下蹲姿态的腿竖直比也能拟合（P5 − 10%）',
-    P.actions?.posture?.squat?.legVerticalGt === 0.9,
-    `got=${P.actions?.posture?.squat?.legVerticalGt}`);
-  check('squat 计数阈值成对且 down < up',
-    P.actions?.reps?.squat?.down === 127 && P.actions?.reps?.squat?.up === 144,
-    JSON.stringify(P.actions?.reps?.squat));
-  check('pushup up 夹在 175（角度极限 180）', P.actions?.reps?.pushup?.up === 175
-    && P.actions?.reps?.pushup?.down === 63);
+  check('uprightness 按比例留余量', P.actions?.posture?.stand?.uprightnessGt === 0.81);
+  check('stand.legVerticalGt = P5 − 10%',
+    P.actions?.posture?.stand?.legVerticalGt === 0.855,
+    `got=${P.actions?.posture?.stand?.legVerticalGt}`);
   check('clap 比例阈值成对', P.actions?.reps?.clap?.down === 0.27
     && P.actions?.reps?.clap?.up === 0.66);
   check('elevTorso.raised 取两侧较低 P95（上限型，排除下垂臂）',
     P.signals?.arm?.elevTorso?.raised === 44, `got=${P.signals?.arm?.elevTorso?.raised}`);
   check('extend.minReach 取两侧较高 P5（下限型，排除未伸出的臂）',
     P.signals?.arm?.extend?.minReach === 1.26, `got=${P.signals?.arm?.extend?.minReach}`);
-  check('pushup 门控用 P95', P.actions?.gates?.pushup?.uprightnessLt === 0.33);
   check('分位来源可追溯', fp.sources.length > 0 && fp.sources.every((s) => s.n >= FIT_MIN_SAMPLES));
+  // 已下线的姿态/计数（躺卧、下蹲、俯卧撑）不再出现在拟合结果里
+  check('拟合结果不含已下线动作',
+    !P.actions?.posture?.squat && !P.actions?.posture?.lying
+    && !P.actions?.reps?.squat && !P.actions?.reps?.pushup && !P.actions?.gates,
+    `actions=${JSON.stringify(Object.keys(P.actions || {}))}`);
 
   const tight = fitToParams({ 'stand/knee': { n: 20, p5: 160, p95: 175 } }, { margin: 0.05 });
   check('margin 可调（5%）', tight.params.actions?.posture?.stand?.kneeGt === 152);
@@ -1289,11 +1284,10 @@ console.log('\n[28] R4 拟合工具');
     `params=${JSON.stringify(thin.params)}`);
 
   const bad = fitToParams({
-    'squat_baseline/knee': { n: 20, p5: 160, p95: 170 },
-    'stand/knee': { n: 20, p5: 100, p95: 120 },
+    'clap_baseline/hands_close': { n: 20, p5: 0.9, p95: 0.3 },
   });
   check('down >= up 时整对跳过并告警',
-    !bad.params.actions?.reps?.squat && bad.warnings.some((w) => /squat/.test(w)),
+    !bad.params.actions?.reps?.clap && bad.warnings.some((w) => /clap/.test(w)),
     bad.warnings.join('；'));
 
   const merged = mergeParams(
@@ -1421,6 +1415,281 @@ console.log('\n[28] R4 拟合工具');
   }
 }
 
+
+// —— 29. 多人评估（R12-1）：逐 track 回放、label.track、手势归属与旧数据回归 ——
+// 合成帧：A 挥手、B 站立。A 的挥手必须只算在 A 头上；B 的 !waving 不能被 A 污染。
+console.log('\n[29] 多人评估口径');
+{
+  const shiftKp = (kp, dx) => kp.map(([x, y, v]) => [x + dx, y, v]);
+  const mkPerson = (kp, track_id, bbox = null, scale = 127) => {
+    const xs = kp.map((p) => p[0]);
+    const ys = kp.map((p) => p[1]);
+    return {
+      track_id, kp_format: 'mediapipe33', kp, scale, score: 0.9,
+      bbox: bbox || [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
+    };
+  };
+  const multiFrame = (ts, people, { hands = null } = {}) => {
+    const f = { ts: Math.round(ts), person_count: people.length, persons: people, signals: null, actions: null };
+    if (hands) f.hands = hands;
+    return f;
+  };
+  const A_BASE = shiftKp(STAND, 0);
+  const B_BASE = shiftKp(STAND, 400);
+  // A：左腕举到肩上并左右摆（waving 需要「举手 + 水平方向翻转」两个条件）。
+  const waveKp = (i) => A_BASE.map((p, idx) => (idx === 5
+    ? [100 + (i % 2 ? 40 : -40), 60, 1]
+    : p));
+  const mf = Array.from({ length: 40 }, (_, i) => multiFrame(i * 100, [
+    mkPerson(waveKp(i), 0), mkPerson(B_BASE, 1),
+  ]));
+
+  const tl = replay(mf);
+  check('多人 replay 带逐 track 时间线', tl.tracks instanceof Map && tl.tracks.size === 2
+    && tl.tracks.get(0).length === mf.length, `tracks=${tl.tracks && tl.tracks.size}`);
+  const lastA = tl.tracks.get(0)[tl.tracks.get(0).length - 1];
+  const lastB = tl.tracks.get(1)[tl.tracks.get(1).length - 1];
+  check('A 判出挥手、B 没有', lastA.act.flags.waving === true && lastB.act.flags.waving === false,
+    `A=${lastA.act.flags.waving} B=${lastB.act.flags.waving}`);
+
+  const labels = {
+    segments: [
+      { action: 'waving', track: 0, startFrame: 20, endFrame: 39 },
+      { action: '!waving', track: 1, startFrame: 0, endFrame: 39 },
+      { action: 'stand', track: 1, startFrame: 5, endFrame: 39 },
+    ],
+  };
+  const ev = evaluateClip(mf, labels, tl);
+  check('A 的 waving 正例 → 命中（recall=1）', ev.segments[0].pass === true
+    && ev.segments[0].track === 0, JSON.stringify(ev.segments[0]));
+  check('B 的 !waving → 通过（不被 A 污染）', ev.segments[1].pass === true
+    && ev.segments[1].track === 1, JSON.stringify(ev.segments[1]));
+  check('B 的 stand 正例 → 通过', ev.segments[2].pass === true, JSON.stringify(ev.segments[2]));
+
+  const rows = summarize([ev]);
+  const aWave = rows.find((r) => r.track === 0 && r.action === 'waving');
+  const bStand = rows.find((r) => r.track === 1 && r.action === 'stand');
+  check('汇总按 track 出行并带 n', aWave && aWave.nRecall === 1 && aWave.recall === 1
+    && bStand && bStand.nRecall === 1, JSON.stringify(rows.map((r) => [r.track, r.action, r.nRecall])));
+
+  // label.track 绑定：同一段 waving 标到 B 头上 → 应漏判（B 没挥手）
+  const wrong = evaluateClip(mf, {
+    segments: [{ action: 'waving', track: 1, startFrame: 20, endFrame: 39 }],
+  }, tl);
+  check('label.track 绑定错人 → 漏判', wrong.segments[0].pass === false
+    && wrong.segments[0].track === 1, JSON.stringify(wrong.segments[0]));
+  const missing = evaluateClip(mf, {
+    segments: [{ action: 'waving', track: 9, startFrame: 20, endFrame: 39 }],
+  }, tl);
+  check('label.track 指向不存在的 track → 明确报错', missing.segments[0].pass === false
+    && /没有 track 9/.test(missing.segments[0].error || ''), missing.segments[0].error);
+
+  // label.track 写 uid（跨 id 稳定）：要能查回 track_id，而不是报「没有 track」
+  const mfUid = mf.map((f, i) => multiFrame(i * 100, [
+    { ...mkPerson(waveKp(i), 0), track_uid: 70 },
+    { ...mkPerson(B_BASE, 1), track_uid: 71 },
+  ]));
+  const tlUid = replay(mfUid);
+  const uidSeg = evaluateClip(mfUid, {
+    segments: [{ action: 'waving', track: 70, startFrame: 20, endFrame: 39 }],
+  }, tlUid);
+  check('label.track 写 uid → 查回 track_id（与 ppe-eval 同口径）',
+    uidSeg.segments[0].pass === true && uidSeg.segments[0].track === 0,
+    JSON.stringify(uidSeg.segments[0]));
+
+  // —— 多 track 汇总不再按 action 互相覆盖（baseline / sweep / A-B）——
+  const curRows = [
+    { action: 'waving', track: 0, recall: 0.16, precision: 1 },
+    { action: 'waving', track: 1, recall: 0.2, precision: 1 },
+  ];
+  const baseDoc = { summary: [
+    { action: 'waving', track: 0, recall: 1.0, precision: 1 },
+    { action: 'waving', track: 1, recall: 0.2, precision: 1 },
+  ] };
+  const gateB = evaluateGates(curRows, { baseline: baseDoc, maxDrop: 0.05 });
+  check('baseline 按 (track, action) 比对：track0 的 1.0→0.16 会被拦下',
+    gateB.passed === false
+    && gateB.violations.some((v) => v.action === 'waving' && v.track === 0),
+    JSON.stringify(gateB.violations));
+  const dRows = diffSummary([
+    { action: 'waving', track: 0, recall: 0.5 },
+    { action: 'waving', track: 1, recall: 0.9 },
+  ], curRows);
+  check('sweep 差异保留两条 track（不互相覆盖）',
+    dRows.length === 2 && dRows.some((r) => r.track === 0) && dRows.some((r) => r.track === 1),
+    JSON.stringify(dRows.map((r) => [r.action, r.track])));
+  const cmpRows = compareSummaries(baseDoc.summary, curRows);
+  check('A/B 对比保留两条 track',
+    cmpRows.length === 2 && cmpRows.every((r) => r.action === 'waving'),
+    JSON.stringify(cmpRows.map((r) => [r.action, r.track])));
+
+  // —— activity/抖动逐 track 统计：主目标每帧换人也不能把两人拼成一条 ——
+  const altFrames = Array.from({ length: 40 }, (_, i) => {
+    const big = i % 2 === 0;
+    return multiFrame(i * 100, [
+      mkPerson(waveKp(i), 0, big ? [100, 50, 400, 400] : [100, 50, 160, 400]),
+      mkPerson(B_BASE, 1, big ? [400, 50, 660, 400] : [400, 50, 900, 400]),
+    ]);
+  });
+  const altTl = replay(altFrames);
+  check('主目标确实每帧切换（测试前提）', altTl.primaryTrack.slice(0, 2).join(',') === '0,1',
+    String(altTl.primaryTrack.slice(0, 4)));
+  const altEv = evaluateClip(altFrames, { segments: [] }, altTl);
+  check('activity 逐 track 统计：主目标切换不产生抖动假象', altEv.activity.waving <= 2,
+    `runs=${altEv.activity.waving}`);
+
+  // —— 姿态混淆矩阵：段写 track 时用那个人的时间线 ——
+  const sitKp = STAND.map((p, idx) => (idx === 9 ? [152, 250, 1]
+    : idx === 10 ? [168, 250, 1] : idx === 11 ? [155, 310, 1] : idx === 12 ? [171, 310, 1] : p));
+  const sitFrames = Array.from({ length: 40 }, (_, i) => multiFrame(i * 100, [
+    mkPerson(sitKp, 0), mkPerson(B_BASE, 1),
+  ]));
+  const sitTl = replay(sitFrames);
+  const confSit = postureConfusion(sitTl, {
+    segments: [{ action: 'sit', track: 0, startFrame: 0, endFrame: 39 }],
+  }, sitFrames);
+  const liSit = confSit.labels.indexOf('sit');
+  const liStand = confSit.labels.indexOf('stand');
+  check('姿态混淆矩阵按段的 track 取预测（不是每帧主目标）',
+    confSit.matrix[liSit][liSit] > confSit.frames * 0.8
+    && confSit.matrix[liSit][liSit] > confSit.matrix[liSit][liStand],
+    JSON.stringify(confSit.matrix[liSit]));
+
+  // —— 手势归属：每人的手只进自己 track 的分母 ——
+  const handAt = (side, shape, cx, y = 220) => ({
+    handedness: side, shape, score: 0.9,
+    orient: { facing: 'front' },
+    bbox: [cx - 10, y - 20, cx + 10, y + 20],
+  });
+  const gframes = Array.from({ length: 6 }, (_, i) => multiFrame(i * 100, [
+    mkPerson(A_BASE, 0), mkPerson(B_BASE, 1),
+  ], { hands: [handAt('Left', 'fist', 100), handAt('Right', 'open', 500)] }));
+  const gfA = gestureFrames(gframes, { track: 0 });
+  const gfB = gestureFrames(gframes, { track: 1 });
+  check('手势按 track 归属：A 只看左拳', gfA.states[4].L.status === 'decided'
+    && gfA.states[4].L.shapes[0] === 'fist' && gfA.states[4].R.status === 'noHand',
+    JSON.stringify(gfA.states[4]));
+  check('手势按 track 归属：B 只看右张开', gfB.states[4].R.status === 'decided'
+    && gfB.states[4].R.shapes[0] === 'open' && gfB.states[4].L.status === 'noHand',
+    JSON.stringify(gfB.states[4]));
+  const gfDefault = gestureFrames(gframes);
+  // 缺省口径只看主目标（面积相同取先出现的 A）；B 的手算「未归属」而不是主目标的右手。
+  check('缺省 track → 主目标（先出现且面积相同取第一个）', gfDefault.states[4].L.shapes[0] === 'fist'
+    && gfDefault.states[4].R.status === 'unattributed', JSON.stringify(gfDefault.states[4]));
+
+  // 两人框重叠：手落在重叠区且离两人中心一样近 → 次近人 margin 不足 → 弃权
+  const pA = { track_id: 0, bbox: [0, 0, 200, 400], kp: [[0, 0, 1]], scale: 100 };
+  const pB = { track_id: 1, bbox: [120, 0, 320, 400], kp: [[0, 0, 1]], scale: 100 };
+  const amb = gestureFrames([multiFrame(0, [
+    { ...pA }, { ...pB },
+  ], { hands: [handAt('Left', 'fist', 160)] })]);
+  check('重叠区手：次近人 margin 不足 → 未归属', amb.stats.unattributed === 1
+    && amb.states[0].L.status === 'unattributed', JSON.stringify(amb.stats));
+  const nearA = gestureFrames([multiFrame(0, [
+    { ...pA }, { ...pB },
+  ], { hands: [handAt('Left', 'fist', 130)] })], { track: 0 });
+  check('margin 足够 → 归给最近的人', nearA.stats.attributed === 1
+    && nearA.states[0].L.status === 'decided', JSON.stringify(nearA.stats));
+
+  // —— 旧单人数据回归：新 replay 必须与旧算法逐位一致；JSONL 往返指标不变 ——
+  const samplePath = path.join(process.cwd(), 'eval-data', 'sample.frames.json');
+  const labelsPath = path.join(process.cwd(), 'eval-data', 'sample.labels.json');
+  const sampleFrames = await loadFrames(samplePath);
+  const sampleLabels = JSON.parse(await readFile(labelsPath, 'utf8'));
+  const legacyReplay = (frames) => {
+    const se = new SignalEngine({});
+    const ae = new ActionEngine({});
+    const handState = (f) => {
+      if (!Array.isArray(f.hands)) return null;
+      const shape = (side) => f.hands.find((h) => h && h.handedness === side)?.shape ?? null;
+      return { L: shape('Left'), R: shape('Right') };
+    };
+    return frames.map((f) => {
+      const p = f.persons && f.persons[0];
+      if (!p) return { ts: f.ts, empty: true, sig: null };
+      const person = {
+        track_id: p.track_id ?? 0, bbox: p.bbox, kp: p.kp,
+        kp_world: Array.isArray(p.kp_world) && p.kp_world.length >= 33 ? p.kp_world : null,
+        hands: handState(f), scale: p.scale, score: p.score, kp_format: p.kp_format,
+      };
+      const sig = se.update(person, f.ts);
+      return { ts: f.ts, empty: false, sig, act: ae.update(sig, f.ts, person.hands) };
+    });
+  };
+  const singleTl = replay(sampleFrames);
+  const legacyTl = legacyReplay(sampleFrames);
+  check('旧单人 sample 走旧路径（没有 tracks 挂载）', !(singleTl.tracks instanceof Map)
+    && singleTl.length === sampleFrames.length, `len=${singleTl.length}`);
+  const sigFingerprint = (r) => JSON.stringify({
+    empty: r.empty,
+    posture: r.act?.postureId ?? null,
+    flags: r.act?.flags ?? null,
+    reps: r.act?.reps ?? null,
+    knee: r.sig?.knee_pick ?? null,
+    upright: r.sig?.uprightness ?? null,
+    elev: r.sig ? [r.sig.armPose.elev_L, r.sig.armPose.elev_R] : null,
+  });
+  check('旧单人 replay 与旧算法逐位一致',
+    singleTl.map(sigFingerprint).join('|') === legacyTl.map(sigFingerprint).join('|'));
+
+  const singleSum = summarize([evaluateClip(sampleFrames, sampleLabels, singleTl)]);
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'evalmulti-'));
+  try {
+    const jsonl = path.join(tmpDir, 'sample.jsonl');
+    const meta = {
+      schema: 'frame.jsonl v0', model: 'full', delegate: 'GPU',
+      export_mode: 'single', log_limit: 20000, frame_count: sampleFrames.length,
+    };
+    await writeFile(jsonl, [JSON.stringify(meta), ...sampleFrames.map((f) => JSON.stringify(f))].join('\n'), 'utf8');
+    const loadedFrames = await loadFrames(jsonl);
+    check('JSONL meta 透传 log_limit / export_mode',
+      loadedFrames.meta?.log_limit === 20000 && loadedFrames.meta?.export_mode === 'single',
+      JSON.stringify(loadedFrames.meta));
+    const loadedSum = summarize([evaluateClip(loadedFrames, sampleLabels, replay(loadedFrames))]);
+    check('旧单人 JSONL 指标逐位不变',
+      JSON.stringify(loadedSum) === JSON.stringify(singleSum),
+      `rows=${loadedSum.length}`);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// —— [R13-3] 物体模型指纹 ------------------------------------------------
+{
+  const h = (ch) => ch.repeat(64);
+  const loaded = [
+    { meta: { objects: { backend: 'onnx', model: 'ppe_smoke.onnx', inputSize: 320, modelHash: h('a'), labelsHash: 'l1' } } },
+    { meta: { objects: { backend: 'onnx', model: 'ppe_smoke.onnx', inputSize: 320, modelHash: h('a'), labelsHash: 'l1' } } },
+  ];
+  const info = objectsInfo(loaded);
+  check('物体模型去重（同一套只报一次）', info.models.length === 1 && info.hashes.length === 1);
+  check('报告头带 backend/model/尺寸/哈希', /onnx\/ppe_smoke\.onnx @320 sha256:aaaaaaaaaaaa labels:l1/.test(formatObject(info.models[0])),
+    formatObject(info.models[0]));
+
+  const two = objectsInfo([loaded[0], { meta: { objects: { backend: 'onnx', model: 'other.onnx', inputSize: 640, modelHash: h('b') } } }]);
+  check('两套物体模型 → 警告', two.models.length === 2 && /不能跨模型合并/.test(two.warning || ''), two.warning || '');
+  check('相同 modelHash → 不阻断 baseline', objectModelChange([h('a')], { objects: [{ modelHash: h('a') }] }) === null);
+  const change = objectModelChange([h('b')], { objects: [{ modelHash: h('a') }] });
+  check('不同 modelHash → 拒绝并提示 --allow-model-change', !!change && /--allow-model-change/.test(change.message),
+    change?.message);
+  check('旧报告没有 objects 段 → 不阻断', objectModelChange([h('b')], {}) === null);
+  check('当前没有指纹 → 不阻断', objectModelChange([], { objects: [{ modelHash: h('a') }] }) === null);
+
+  // meta 透传：JSONL 首行的 objects 必须进 frames.meta，否则评估器永远看不到指纹
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'evalobj-'));
+  try {
+    const file = path.join(tmp, 'obj.jsonl');
+    const meta = {
+      schema: 'frame.jsonl v0', frame_count: 0,
+      objects: { backend: 'onnx', model: 'm.onnx', inputSize: 320, modelHash: h('c'), labelsHash: 'x' },
+    };
+    await writeFile(file, JSON.stringify(meta) + '\n', 'utf8');
+    const fr = await loadFrames(file);
+    check('meta 透传 objects（R13-3）', fr.meta?.objects?.modelHash === h('c'), JSON.stringify(fr.meta));
+  } finally {
+    await rm(tmp, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

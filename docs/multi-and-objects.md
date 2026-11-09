@@ -23,7 +23,7 @@ MediaPipe PoseLandmarker 的 **VIDEO 模式只返回一个人**（实测 `numPos
 
 `web/js/multi.js`
 
-- 每人一对独立的 `SignalEngine` + `ActionEngine`。这两个类里全是**有记忆**的部件（One Euro、Hold 计时、计数相位、换侧滞回），共用一套就会出现"A 的深蹲相位被 B 的膝盖角度打断"。
+- 每人一对独立的 `SignalEngine` + `ActionEngine`。这两个类里全是**有记忆**的部件（One Euro、Hold 计时、计数相位、换侧滞回），共用一套就会出现"A 的计数相位被 B 的角度信号打断"。
 - 同一 track 缺席超过 `gapMs`（1000ms）回来时重建状态机：旧滤波状态和旧计数相位都不该续上。
 - 手部按"手部 wrist(0) 到该人左右腕关键点的距离 / 躯干长"归属（`assignHands`），超出 0.8 直接丢弃。用像素距离会系统性偏向离镜头近的人。
 
@@ -85,11 +85,11 @@ MOT17 实测对夜景/远景提升很大、对拥挤近景提升有限且误检�
 
 ## 四、数据契约
 
-`pushLog()` 每帧新增两个字段，**老字段完全不变**（`persons[0]` 仍是主目标，`signals/actions` 仍是主目标的判定），所以现有评估器不受影响：
+`pushLog()` 每帧新增两个字段，**老字段完全不变**（`signals/actions` 仍是主目标的判定），所以旧流程不受影响。多人导出时 `persons[]` 是**全部判定人员**（每人一条，`[0]` 仍是主目标）；单人导出仍是 1 条：
 
 ```json
 {
-  "persons": [ ... 主目标 ... ],
+  "persons": [ ... 全部判定人员 ... ],
   "signals": { ... }, "actions": { ... },
   "verdicts": [
     { "track_id": 2, "bbox": [...], "posture": "stand", "flags": {...}, "reps": {...},
@@ -100,7 +100,7 @@ MOT17 实测对夜景/远景提升很大、对拥挤近景提升有限且误检�
 }
 ```
 
-多人时 `verdicts` 是**所有人**（含主目标），`signals/actions` 仍只是主目标。评估器暂时只读主目标；多人评估口径还没做（见下）。
+多人时 `verdicts` 是**所有人**（含主目标），`signals/actions` 仍只是主目标。评估器已有逐 track 口径：按 `label.track`（uid 优先）回放，汇总按 `(track, action)` 出行，见 `docs/eval.md`「多人素材」。
 
 ---
 
@@ -197,6 +197,7 @@ ONNX 后端（~28fps）；efficientdet 只用于 COCO 通用物体演示。
 - 冒烟模型只有 623 张训练图、mAP50 0.40，和本项目机位差异大——PPE 的实拍准确率仍是 **0 个数字**。
 - 多人时的速度：30fps 上限下，多人 3 + 手部约 26 帧/s；再开 ONNX 物体检测仍是 ~26（worker）；
   开 MediaPipe efficientdet 会掉到 ~16。帧率不足会加大 id 抖动，具体数字用 `npm run probe:throughput` 测。
-- 手部 ROI 补检只对主目标做（每多一人多一次推理），其余人只有整帧检出的手。
+- 手部 ROI 补检按预算给面积最大的前 `min(perception.multi.maxPersons, signals.hand.roi.maxPersonsPerFrame)`
+  人做（主目标优先，默认 2 人；`scale < minScalePx` 跳过），其余人只有整帧检出的手。
 - 多人 + PPE 的评估口径（按 track 的 recall/precision、跨机位退化）还没接进 `evaluate.mjs`。
 - 一个人长时间离开再回来会拿到新 track_id，计数从 0 开始——这是刻意的（宁可重置，不续旧状态），但没有做长期 re-id。

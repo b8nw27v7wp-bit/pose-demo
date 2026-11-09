@@ -21,7 +21,7 @@ const labels = {
   segments: [
     { action: 'stand', start: 0, end: 1000 },
     { action: 'stand', start: 1200, end: 2000 },
-    { action: 'squat', start: 3000, end: 4000, count: 3 },
+    { action: 'clap', start: 3000, end: 4000, count: 3 },
     { action: 'none', start: 5000, end: 6000 },
     { action: 'noArm', start: 7000, end: 8000 },
     { action: '!onHips', start: 9000, end: 9500 },
@@ -91,15 +91,15 @@ console.log('\n[1] validateManifest');
 console.log('\n[2] coverageReport');
 {
   const cov = await coverageReport(manifest, dir, {
-    actions: ['stand', 'squat'], minPos: 2, minNeg: 1, minSubjects: 2, minCameras: 2,
+    actions: ['stand', 'clap'], minPos: 2, minNeg: 1, minSubjects: 2, minCameras: 2,
   });
   const stand = cov.rows.find((r) => r.action === 'stand');
-  const squat = cov.rows.find((r) => r.action === 'squat');
+  const clap = cov.rows.find((r) => r.action === 'clap');
   check('stand：2 段/人 × 2 份素材', stand.pos === 4 && stand.segs === 4, JSON.stringify(stand));
   check('stand：none 反例 2 段', stand.neg === 2);
-  check('squat：计数按 count 求和（3 × 2）', squat.pos === 6 && squat.segs === 2, JSON.stringify(squat));
+  check('clap：计数按 count 求和（3 × 2）', clap.pos === 6 && clap.segs === 2, JSON.stringify(clap));
   check('每动作人物/机位齐全', stand.subjects.length === 2 && stand.cameras.length === 2
-    && squat.subjects.length === 2 && squat.cameras.length === 2);
+    && clap.subjects.length === 2 && clap.cameras.length === 2);
   check('整体达标', cov.ok === true && cov.rows.every((r) => r.ok));
 
   const strict = await coverageReport(manifest, dir, {

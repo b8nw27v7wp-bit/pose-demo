@@ -26,22 +26,11 @@ const EMPTY_FLAGS = {
  */
 export function buildPostures(actions) {
   const { posture } = actions;
+  // 只保留「站 / 坐」两种静态姿态。
+  // 躺卧、下蹲需要膝/踝同时可见且机位能拍到全身或地面，桌面摄像头与上半身构图下
+  // 判不了（不是识别失败，是信息不足）。与其留着一个恒为 null 的档位，
+  // 不如把姿态集合收敛到能在常见机位稳定判定的范围，见 README「初始版验证范围」。
   return [
-    {
-      id: 'lying', name: '躺卧', prio: 40,
-      minMs: posture.lying.minMs, streak: posture.lying.streak,
-      cond: (s) => s.uprightness < posture.lying.uprightnessLt
-        && s.leg_vertical < posture.lying.legVerticalLt,
-    },
-    {
-      id: 'squat_static', name: '下蹲', prio: 30,
-      minMs: posture.squat.minMs, streak: posture.squat.streak,
-      // 腿竖直比与计数门控同口径：坐姿膝角也会 <110°、躯干也会直，
-      // 少了这道门，坐会被更高优先级的「下蹲」吃掉。
-      cond: (s) => s.knee_pick < posture.squat.kneeLt
-        && s.uprightness > posture.squat.uprightnessGt
-        && s.leg_vertical > posture.squat.legVerticalGt,
-    },
     {
       id: 'sit', name: '坐', prio: 20,
       minMs: posture.sit.minMs, streak: posture.sit.streak,
@@ -70,9 +59,7 @@ export class ActionEngine {
     this.openShapes = new Set(cfg.signals.hand.openShapes);
     this.pointShapes = new Set(cfg.signals.hand.pointShapes);
     this.carryCfg = cfg.signals.arm.carry;
-    // 深蹲门控：躯干仍接近竖直 + 踝明显在髋下方。
-    // 少了这个门，从站到坐的过程中膝角也会穿过 100°，一次坐下会被记成一次深蹲。
-    // 俯卧撑门控：身体接近水平，否则站着弯一下手臂也会被数。
+    // 姿态只有站/坐；计数只剩鼓掌（深蹲/俯卧撑已下线，见 buildPostures 的说明）。
     this.postures = buildPostures(this.cfg);
     this.postureHolds = new Map(this.postures.map((p) => [p.id, new Hold(p.minMs)]));
     this.streaks = new Map(this.postures.map((p) => [p.id, 0]));
@@ -97,15 +84,10 @@ export class ActionEngine {
     this.graspCount = 0;
     this.graspPhase = 'idle';
     this.reps = {
-      squat: new RepCounter(this.cfg.reps.squat),
-      pushup: new RepCounter(this.cfg.reps.pushup),
       clap: new RepCounter(this.cfg.reps.clap),
     };
     this.postureSince = null;
     this.last = null;
-    // 上一帧选中的腿/臂：换侧时角度序列不连续，计数必须先中止（见 update）
-    this.lastKneeSide = null;
-    this.lastElbowSide = null;
   }
 
   reset() {
@@ -126,13 +108,9 @@ export class ActionEngine {
     this.graspSeq.reset();
     this.graspCount = 0;
     this.graspPhase = 'idle';
-    this.reps.squat.reset();
-    this.reps.pushup.reset();
     this.reps.clap.reset();
     this.postureSince = null;
     this.last = null;
-    this.lastKneeSide = null;
-    this.lastElbowSide = null;
   }
 
   /**
@@ -154,18 +132,14 @@ export class ActionEngine {
         frozen: true,
         flags: prev?.flags ?? { ...EMPTY_FLAGS },
         reps: {
-          squat: this.reps.squat.count,
-          pushup: this.reps.pushup.count,
           clap: this.reps.clap.count,
           grasp: this.graspCount,
         },
-        gates: prev?.gates ?? { squat: false, pushup: false, clap: false },
-        countBlocked: prev?.countBlocked ?? { squat: false, pushup: false, clap: false },
+        gates: prev?.gates ?? { clap: false },
+        countBlocked: prev?.countBlocked ?? { clap: false },
         // 判定不可靠的原因：界面/导出据此提示「这一帧别太当真」
         unreliable: ['low_confidence', ...(s.extrapolated_any ? ['extrapolated'] : [])],
         repPhase: {
-          squat: this.reps.squat.phase,
-          pushup: this.reps.pushup.phase,
           clap: this.reps.clap.phase,
           grasp: this.graspPhase,
         },
@@ -285,37 +259,10 @@ export class ActionEngine {
     this.graspPhase = step.phase;
     this.graspCount = step.count;
 
-    // —— 计数类
-    // —— 换侧保护：膝角/肘角在左右两侧之间切换时，角度序列不连续。
-    // 拿不连续的角度去数周期，会在换侧那一帧凭空凑出一次「到顶/到底」，
-    // 深蹲/俯卧撑会多数一次或少计一次。换侧时中止当前半程，宁可漏这一帧也不数错。
-    const kneeSideNow = (s.knee_side === 'L' || s.knee_side === 'R') ? s.knee_side : null;
-    const elbowSideNow = (s.elbow_side === 'L' || s.elbow_side === 'R') ? s.elbow_side : null;
-    const kneeSwitched = !!(kneeSideNow && this.lastKneeSide && kneeSideNow !== this.lastKneeSide);
-    const elbowSwitched = !!(elbowSideNow && this.lastElbowSide && elbowSideNow !== this.lastElbowSide);
-    if (kneeSwitched) this.reps.squat.abort();
-    if (elbowSwitched) this.reps.pushup.abort();
-    if (kneeSideNow) this.lastKneeSide = kneeSideNow;
-    if (elbowSideNow) this.lastElbowSide = elbowSideNow;
-
+    // —— 计数类（只剩鼓掌；深蹲/俯卧撑计数已随姿态一起下线）
     // 短时遮挡外推期间冻结计数：外推坐标是猜的，拿来数必然出错。
-    // 按动作只冻结用到的那几个点，避免左手被挡就全都不数。
     const ext = new Set(s.extrapolated || []);
-    const sideOf = (side) => (side === 'R' ? 'R' : 'L');
-    const squatBlocked = [`hip_${sideOf(s.knee_side)}`, `knee_${sideOf(s.knee_side)}`, `ankle_${sideOf(s.knee_side)}`]
-      .some((p) => ext.has(p));
-    const pushupBlocked = [`shoulder_${sideOf(s.elbow_side)}`, `elbow_${sideOf(s.elbow_side)}`, `wrist_${sideOf(s.elbow_side)}`]
-      .some((p) => ext.has(p));
     const clapBlocked = ext.has('wrist_L') || ext.has('wrist_R');
-
-    const squatGate = s.leg_vertical > this.cfg.gates.squat.legVerticalGt
-      && s.uprightness > this.cfg.gates.squat.uprightnessGt;
-    const squatCount = squatBlocked ? this.reps.squat.count
-      : squatGate ? this.reps.squat.update(s.knee_pick, ts) : (this.reps.squat.abort(), this.reps.squat.count);
-
-    const pushupGate = s.uprightness < this.cfg.gates.pushup.uprightnessLt;
-    const pushupCount = pushupBlocked ? this.reps.pushup.count
-      : pushupGate ? this.reps.pushup.update(s.elbow_pick, ts) : (this.reps.pushup.abort(), this.reps.pushup.count);
 
     // 鼓掌：两腕距离的周期，且必须在胸前高度、且不是抱臂（抱臂时两腕也很近，会误入低值）
     const clapGate = !!ap.chest_height && !ap.crossed;
@@ -344,20 +291,17 @@ export class ActionEngine {
         carryingL: carrying && closedL,
         carryingR: carrying && closedR,
       },
-      reps: { squat: squatCount, pushup: pushupCount, clap: clapCount, grasp: this.graspCount },
-      gates: { squat: squatGate, pushup: pushupGate, clap: clapGate },
-      countBlocked: { squat: squatBlocked, pushup: pushupBlocked, clap: clapBlocked },
+      reps: { clap: clapCount, grasp: this.graspCount },
+      gates: { clap: clapGate },
+      countBlocked: { clap: clapBlocked },
       // 判定不可靠的原因：界面/导出据此提示「这一帧别太当真」
       unreliable: [
         ...(s.extrapolated_any ? ['extrapolated'] : []),
-        ...(kneeSwitched || elbowSwitched ? ['side_switched'] : []),
         ...(s.world?.bones && Object.values(s.world.bones).some((v) => v === false)
           ? ['bone_blocked'] : []),
         ...(s.angle_outliers?.length ? ['angle_outlier'] : []),
       ],
       repPhase: {
-        squat: this.reps.squat.phase,
-        pushup: this.reps.pushup.phase,
         clap: this.reps.clap.phase,
         grasp: this.graspPhase,
       },
@@ -375,8 +319,6 @@ export class ActionEngine {
 export const ACTION_CATALOG = [
   { id: 'stand', name: '站立', kind: '姿态' },
   { id: 'sit', name: '坐', kind: '姿态' },
-  { id: 'squat_static', name: '下蹲', kind: '姿态' },
-  { id: 'lying', name: '躺卧', kind: '姿态' },
 ];
 export const POSTURE_IDS = ACTION_CATALOG.map((a) => a.id);
 
@@ -400,8 +342,6 @@ export const ARM_ID_TO_FLAG = Object.fromEntries(ARM_ACTIONS.map((a) => [a.id, a
 
 // 计数类：RepCounter（或 PhaseSequence）维护计数，labels 用 id + count。
 export const REP_ACTIONS = [
-  { id: 'squat', name: '深蹲' },
-  { id: 'pushup', name: '俯卧撑' },
   { id: 'clap', name: '鼓掌' },
   { id: 'grasp', name: '拿取' },
 ];

@@ -24,10 +24,17 @@
 ## 2. 数据
 
 来源、许可与字段见 `docs/open-datasets.md`。统一后的数据集由
-`scripts/prepare-ppe-dataset.py` 生成（可重建，不进 git）：
+`scripts/prepare-ppe-dataset.py` 生成（可重建，不进 git）。
+
+**类别映射只从显式台账 `eval-data/open/sources.json` 读**，代码里没有硬编码的
+`HELMET_MAP`。第一次先生成骨架，再逐条回源确认（尤其 Safety-helmet 的 `0/1`，
+禁止目测——映射反了会让 helmet/no_helmet 整体翻转）：
 
 ```bash
-py -I scripts/prepare-ppe-dataset.py
+py -I scripts/prepare-ppe-dataset.py --init-sources   # 生成按 data.yaml 名字预填的骨架
+# 编辑 eval-data/open/sources.json：空字符串 = 未确认
+py -I scripts/prepare-ppe-dataset.py --strict         # 缺映射直接退出非 0，不写输出
+py -I scripts/prepare-ppe-dataset.py                  # 非 strict：未映射的 class id 跳过并报告
 ```
 
 产物：
@@ -107,7 +114,51 @@ cp eval-data/ppe-runs/smoke/weights/best.onnx web/models/ppe_smoke.onnx
 
 输出形状是 `[1, 4+nc, N]`（`objects-onnx.js` 也兼容 `[1, N, 4+nc]`）。
 
-## 6. 浏览器运行时（onnxruntime-web）
+## 6. 导出 sidecar 与浏览器校验（R11-3）
+
+ONNX 没有 label map。类别名只能由 profile 按训练时 `data.yaml` 的顺序给出，
+**数量写对、顺序写错时模型照常推理，只是类别张冠李戴**（`helmet` 框被判成 `no_helmet`），
+而且不会报错。所以导出后必须生成一份同名 sidecar：
+
+```bash
+# 从 data.yaml 读顺序（推荐）
+node scripts/ppe-model-manifest.mjs web/models/ppe_smoke.onnx \
+  --labels eval-data/ppe-yolo/data.yaml --input-size 320
+
+# 产物：web/models/ppe_smoke.onnx.json
+# 也可以直接给逗号列表或每行一个名字的 txt：
+node scripts/ppe-model-manifest.mjs web/models/x.onnx --labels helmet,no_helmet,glove
+```
+
+sidecar 字段：
+
+```jsonc
+{
+  "labels": ["helmet", "no_helmet", "glove", "..."], // 顺序 = 训练时 data.yaml 的 names
+  "inputSize": 320,        // 必须与导出 imgsz 一致
+  "numClasses": 9,         // 必须等于 labels.length，也等于模型输出通道数 - 4
+  "sha256": "…",           // 对 .onnx 文件算一次（只暴露，不在浏览器重复算）
+  "exportedAt": "2026-11-05T…",
+  "dataYamlHash": "…"      // 从 data.yaml 生成时有
+}
+```
+
+浏览器端（`objects-onnx.js`）在 `createOnnxDetector()` 里：
+
+- 加载同目录同名 sidecar（`ppe_smoke.onnx` → `ppe_smoke.onnx.json`）；
+- `labels` 深比较（顺序敏感），不一致打印**第一处差异**并拒绝创建；
+- 校验 `inputSize`、`numClasses`；模型自重检后再核对输出通道数；
+- `requireManifest` 默认 `true`：sidecar 缺失即失败。确需加载旧模型时显式传
+  `requireManifest:false`（只放宽「缺失」，内容不一致仍然失败）；
+- `onnxInfo()` 暴露 `modelHash` 与 `manifest: {ok, path, numClasses, sha256, …}`。
+
+本机冒烟模型 `web/models/ppe_smoke.onnx` 的 sidecar 已按上述命令生成（9 类 / 320）；
+重新导出模型后必须重新生成。注意浏览器**不重算权重哈希**：只换了权重、类别数/顺序/输入
+尺寸都没变时，旧 sidecar 仍会被接受（不会拒绝加载），但 `meta.objects.modelHash` 会是旧
+权重的值，跨模型比较会被误导。sidecar 是导出产物的伴生文件，和 `web/models/*.onnx`
+一样不进 git。
+
+## 7. 浏览器运行时（onnxruntime-web）
 
 `web/vendor/` 与 `web/models/` 都不进 git，需要按需下载：
 
@@ -119,7 +170,7 @@ node scripts/fetch-ort.mjs          # 固定 1.31.1，复制 wasm 运行时到 w
 没有 COOP/COEP 头时没有 `SharedArrayBuffer`，`objects-onnx.js` 自动退回单线程 wasm
 （`numThreads=1`）。
 
-## 7. 页面接入
+## 8. 页面接入
 
 - `web/js/objects-onnx.js`：letterbox 预处理 → ORT 推理 → YOLOv8 解码 → 逐类别 NMS
   → `{label, score, box}`（原图像素坐标）。
@@ -139,7 +190,81 @@ node web/test/headless-ppe-onnx.mjs
 它会挑一张同时含 `helmet` 与 `no_helmet` 的验证图，检查：后端是 onnx、模型就绪、
 labels 数对上、检出框非空、`no_helmet` 没被当成 helmet 正例。
 
-## 8. 已知限制
+## 9. PPE 身份绑定与护栏窗口（R13-2 / R13-10）
+
+### 9.1 `track_uid`：换 `track_id` 不等于换人
+
+跟踪器超时后会发新的 `track_id`（慢放实测约 8.9% 的帧对）。PPE 的「连续缺帽 3 秒」
+如果按 `track_id` 计时，一次真实违规会被切成多段，永远升不到 violation。
+
+- `web/js/track.js` 在轨迹首建时分配单调递增的 `track_uid`，之后随 track 带出，
+  **不参与匹配、不随 `track_id` 变化**；`track_id` 的分配与匹配逻辑完全没改（A/B 基线不变）。
+- `web/js/ppe.js` 的 `PpeMonitor.tracks` 以 `track_uid ?? track_id` 为键；旧导出没有
+  `track_uid` 时自动退回 `track_id`，行为与之前一致。
+- `prune()` 同时接受 `track_id` 和 `track_uid`，调用方还没改完也不会误删计时器。
+- 导出契约（`docs/frame-schema.md`）：`persons[]` / `verdicts[]` 都带可选 `track_uid`。
+
+**`linkAcrossIds` 未实现（默认 `false`）。** 目前没有「新 id 在 `reidWindowMs` 内按中心距离/
+外观接回旧 uid」的逻辑。`track_uid` 在同一个轨迹对象生命周期内稳定，是将来 re-id 的锚点；
+跟踪器 `prune()` 丢弃轨迹后重新出现的同一个人会得到新 uid、PPE 计时从 0 开始。
+开启跨 id 继承前必须先做审计日志（把 A 的违规算到 B 头上是责任风险），见 PLAN §18.4 D8。
+
+### 9.2 `requirePositive` 窗口化
+
+旧行为（`positiveWindowMs=0`，默认）是整场 sticky：全场任何一人任何时刻检出过一次
+正例，护栏对该类永久失效。类别名写错但偶尔误匹配时，会从「全场 unknown」直接翻成
+「全场 missing」。
+
+```jsonc
+// web/profiles/*.json 的 signals.ppe（新键默认关闭/现行为）
+{
+  "positiveWindowMs": 0,   // 0 = 现行为（整场 sticky）；>0 = 只统计最近 N ms 的正例
+  "minPositive": 3         // 窗口内至少 N 次正例才算「模型确实认识这个类」
+}
+```
+
+- 正例按**帧次**计数：同一时刻的多人调用/同一批缓存框只记一次。按调用次数累加会让
+  `minPositive=3` 在单人单帧内被凑满，护栏形同虚设。
+- 窗口内正例不足时维持 `unknown`，`missing` 计时**暂停不清零**（与原语义一致）。
+- 默认参数下 `state/alert/streak_ms` 与旧实现逐位一致（`multi-test.mjs` + `ppe-test.mjs`）。
+- `unknown` 额外带 `reason_code`：`no_positive`（正例不足）/ `config_mismatch`（类别没配）/
+  `occluded`（头/腕不可见）。原有可读 `reason` 文案保留，供 UI 显示。
+
+## 10. PPE 事件评估（R13-1 骨架）
+
+独立工具 `web/test/ppe-eval.mjs`（不改 `evaluate.mjs`）：
+
+```bash
+node web/test/ppe-eval.mjs --input clip.jsonl --labels clip.labels.json
+node web/test/ppe-eval.mjs --dir eval-data --report eval-data/ppe-report.md
+node web/test/ppe-eval.mjs --dir eval-data --min-ppe-recall 0.9 --max-ppe-fa-per-hour 1
+node web/test/ppe-eval.mjs --self-test        # 合成帧自测，不需要素材
+```
+
+labels 段（与 `docs/eval.md` 同一份文件，段之间按 `action` 区分）：
+
+```jsonc
+{ "action": "ppe", "target": "helmet", "expect": "missing",
+  "track": 7, "startSec": 3.0, "endSec": 9.0, "camera": "front", "subject": "甲" }
+```
+
+- `target`：`helmet` / `glove`；`expect`：`worn` / `missing` / `unknown`。
+- `track` 优先匹配 `track_uid`（跨 id 稳定），旧标注可直接写 `track_id`；在**整个段**内
+  逐帧查找，人晚于段起点进场也能绑上。
+  `track` 缺省时：有 `bbox` 按段内最早 IoU > 0.05 的帧绑定，一直找不到记为 `bbox_not_found`
+  （不静默按「任一人」计分）；每帧只有一个人则直接绑定；否则按「任一人」统计并标记
+  `ambiguous`（报告单列）。
+- `camera` 取段级一致值（没有就用 clip 级）；段分组与告警事件共用同一口径，
+  所以把 camera 只写在段上也能正确算误报/小时。
+- 指标：per target × camera 的段级混淆矩阵 + recall/precision（Wilson 95%）、
+  unknown 弃权率、告警时延（中位数/均值）、告警事件真/假与误报/小时。
+  标签要求 worn/missing 而模型给 unknown 时只记弃权，不计入 FN/FP。
+- `--min-ppe-recall` 检查 **missing 事件 recall**；未达标退出码 2。
+  `--max-ppe-fa-per-hour` 检查误报事件/小时；超出退出码 2。
+- **旧数据不会静默算 0**：没有 `verdicts[]`、`verdicts[]` 没有 `ppe`、或所有帧只有
+  一个 verdict（导出只含主目标）都会明确报错/告警。
+
+## 11. 已知限制
 
 - 只有 623 张训练图，来源以 Roboflow 的施工场景为主，和本项目机位差异大；
   冒烟模型在实拍画面上的漏检/误检会很明显。

@@ -155,7 +155,8 @@ console.log('\n[6] 姿态判定');
   const ae2 = new ActionEngine();
   let act2 = null;
   for (let i = 0; i <= 10; i++) act2 = ae2.update(se2.update(person(lieKp), 1000 + i * 100), 1000 + i * 100);
-  check('卧姿 → 躺卧', act2.postureId === 'lying', `posture=${act2.posture}`);
+  // 躺卧/下蹲已下线（需要全身/地面机位）：卧姿不再被硬凑成任何静态姿态
+  check('卧姿不再判成站/坐（躺卧已下线）', act2.postureId === null, `posture=${act2.posture}`);
 
   // 坐姿与深蹲的膝角/直立度量级相同，只能靠腿竖直比分：
   // 少了这道门，「坐」会被更高优先级的「下蹲」吃掉（实测膝 90°、腿竖直比 0.6）。
@@ -172,7 +173,7 @@ console.log('\n[6] 姿态判定');
   const sitAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.9, leg_vertical: 0.6 }));
   check('坐姿（腿不竖直）→ 坐，而不是下蹲', sitAct.postureId === 'sit', `posture=${sitAct.postureId}`);
   const squatAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.9, leg_vertical: 1.3 }));
-  check('深蹲（腿仍竖直）→ 下蹲', squatAct.postureId === 'squat_static', `posture=${squatAct.postureId}`);
+  check('腿仍竖直的屈膝不再是任何姿态（下蹲已下线）', squatAct.postureId === null, `posture=${squatAct.postureId}`);
 
   // 注册表一致性：ARM_ACTIONS.flag 是页面、评估器、难例导出共用的键名。
   // 写错一个字母不会报错，只会让这个动作在 UI/评估里永远为 false——手抄时代就这么漏过。
@@ -205,35 +206,39 @@ const mkSig = (o = {}) => ({
   ...o,
 });
 {
+  // 鼓掌：两腕在胸前高度反复靠近/分开。门控要求 chest_height 且非抱臂。
+  const baseArm = mkSig().armPose;
+  const clapSig = (close, o = {}) => mkSig({
+    armPose: { ...baseArm, hands_close: close, chest_height: true },
+    ...o,
+  });
   const ae = new ActionEngine();
   let t = 0;
-  ae.update(mkSig(), t);
-  ae.update(mkSig({ knee_pick: 90 }), t += 300);
-  const r = ae.update(mkSig({ knee_pick: 165 }), t += 700);
-  check('站立深蹲计 1', r.reps.squat === 1, `squat=${r.reps.squat}`);
-  check('门控为真', r.gates.squat === true);
+  ae.update(clapSig(2.0), t);
+  ae.update(clapSig(0.2), t += 300);
+  const r = ae.update(clapSig(2.0), t += 700);
+  check('胸前张手→合手→张手计 1 次鼓掌', r.reps.clap === 1, `clap=${r.reps.clap}`);
+  check('门控为真', r.gates.clap === true);
 
   const ae2 = new ActionEngine();
   let t2 = 0;
-  ae2.update(mkSig({ leg_vertical: 0.6 }), t2);
-  ae2.update(mkSig({ knee_pick: 90, leg_vertical: 0.6 }), t2 += 300);
-  const r2 = ae2.update(mkSig({ knee_pick: 165, leg_vertical: 0.6 }), t2 += 700);
-  check('坐下不计深蹲', r2.reps.squat === 0, `squat=${r2.reps.squat}`);
-  check('坐下门控为假', r2.gates.squat === false);
+  const notChest = (close) => mkSig({ armPose: { ...baseArm, hands_close: close, chest_height: false } });
+  ae2.update(notChest(2.0), t2);
+  ae2.update(notChest(0.2), t2 += 300);
+  const r2 = ae2.update(notChest(2.0), t2 += 700);
+  check('不在胸前高度不计鼓掌', r2.reps.clap === 0, `clap=${r2.reps.clap}`);
+  check('门控为假', r2.gates.clap === false);
 
+  // 抱臂时两腕也很近，不能当成鼓掌的「合手」
   const ae3 = new ActionEngine();
   let t3 = 0;
-  ae3.update(mkSig(), t3);
-  ae3.update(mkSig({ elbow_pick: 80 }), t3 += 300);
-  const r3 = ae3.update(mkSig({ elbow_pick: 165 }), t3 += 700);
-  check('站立弯肘不算俯卧撑', r3.reps.pushup === 0, `pushup=${r3.reps.pushup}`);
-
-  const ae4 = new ActionEngine();
-  let t4 = 0;
-  ae4.update(mkSig({ uprightness: 0.2 }), t4);
-  ae4.update(mkSig({ uprightness: 0.2, elbow_pick: 80 }), t4 += 300);
-  const r4 = ae4.update(mkSig({ uprightness: 0.2, elbow_pick: 165 }), t4 += 700);
-  check('卧姿弯肘 → 俯卧撑 1', r4.reps.pushup === 1, `pushup=${r4.reps.pushup}`);
+  const crossedSig = (close) => mkSig({
+    armPose: { ...baseArm, hands_close: close, chest_height: true, crossed: true },
+  });
+  ae3.update(crossedSig(2.0), t3);
+  ae3.update(crossedSig(0.2), t3 += 300);
+  const r3 = ae3.update(crossedSig(2.0), t3 += 700);
+  check('抱臂时不计鼓掌', r3.reps.clap === 0, `clap=${r3.reps.clap}`);
 }
 
 // —— 8. 低置信度冻结 ——
@@ -244,11 +249,11 @@ console.log('\n[8] 置信冻结');
   let r = null;
   for (let i = 0; i < 10; i++) r = ae.update(mkSig(), t += 100);
   check('先进入站立', r.postureId === 'stand');
-  const before = r.reps.squat;
+  const before = r.reps.clap;
   const frozen = ae.update(mkSig({ ok: false, knee_pick: 80 }), t += 300);
   check('置信不足标记 frozen', frozen.frozen === true);
   check('冻结时保持原姿态', frozen.postureId === 'stand', `posture=${frozen.posture}`);
-  check('冻结时计数不推进', frozen.reps.squat === before, `squat=${frozen.reps.squat}`);
+  check('冻结时计数不推进', frozen.reps.clap === before, `clap=${frozen.reps.clap}`);
   check('冻结时沿用上次门控', JSON.stringify(frozen.gates) === JSON.stringify(r.gates),
     `frozen=${JSON.stringify(frozen.gates)} prev=${JSON.stringify(r.gates)}`);
 }
@@ -474,7 +479,8 @@ console.log('\n[13] 可见性门控');
   check('踝不可见 → leg_vertical=NaN', Number.isNaN(s.leg_vertical), `leg_vertical=${s.leg_vertical}`);
   const ae = new ActionEngine();
   const r = ae.update({ ...mkSig({ leg_vertical: NaN }), ok: true }, 1000);
-  check('leg_vertical=NaN → 深蹲门控为假', r.gates.squat === false);
+  // 腿不可见不再驱动任何计数门控（深蹲已下线），但也不能把 NaN 当成「站/坐」的证据
+  check('leg_vertical=NaN → 不判任何姿态', r.postureId === null, `posture=${r.postureId}`);
 
   // 腕不可见：举手/抱臂/鼓掌都不能成立
   const se2 = new SignalEngine();
@@ -494,7 +500,7 @@ console.log('\n[13] 可见性门控');
   const aeHidden = new ActionEngine();
   let rHidden = null;
   for (let i = 0; i < 12; i++) rHidden = aeHidden.update(sHidden, 1000 + i * 100);
-  check('腿不可见 → 不误判下蹲', rHidden.postureId !== 'squat_static', `posture=${rHidden.postureId}`);
+  check('腿不可见 → 不硬凑站/坐', rHidden.postureId === null, `posture=${rHidden.postureId}`);
 }
 
 // —— 14. 抱臂判定要抗转身 ——
@@ -1228,19 +1234,20 @@ console.log('\n[24] 遮挡外推与周期');
   // 24.4 外推期间冻结计数（不是暂停相位，更不是 abort）
   const seSig = new SignalEngine();
   const base = seSig.update(person(standKp), 0);
-  const mk = (knee, ext, t) => ({
-    ...base, ts: t, knee_pick: knee, knee_side: 'L',
-    leg_vertical: 1.5, uprightness: 0.9, extrapolated: ext,
+  const mk = (close, ext, t) => ({
+    ...base, ts: t, extrapolated: ext,
+    armPose: { ...base.armPose, chest_height: true, hands_close: close },
   });
+  // 一次鼓掌 = 合手（< down）→ 张开（> up）
   const ae = new ActionEngine();
-  ae.update(mk(90, [], 0), 0);
-  const r1 = ae.update(mk(170, [], 1500), 1500);
-  check('无外推 → 正常计 1', r1.reps.squat === 1, `squat=${r1.reps.squat}`);
+  ae.update(mk(0.2, [], 0), 0);
+  const r1 = ae.update(mk(2.0, [], 1500), 1500);
+  check('无外推 → 正常计 1', r1.reps.clap === 1, `clap=${r1.reps.clap}`);
   const ae2 = new ActionEngine();
-  ae2.update(mk(90, [], 0), 0);
-  const r2 = ae2.update(mk(170, ['ankle_L', 'knee_L', 'hip_L'], 1500), 1500);
-  check('外推期间不计数', r2.reps.squat === 0 && r2.countBlocked.squat === true,
-    `squat=${r2.reps.squat} blocked=${r2.countBlocked.squat}`);
+  ae2.update(mk(0.2, [], 0), 0);
+  const r2 = ae2.update(mk(2.0, ['wrist_L'], 1500), 1500);
+  check('外推期间不计数', r2.reps.clap === 0 && r2.countBlocked.clap === true,
+    `clap=${r2.reps.clap} blocked=${r2.countBlocked.clap}`);
 }
 
 // —— 25. 分布统计（R3 正/侧面重合度的口径）——
@@ -1367,16 +1374,6 @@ console.log('\n[28] 稳健性');
   check('初始选更可信的一侧', pickSide1 === 'R', `side=${pickSide1}`);
   check('小幅反转不换侧（滞回）', pickSide2 === 'R', `side=${pickSide2}`);
   check('差距明显才换侧', pickSide3 === 'L', `side=${pickSide3}`);
-
-  // 换侧中止计数：不允许拿两条腿拼起来的角度序列数周期
-  const aeSide = new ActionEngine();
-  let ts2 = 0;
-  aeSide.update(mkSig({ knee_side: 'L', knee_pick: 170 }), ts2);
-  aeSide.update(mkSig({ knee_side: 'L', knee_pick: 80 }), ts2 += 300);
-  const rSide = aeSide.update(mkSig({ knee_side: 'R', knee_pick: 165 }), ts2 += 700);
-  check('换侧时不凭空计一次深蹲',
-    rSide.reps.squat === 0 && rSide.unreliable.includes('side_switched'),
-    `squat=${rSide.reps.squat} unrel=${rSide.unreliable.join(',')}`);
 
   // 不可靠原因：冻结帧与低置信都能被识别出来
   const aeBad = new ActionEngine();

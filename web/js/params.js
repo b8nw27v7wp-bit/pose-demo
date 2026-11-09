@@ -15,8 +15,8 @@ export const DEFAULT_PARAMS = {
     },
     scaleMedianFrames: 5,
     // 左右侧选择滞回：另一侧的可信度要高出这么多才换侧。
-    // 不设滞回时，两侧可见性在阈值附近抖动会让膝角在两条腿之间来回跳，
-    // 计数会拿到不连续的角度序列（见 actions.js 的换侧中止）。
+    // 不设滞回时，两侧可见性在阈值附近抖动会让膝角/肘角在两条腿之间来回跳。
+    // 深蹲/俯卧撑计数下线后不再有「换侧中止半程」，换侧只影响后续信号选哪一侧。
     sideHysteresis: 0.15,
     // 关节角突变剔除：角速度超过 maxRate（度/秒）且间隔不超过 maxDtMs 时，
     // 视为单帧坏点（不给滤波器、也不沿用旧值冒充当前）。持续超过 maxDtMs 才接受新值。
@@ -89,7 +89,13 @@ export const DEFAULT_PARAMS = {
       // mul = 框边长 / 躯干长；maxCenterOffset = 检出腕点离框中心的最大偏移（占框边长）。
       // 归属判据不是这个偏移量，而是「检出腕点离哪个姿态腕点最近」（hands.js 里做），
       // 这里只是排除离裁图中心太远的框（基本是另一只手/背景）。
-      roi: { mul: 1.8, minPx: 64, maxPx: 480, maxCenterOffset: 0.6 },
+      roi: {
+        mul: 1.8, minPx: 64, maxPx: 480, maxCenterOffset: 0.6,
+        // R12-2：每帧最多给几个人做 ROI 补检（每多一人多一次推理）。默认 2。
+        maxPersonsPerFrame: 2,
+        // 人的 scale（躯干长，像素）低于此值时不补检：远景裁出来的框全是背景，补检只会烧推理。
+        minScalePx: 80,
+      },
     },
     grasp: {
       // 拿取状态机的时间窗
@@ -99,6 +105,8 @@ export const DEFAULT_PARAMS = {
     },
     gesture: {
       streak: 3,        // 手势要连续命中几帧才切换（治「张开→剪刀手」来回闪）
+      // 稳定状态保持多久由 HandShapeStabilizer 的 keepMs（默认 250ms）决定；
+      // 之前这里加过一个 edgeKeepMs，但没有任何代码读它，已删除。
     },
     // —— 多人跟踪（track.js）——
     // maxLostMs：人短暂被挡/检出失败时保留 track_id 的时长。太短会频繁换 id（计数清零），
@@ -138,6 +146,13 @@ export const DEFAULT_PARAMS = {
       gloveBoxScale: 0.45,  // 腕部区域半边长 / 躯干长
       // 本场从未检出过该类正例 → 只报 unknown。模型类别名写错时防止满屏误报。
       requirePositive: true,
+      // R13-5：物体框归属给人的方式（预留，物体线尚未接线，本轮只加键）。
+      // 目标：'center' = 物体框中心落在人的头/腕区域；'exclusive' = 一人一物约束。
+      assignment: 'center',
+      // R13-10：「本场有正例」的收紧口径。0 = 旧行为（整场 sticky）；
+      // >0 时只看最近 positiveWindowMs 内是否至少出现 minPositive 次正例。
+      positiveWindowMs: 0,
+      minPositive: 3,
       helmet: { minMs: 3000, policy: 'violation' },  // 连续缺失多久算违规
       // 手套默认只报「疑似」：手小、常被遮挡，「没检出」与「没戴」不可区分，
       // 直接进实时违规就是无穷申诉。要升级成违规必须在这里显式改 policy。
@@ -158,6 +173,9 @@ export const DEFAULT_PARAMS = {
     multi: {
       enabled: false, maxPersons: 3, detConf: 0.3, presenceConf: 0.3,
       tiles: 1, tileOverlap: 0.2,
+      // R12-3：平铺策略。'off' = 只看 tiles；'always' = 每帧平铺；
+      // 'auto' 预留给「连续 N 帧检出 <1 人时启用平铺一段」的自适应逻辑（本轮只加键）。
+      tileMode: 'off',
     },
     objects: {
       enabled: false,                 // 物体检测（PPE 需要它；默认关，省 GPU）
@@ -179,15 +197,19 @@ export const DEFAULT_PARAMS = {
       // MediaPipe/efficientdet 同步推理一次 ~54ms，30fps 下每帧跑会把吞吐从 28fps
       // 拖到 11fps；150ms（约 6.7Hz）足够，主循环只跳过检测、沿用上一帧的框。
       intervalMs: 150,
+      // R13-1：没有模型清单（类别顺序/输入尺寸/许可）时拒绝加载自训权重，
+      // 避免「权重换了、类别顺序没换」静默产出错误标签。物体线读这个键。
+      requireManifest: true,
+      // R13-3：只在物体 ROI 内推理（预留，物体线尚未接线，本轮只加键）。
+      // source：'head'|'person'；expand 为 bbox 外扩倍数；minPx 是 ROI 最小边长
+      // （太小就退回整帧），maxPerFrame 限制每帧 ROI 数（成本上限）。
+      roi: { enabled: false, source: 'head', expand: 1.5, minPx: 96, maxPerFrame: 4 },
     },
   },
 
   actions: {
     posture: {
-      lying: { minMs: 450, streak: 4, uprightnessLt: 0.45, legVerticalLt: 0.8 },
-      // legVerticalGt 与计数门控（actions.gates.squat.legVerticalGt）同一个口径：
-      // 少了它，坐姿（膝角同样 <110°、躯干同样直）会因为优先级更高被判成「下蹲」。
-      squat: { minMs: 350, streak: 4, kneeLt: 110, uprightnessGt: 0.45, legVerticalGt: 0.85 },
+      // 只保留站/坐：躺卧与下蹲需要膝、踝同时可见，桌面机位/上半身构图判不了。
       sit: { minMs: 450, streak: 5, kneeGt: 55, kneeLt: 135, uprightnessGt: 0.5, legVerticalLt: 1.05 },
       stand: { minMs: 350, streak: 4, uprightnessGt: 0.8, kneeGt: 150, legVerticalGt: 0.8 },
     },
@@ -200,17 +222,11 @@ export const DEFAULT_PARAMS = {
       front: 300, side: 300,
     },
     // adaptiveMs：有历史后，用「半程时长中位数 × adaptiveMinRatio」替代固定 minCycleMs。
-    // 挥手/快速深蹲不再被固定周期判成抖动，慢动作也不会因此漏计（见 docs/signals.md §二）。
+    // 挥手/快速鼓掌不再被固定周期判成抖动，慢动作也不会因此漏计（见 docs/signals.md §二）。
     // 没有历史时门槛放宽到 minCycleMs × adaptiveBootstrapRatio，否则真实的快节奏
     // （鼓掌半程约 200ms）第一次就被拒，永远攒不出历史。
     reps: {
-      squat: { down: 100, up: 150, minCycleMs: 600, minHalfMs: 120, adaptiveMs: true, adaptiveWindow: 5, adaptiveMinRatio: 0.5, adaptiveBootstrapRatio: 0.5 },
-      pushup: { down: 90, up: 150, minCycleMs: 500, minHalfMs: 120, adaptiveMs: true, adaptiveWindow: 5, adaptiveMinRatio: 0.5, adaptiveBootstrapRatio: 0.5 },
       clap: { down: 0.45, up: 1.0, minCycleMs: 400, minHalfMs: 100, adaptiveMs: true, adaptiveWindow: 5, adaptiveMinRatio: 0.5, adaptiveBootstrapRatio: 0.5 },
-    },
-    gates: {
-      squat: { legVerticalGt: 0.85, uprightnessGt: 0.6 },
-      pushup: { uprightnessLt: 0.6 },
     },
   },
 };

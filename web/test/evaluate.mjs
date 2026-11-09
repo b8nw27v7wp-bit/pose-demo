@@ -25,6 +25,7 @@ import { SignalEngine } from '../js/signals.js';
 import { ActionEngine, ARM_FLAG_IDS, ARM_ID_TO_FLAG, POSTURE_IDS, REP_IDS } from '../js/actions.js';
 import { SHAPE_IDS } from '../js/handshape.js';
 import { resolveParams, mergeParams, profileParams, profileName, paramsHash } from '../js/params.js';
+import { assignHands, PersonPipelines } from '../js/multi.js';
 import { stripBom, videoTimeMonotonic } from './frame-io.mjs';
 
 // —— 参数 ---------------------------------------------------------------
@@ -34,6 +35,7 @@ function parseArgs(argv) {
     dir: null, input: null, labels: null, report: null, profile: null, out: null,
     compare: null, baseline: null, sweep: null, sweepActions: null,
     minRecall: null, minPrecision: null, maxCountErr: null, maxDrop: 0.05,
+    allowModelChange: false,
     minGestureRecall: null, maxGestureAbstain: null,
     loso: false, maxLosoDrop: null, margin: 0.1, fitOut: null, resample: null,
     fit: false, json: false, quiet: false, timeline: false, autolabel: false, every: 1,
@@ -54,6 +56,7 @@ function parseArgs(argv) {
     else if (a === '--out') out.out = next();
     else if (a === '--compare') out.compare = [next(), next()];
     else if (a === '--baseline') out.baseline = next();
+    else if (a === '--allow-model-change') out.allowModelChange = true;
     else if (a === '--sweep') out.sweep = next();
     else if (a === '--sweep-actions') out.sweepActions = next().split(',').map((s) => s.trim()).filter(Boolean);
     else if (a === '--min-recall') out.minRecall = num(next(), '--min-recall');
@@ -101,7 +104,7 @@ const USAGE = `用法:
   --autolabel       按当前规则生成 labels 草稿（只含正例，反例仍需人工补）
   --out             配合 --autolabel，写入文件；不给则打印到 stdout
   --compare A B     同一批素材跑两套 profile，输出指标差与判定变化的段
-  --sweep <key>     数值参数 ±10%/±20% 的灵敏度扫描，如 actions.reps.squat.down
+  --sweep <key>     数值参数 ±10%/±20% 的灵敏度扫描，如 actions.reps.clap.down
   --sweep-actions   只列出这几个动作的扫描结果（默认只列发生变化的）
   --min-recall R    每个有数据的动作 recall 下限（0~1），未达标退出码 2
   --min-precision P 同上，precision 下限
@@ -109,6 +112,7 @@ const USAGE = `用法:
   --min-gesture-recall R   每种手势的 recall 下限（0~1，帧级）
   --max-gesture-abstain P  手势弃权率上限（unknown / 侧对 / 未检出，0~1）
   --baseline <报告> 用 --json 导出的旧报告做基线，下降超过 --max-drop（默认 0.05）即失败
+  --allow-model-change  允许 baseline 与当前数据使用不同物体模型（默认拒绝比较）
   --loso            留一人验证：按 labels.subject 轮流留出一人，用其余人拟合阈值后测留出者
   --max-loso-drop R 留出 recall/precision 相对训练集的最大退化（0~1），超出退出码 2
   --margin R        拟合余量比例（默认 0.1），角度/比例按分位值乘此比例留余量
@@ -135,7 +139,7 @@ const META_KEYS = [
   'schema', 'exported_at', 'kp_format', 'hand_kp_format',
   'model', 'delegate', 'hand_model', 'infer_fps',
   'profile', 'profile_model', 'params_hash', 'params',
-  'fps', 'frame_count',
+  'fps', 'frame_count', 'log_limit', 'export_mode', 'objects',
 ];
 
 function metaFrom(obj) {
@@ -227,44 +231,158 @@ function handStateFromFrame(frame) {
 }
 
 /**
- * 导出记录里的 persons[0] 已经是统一契约，直接喂给信号层（从 kp 重算，不用 export 里的 signals）。
+ * 导出记录里的 persons 已经是统一契约，直接喂给信号层（从 kp 重算，不用 export 里的 signals）。
  * kp_world 与 hands 必须一起带上：动作层用 has_world 在 2D/3D 之间选、用 hands 判手部动作，
  * 漏了任何一个，评估就与页面不是同一套规则。
+ *
+ * 多人导出里每个人一条；旧导出只有主目标（1 条）。这里**不做面积筛选**，
+ * 排序与主目标选择由调用方决定（replay 逐 track、evaluateClip 按 label.track）。
+ */
+export function personsFromFrame(frame) {
+  const list = frame && Array.isArray(frame.persons) ? frame.persons : [];
+  const out = [];
+  for (const p of list) {
+    if (!p || !Array.isArray(p.kp) || !p.kp.length) continue;
+    out.push({
+      track_id: p.track_id ?? 0,
+      track_uid: p.track_uid,
+      bbox: p.bbox,
+      kp: p.kp,
+      kp_world: Array.isArray(p.kp_world) && p.kp_world.length >= 33 ? p.kp_world : null,
+      scale: p.scale,
+      score: p.score,
+      kp_format: p.kp_format,
+    });
+  }
+  return out;
+}
+
+/**
+ * 旧语义：只取 persons[0]（单人口径的主目标），手部用整帧 hands。
+ * 保留给只关心主目标的调用方；多人请用 personsFromFrame()。
  */
 function personFromFrame(frame) {
-  const p = frame.persons && frame.persons[0];
+  const p = personsFromFrame(frame)[0];
   if (!p) return null;
-  return {
-    track_id: p.track_id ?? 0,
-    bbox: p.bbox,
-    kp: p.kp,
-    kp_world: Array.isArray(p.kp_world) && p.kp_world.length >= 33 ? p.kp_world : null,
-    hands: handStateFromFrame(frame),
-    scale: p.scale,
-    score: p.score,
-    kp_format: p.kp_format,
-  };
+  return { ...p, hands: handStateFromFrame(frame) };
+}
+
+const personArea = (p) => {
+  const b = p && Array.isArray(p.bbox) ? p.bbox : null;
+  return b && b.length >= 4 ? Math.max(0, (b[2] - b[0]) * (b[3] - b[1])) : 0;
+};
+
+/** 这一帧面积最大的人（主目标）。旧单人导出只有一人，结果恒为该人。 */
+function primaryPerson(persons) {
+  let best = null;
+  for (const p of persons || []) {
+    if (!best || personArea(p) > personArea(best)) best = p;
+  }
+  return best;
+}
+
+function emptyRow(ts) {
+  return { ts, empty: true, postureId: null, frozen: true, flags: {}, reps: null, sig: null };
 }
 
 /**
  * 逐帧复算。同一段素材必须用**同一个** SignalEngine/ActionEngine 实例，
  * 否则滤波与短时窗每帧重置，动作永远出不来。
+ *
+ * 单人素材（整份导出每帧最多 1 人、且只有 1 个 track_id）走旧路径，逐位保持旧结果：
+ * 一个引擎、整帧 hands、不做 gap 重置。多人素材按 track_id 各建一套引擎
+ * （PersonPipelines，缺席超过 gapMs=1000 重建），手部用 multi.js 的 assignHands 归属。
+ *
+ * 返回值与旧版一样是「逐帧主目标」的扁平数组；多人时数组上另挂
+ * `tracks: Map<track_id, 逐帧记录>` 与 `primaryTrack: (track_id|null)[]`，
+ * evaluateClip 按 label.track 取对应 track 的时间线。
  */
 export function replay(frames, params = {}) {
+  const personsByFrame = (frames || []).map(personsFromFrame);
+  const trackIds = new Set();
+  let multiTrack = false;
+  for (const ps of personsByFrame) {
+    if (ps.length > 1) multiTrack = true;
+    for (const p of ps) trackIds.add(p.track_id);
+  }
+  // 旧导出没有 meta：只有「某帧真的出现多个人」才按多人回放，保证旧单人数据逐位不变。
+  // 新导出显式写 export_mode，即使整段素材从没同时检出两个人也能按 multi 处理。
+  if (frames && frames.meta && frames.meta.export_mode === 'multi') multiTrack = true;
+  if (!multiTrack) return replaySingle(frames, params);
+  return replayMulti(frames, personsByFrame, trackIds, params);
+}
+
+/** 旧单人路径：逐字保留，避免任何指标漂移（含不做 gap 重置）。 */
+function replaySingle(frames, params) {
   const se = new SignalEngine(params);
   const ae = new ActionEngine(params);
   const out = [];
   for (const f of frames) {
     const person = personFromFrame(f);
     if (!person) {
-      out.push({ ts: f.ts, empty: true, postureId: null, frozen: true, flags: {}, reps: null, sig: null });
+      out.push(emptyRow(f.ts));
       continue;
     }
     const sig = se.update(person, f.ts);
     const act = ae.update(sig, f.ts, person.hands);
-    out.push({ ts: f.ts, empty: false, sig, act });
+    // person 只用于 label.track 的校验与调试，不参与任何指标计算。
+    out.push({ ts: f.ts, empty: false, sig, act, person });
   }
   return out;
+}
+
+/** 多人路径：每人一套信号/动作引擎，逐帧重建手部归属。 */
+function replayMulti(frames, personsByFrame, trackIds, params) {
+  const pipes = new PersonPipelines(params, { gapMs: 1000 });
+  const perFrame = new Map();          // frameIndex → Map(track_id → 记录)
+  const primaryTrack = new Array(frames.length).fill(null);
+  // uid 与 track_id 是两套空间（都从 1 起）：label 写 uid 时要能查回 track_id。
+  // 以第一次出现的映射为准，避免 id 复用后指向别人。
+  const uidToTrack = new Map();
+  for (const ps of personsByFrame) {
+    for (const p of ps) {
+      if (p.track_uid != null && !uidToTrack.has(p.track_uid)) uidToTrack.set(p.track_uid, p.track_id);
+    }
+  }
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    const persons = personsByFrame[i];
+    const main = primaryPerson(persons);
+    primaryTrack[i] = main ? main.track_id : null;
+    if (!persons.length) continue;
+    // 导出的 hand 只有稳定后的 shape；PersonPipelines 读 cls.shape，这里补一层适配。
+    // （导出里不存在 cls，不能直接改源对象，否则会污染原帧。）
+    const hands = (Array.isArray(f.hands) ? f.hands : [])
+      .filter((h) => h && Array.isArray(h.kp) && h.kp.length)
+      .map((h) => ({
+        ...h,
+        cls: h.cls || { shape: typeof h.shape === 'string' ? h.shape : null, raw: h.shape_raw ?? null },
+      }));
+    const handsByTrack = assignHands(persons, hands);
+    for (const r of pipes.update(persons, f.ts, handsByTrack)) {
+      if (!perFrame.has(i)) perFrame.set(i, new Map());
+      perFrame.get(i).set(r.track_id, {
+        ts: f.ts, empty: false, sig: r.sig, act: r.act,
+        // 评估器只对主目标/指定 track 用；保留 person 便于调试与后续 PPE 评估。
+        person: r.person,
+      });
+    }
+  }
+
+  // 对齐到帧：缺席的帧补 empty，保证 timeline[i] ↔ frames[i]（混淆矩阵与重采样都按下标对）。
+  const tracks = new Map();
+  for (const id of trackIds) {
+    tracks.set(id, frames.map((f, i) => perFrame.get(i)?.get(id) || emptyRow(f.ts)));
+  }
+  const primary = frames.map((f, i) => {
+    const id = primaryTrack[i];
+    return id != null && tracks.has(id) ? tracks.get(id)[i] : emptyRow(f.ts);
+  });
+  // 非元素属性：JSON.stringify(数组) 不会带它，现有调用方看不到任何变化。
+  Object.defineProperty(primary, 'tracks', { value: tracks, enumerable: false });
+  Object.defineProperty(primary, 'primaryTrack', { value: primaryTrack, enumerable: false });
+  Object.defineProperty(primary, 'uidToTrack', { value: uidToTrack, enumerable: false });
+  return primary;
 }
 
 // —— 时间段运算 ---------------------------------------------------------
@@ -411,6 +529,7 @@ function normGestureHand(h) {
   return null;
 }
 
+/** 全量 person bbox（多人导出里是每个人一条；旧导出恒为 1 条）。 */
 function personBoxes(frame) {
   return (frame && Array.isArray(frame.persons) ? frame.persons : [])
     .map((p) => (p && Array.isArray(p.bbox) && p.bbox.length >= 4 ? p.bbox : null))
@@ -424,18 +543,50 @@ function insideBox(box, [x, y]) {
   return x >= box[0] - padX && x <= box[2] + padX && y >= box[1] - padY && y <= box[3] + padY;
 }
 
+// 两人框重叠、手恰好落在重叠区时，谁的手无法从几何上判定。
+// 次近人 margin：手心到最近人中心与次近人中心的距离差 < 0.15×scale 就弃权。
+// 不用固定像素：远景两个人的 scale 小，0.15×scale 也跟着变小，阈值随人走。
+const OWNER_MARGIN = 0.15;
+
 /**
- * 只手 → 可判定状态。优先级：未归属 > 侧对 > unknown > decided。
+ * 手 → 人归属（多人口径）。
+ * 只在「手框中心落在 bbox 内」的人里选；两人都命中时按到各自 bbox 中心的距离，
+ * 次近人必须比最近人远出 ≥0.15×scale，否则判为 ambiguous（弃权，不硬分给谁）。
+ * @returns {{status:'ok'|'outside'|'ambiguous', track_id?:number}}
+ */
+function handOwner(h, persons) {
+  const b = Array.isArray(h.bbox) && h.bbox.length >= 4 ? h.bbox : null;
+  if (!b) return { status: 'outside' };
+  const center = [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+  const cand = [];
+  for (const p of persons || []) {
+    const box = p.bbox;
+    if (!Array.isArray(box) || box.length < 4) continue;
+    if (!insideBox(box, center)) continue;
+    const cx = (box[0] + box[2]) / 2;
+    const cy = (box[1] + box[3]) / 2;
+    cand.push({
+      track_id: p.track_id,
+      d: Math.hypot(center[0] - cx, center[1] - cy),
+      scale: p.scale > 0 ? p.scale : null,
+    });
+  }
+  if (!cand.length) return { status: 'outside' };
+  cand.sort((a, b2) => a.d - b2.d);
+  if (cand.length > 1) {
+    const scale = cand[0].scale ?? cand[1].scale ?? 1;
+    if ((cand[1].d - cand[0].d) / scale < OWNER_MARGIN) return { status: 'ambiguous' };
+  }
+  return { status: 'ok', track_id: cand[0].track_id };
+}
+
+/**
+ * 只手 → 可判定状态（归属已确定之后）。优先级：侧对 > unknown > decided。
  *
  * 侧对（`orient.facing === 'edge'`）整帧不计入分母：手掌侧对镜头时手势分类本来就不可信，
  * 模型给没给答案都不该算对或算错（PLAN §R7 的「朝向门控」）。
  */
-function handState(h, boxes, stats) {
-  const b = Array.isArray(h.bbox) && h.bbox.length >= 4 ? h.bbox : null;
-  const center = b ? [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] : null;
-  const target = !!(center && boxes.length && insideBox(boxes[0], center));
-  if (!target) { stats.unattributed++; return { status: 'unattributed', shapes: [] }; }
-  stats.attributed++;
+function handStateOf(h) {
   if (h.orient && h.orient.facing === 'edge') return { status: 'edge', shapes: [] };
   const shape = typeof h.shape === 'string' ? h.shape : null;
   if (!shape || shape === 'unknown' || !SHAPE_IDS.includes(shape)) {
@@ -465,25 +616,47 @@ function mergeGestureSides(a, b) {
  * 整份素材的逐帧手势状态 + 归属统计。
  * 选边规则与 app.js 的 handState 完全一致：未知 handedness 不参与 L/R，同一侧取第一只。
  * `hasHands=false` 表示整份导出没有 hands 字段（旧版导出/手部模型没开）。
+ *
+ * @param {{track?: number|null}} opts
+ *   track 指定时只看这个人被归属到的手（多人逐 track 评估）；
+ *   缺省时看**面积最大的主目标**（旧单人导出只有一个人 → 结果与旧版逐位相同）。
  */
-export function gestureFrames(frames) {
+export function gestureFrames(frames, { track = null } = {}) {
   const states = [];
   const stats = {
     hands: 0, attributed: 0, unattributed: 0, multiPersonFrames: 0, noPersonFrames: 0,
   };
   let hasHands = false;
   for (const f of frames || []) {
+    const persons = personsFromFrame(f);
     const boxes = personBoxes(f);
     if (boxes.length > 1) stats.multiPersonFrames++;
     if (!boxes.length) stats.noPersonFrames++;
+    const main = primaryPerson(persons);
     const list = Array.isArray(f && f.hands) ? f.hands : null;
     if (list) hasHands = true;
     let L = noHandState();
     let R = noHandState();
     for (const h of list || []) {
       if (!h) continue;
+      const own = handOwner(h, persons);
+      // 指定 track：别人的手直接跳过（不进分母，也不算「未归属」——
+      // 它可能归属得很好，只是不属于这次评估的人）。
+      if (track != null && own.status === 'ok' && own.track_id !== track) continue;
       stats.hands++;
-      const st = handState(h, boxes, stats);
+      let st;
+      if (own.status !== 'ok') {
+        // 框外 / 两人框重叠且分不清 → 未归属
+        stats.unattributed++;
+        st = { status: 'unattributed', shapes: [] };
+      } else if (track == null && main && own.track_id !== main.track_id) {
+        // 缺省主目标口径：别人的手算未归属（与旧版「手不在 boxes[0] 内」一致）
+        stats.unattributed++;
+        st = { status: 'unattributed', shapes: [] };
+      } else {
+        stats.attributed++;
+        st = handStateOf(h);
+      }
       if (h.handedness === 'Left') { if (L.status === 'noHand') L = st; }
       else if (h.handedness === 'Right') { if (R.status === 'noHand') R = st; }
     }
@@ -627,9 +800,7 @@ const SIGNAL_GETTERS = {
 /** 每个动作判定真正依赖的信号。报错时只打这几列，避免整张信号表淹没有用信息。 */
 const SIGNALS_FOR = {
   stand: ['uprightness', 'knee', 'leg_vertical'],
-  squat_static: ['knee', 'uprightness', 'leg_vertical'],
   sit: ['knee', 'uprightness', 'leg_vertical'],
-  lying: ['uprightness', 'leg_vertical'],
   armRaised: ['elev_L', 'elev_R', 'elev_torso_L', 'elev_torso_R'],
   bothHandsUp: ['elev_L', 'elev_R', 'elev_torso_L', 'elev_torso_R', 'reach_L', 'reach_R'],
   waving: ['elev_L', 'elev_R', 'wave_flips', 'wave_amp'],
@@ -645,8 +816,6 @@ const SIGNALS_FOR = {
   armFront: ['elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
   armSide: ['elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
   grasp: ['reach_L', 'reach_R', 'elev_L', 'elev_R'],
-  squat: ['knee'],
-  pushup: ['elbow', 'uprightness'],
   clap: ['hands_close'],
   [NO_ARM]: ['elev_L', 'elev_R', 'hands_close', 'reach_L', 'reach_R'],
 };
@@ -696,40 +865,124 @@ function rangeContext(frames, range) {
  *   action 可以是姿态 id、手臂 flag、rep 名、`none`、`noArm`，或加 `!` 前缀表示反例。
  * 反例段的 pass = 整个窗口内都没有出现该动作。
  */
+/** 多人 replay 的时间线上下文。旧单人 replay 返回的扁平数组没有 tracks。 */
+function timelineContext(timeline) {
+  const tracks = timeline && timeline.tracks instanceof Map ? timeline.tracks : null;
+  return {
+    tracks,
+    multi: !!tracks,
+    primaryTrack: (timeline && Array.isArray(timeline.primaryTrack)) ? timeline.primaryTrack : null,
+    uidToTrack: (timeline && timeline.uidToTrack instanceof Map) ? timeline.uidToTrack : null,
+  };
+}
+
+/** 段起点所在的帧下标（没有正好命中时取最后一个更早的帧）。 */
+function frameIndexAt(frames, ts) {
+  let idx = -1;
+  for (let i = 0; i < frames.length; i++) {
+    if (frames[i] && frames[i].ts <= ts) idx = i;
+    else break;
+  }
+  return idx < 0 ? 0 : idx;
+}
+
+/**
+ * 这一段该看哪个 track：
+ *   seg.track 显式给出 → 用它（导出里没有就报错，不静默退回主目标）；
+ *   缺省 → 段起点处面积最大的主目标（旧单人数据只有一个 track，结果不变）。
+ */
+function segmentTrack(seg, range, frames, tctx, fallbackTimeline) {
+  if (!tctx.multi) {
+    // 单人数据：允许 label 写 track 做校验，但评估口径仍是唯一的那个 track。
+    if (seg.track === undefined || seg.track === null) return { id: null };
+    const want = Number(seg.track);
+    if (!Number.isFinite(want)) return { error: `非法 track：${seg.track}` };
+    const row = fallbackTimeline.find((r) => !r.empty);
+    const actual = row?.person?.track_id;
+    const actualUid = row?.person?.track_uid;
+    // 旧导出没有 person；单人素材只有一个 track，按 0 处理（与 persons[0].track_id 一致）。
+    // 写 uid 也接受（与多人口径一致），但单人素材里 id/uid 指的都是同一个人。
+    if (actual !== undefined && actual !== want && actualUid !== want) {
+      return {
+        error: `导出里没有 track ${want}（单人素材只有 track_id ${actual}`
+          + `${actualUid != null ? ` / uid ${actualUid}` : ''}）`,
+      };
+    }
+    return { id: null };
+  }
+  if (seg.track !== undefined && seg.track !== null && seg.track !== '') {
+    const want = Number(seg.track);
+    if (!Number.isFinite(want)) return { error: `非法 track：${seg.track}` };
+    // uid 优先（跨 id 稳定，与 ppe-eval 同口径），找不到再退回 track_id。
+    let id = tctx.uidToTrack?.get(want) ?? null;
+    if (id == null && tctx.tracks.has(want)) id = want;
+    if (id == null) return { error: `导出里没有 track ${want}（按 uid 优先、再按 track_id 查）` };
+    return { id };
+  }
+  const idx = frameIndexAt(frames, range[0]);
+  id = tctx.primaryTrack?.[idx] ?? null;
+  if (id == null) {
+    // 段起点没有人：往前找最近一帧的主目标；整份素材都没人就退回任意一个 track
+    for (let i = idx; i >= 0 && id == null; i--) id = tctx.primaryTrack?.[i] ?? null;
+    if (id == null) id = [...tctx.tracks.keys()][0] ?? null;
+  }
+  if (id == null || !tctx.tracks.has(id)) return { error: '导出里没有任何可判定的 track' };
+  return { id };
+}
+
 export function evaluateClip(frames, labels, timeline) {
   const segments = labels.segments || [];
   const span = frames.length ? frames[frames.length - 1].ts - frames[0].ts : 0;
+  const tctx = timelineContext(timeline);
 
   const results = [];
-  let gf = null;                       // 逐帧手势状态：只在这份素材真的标了手势/none 时才算
-  const gestures = () => (gf ||= gestureFrames(frames));
+  // 逐帧手势状态：只在这份素材真的标了手势/none 时才算。多人按 track 各缓存一份。
+  const gfByTrack = new Map();
+  const gestures = (track = null) => {
+    const key = track == null ? '__primary__' : track;
+    if (!gfByTrack.has(key)) gfByTrack.set(key, gestureFrames(frames, { track }));
+    return gfByTrack.get(key);
+  };
   for (const seg of segments) {
     const range = resolveRange(seg, frames);
     const { action, expect } = parseSegment(seg);
     const ctx = rangeContext(frames, range);
+    const picked = segmentTrack(seg, range, frames, tctx, timeline);
+    if (picked.error) {
+      results.push({
+        type: 'unknown', action, expect, range, pass: false,
+        error: picked.error, fail: ctx,
+        ...(tctx.multi ? { track: seg.track ?? null } : {}),
+      });
+      continue;
+    }
+    const track = picked.id;
+    const trackExtra = tctx.multi ? { track } : {};
+    // 该 track 的逐帧时间线（与 frames 逐下标对齐；缺席帧是 empty）。
+    const tline = tctx.multi && track != null ? tctx.tracks.get(track) : timeline;
 
     if (action === GESTURE) {
-      results.push(evalGestureSegment(seg, expect, range, frames, gestures(), ctx));
+      results.push({ ...evalGestureSegment(seg, expect, range, frames, gestures(track), ctx), ...trackExtra });
       continue;
     }
 
     if (REP_IDS.includes(action)) {
-      // 计数类：正例比较增量与期望次数；反例（!squat）期望 0，多出来的都算 FP
-      const got = repDelta(timeline, action, range);
+      // 计数类：正例比较增量与期望次数；反例（!clap）期望 0，多出来的都算 FP
+      const got = repDelta(tline, action, range);
       const want = expect ? (seg.count ?? 1) : 0;
       const tol = seg.tol ?? (expect ? 1 : 0);
       const pass = Math.abs(got - want) <= tol;
-      const r = { type: 'rep', action, expect, range, want, got, pass };
-      if (!pass) r.fail = { ...ctx, signals: sigStats(timeline, range, SIGNALS_FOR[action]) };
+      const r = { type: 'rep', action, expect, range, want, got, pass, ...trackExtra };
+      if (!pass) r.fail = { ...ctx, signals: sigStats(tline, range, SIGNALS_FOR[action]) };
       results.push(r);
       continue;
     }
 
-    const series = seriesOf(timeline, action);
+    const series = seriesOf(tline, action);
     if (!series) {
       results.push({
         type: 'unknown', action, expect, range, pass: false,
-        error: `未知动作名 ${action}`, fail: ctx,
+        error: `未知动作名 ${action}`, fail: ctx, ...trackExtra,
       });
       continue;
     }
@@ -739,15 +992,15 @@ export function evaluateClip(frames, labels, timeline) {
     const hit = hits.length > 0;
     // none 声称「什么都不该发生」，所以窗口内的计数增量也要算误报。
     // 手臂反例（!onHips）不背这个锅：它只声明手臂状态，不声明有没有深蹲。
-    const repFalseAlarms = action === NO_ACTIVITY ? repDeltas(timeline, range) : null;
+    const repFalseAlarms = action === NO_ACTIVITY ? repDeltas(tline, range) : null;
     const repViolated = !!repFalseAlarms && Object.values(repFalseAlarms).some((n) => n > 0);
     const pass = expect ? hit : (!hit && !repViolated);
-    const r = { type: 'state', action, expect, range, want: expect, got: hit, pass };
+    const r = { type: 'state', action, expect, range, want: expect, got: hit, pass, ...trackExtra };
     if (repFalseAlarms) r.repFalseAlarms = repFalseAlarms;
     // none 声称「什么都不该发生」：窗口里被判定出来的手势也算误报。
     // 只记 FP、不改变 none 段本身的通过条件——手势的 precision 才是它的归宿。
     if (action === NO_ACTIVITY) {
-      const g = gestureActivations(frames, gestures(), range);
+      const g = gestureActivations(frames, gestures(track), range);
       if (Object.keys(g).length) r.gestureFalseAlarms = g;
     }
     // 事件时延：标签起点 → 该动作在段内第一次为真。段开始时已经为真则记 0。
@@ -757,17 +1010,17 @@ export function evaluateClip(frames, labels, timeline) {
     if (!pass) {
       r.fail = {
         ...ctx,
-        signals: sigStats(timeline, range, SIGNALS_FOR[action] || ['uprightness', 'knee']),
+        signals: sigStats(tline, range, SIGNALS_FOR[action] || ['uprightness', 'knee']),
       };
       if (expect) {
         // 漏判：当时实际判成了什么，比「没出现」更有信息量（常见是串判到相邻姿态）
-        r.fail.observed = culprits(timeline, range, true);
+        r.fail.observed = culprits(tline, range, true);
       } else if (action === NO_ACTIVITY) {
         // none 声称「什么都不该发生」：所有在跳的动作/姿态都算误报
-        r.fail.falseAlarms = culprits(timeline, range, true);
+        r.fail.falseAlarms = culprits(tline, range, true);
       } else if (action === NO_ARM) {
         // noArm 只追究手臂，站立不算它的错
-        r.fail.falseAlarms = culprits(timeline, range, false);
+        r.fail.falseAlarms = culprits(tline, range, false);
       } else {
         // 单动作反例（!onHips）：只有它自己算误报。
         // 把同时成立的 stand 也记成 FP，会把 stand 的 precision 一起拉低 —— 那并不是 stand 判错了。
@@ -780,9 +1033,12 @@ export function evaluateClip(frames, labels, timeline) {
 
   // 每个动作在整段素材里的「状态段数」（off→on 次数），用于抖动统计。
   // 与标注无关：只统计模型自己报了多少次，所以没标注的动作也能看出抖不抖。
+  // 多人时逐 track 各数一遍再相加——扁平 timeline 是「每帧主目标」，面积排序一变
+  // 主目标就换人，会把两个人的状态拼成一条，翻转次数虚高。
+  const activitySources = tctx.multi ? [...tctx.tracks.values()] : [timeline];
   const activity = {};
   for (const id of [...POSTURE_IDS, ...FLAG_IDS]) {
-    activity[id] = activeRanges(seriesOf(timeline, id)).length;
+    activity[id] = activitySources.reduce((n, tl) => n + activeRanges(seriesOf(tl, id)).length, 0);
   }
 
   return {
@@ -794,8 +1050,10 @@ export function evaluateClip(frames, labels, timeline) {
     frames: frames.length,
     duration_s: +(span / 1000).toFixed(2),
     activity,
-    // 只有在标了手势 / none 段时才算过逐帧手势状态；没有就不带这个字段
-    ...(gf ? { gestureAttr: gf.stats } : {}),
+    // 只有在标了手势 / none 段时才算过逐帧手势状态；没有就不带这个字段。
+    // 多人多 track 时归属统计取**主目标口径**（每段自己的 gf 只服务于该段的指标）。
+    ...(gfByTrack.size ? { gestureAttr: gestures(null).stats } : {}),
+    ...(tctx.multi ? { tracks: [...tctx.tracks.keys()] } : {}),
     segments: results,
   };
 }
@@ -814,15 +1072,20 @@ export function gestureSummary(clips) {
     hands: 0, attributed: 0, unattributed: 0, multiPersonFrames: 0, noPersonFrames: 0,
   };
   let segments = 0;
-  const bump = (shape) => {
+  // 多人口径：手势段带 track 时按 (track, shape) 分组（与 summarize 一致）。
+  const trackMode = clips.some((c) => (c.segments || [])
+    .some((s) => s && s.track !== undefined && s.track !== null));
+  const bump = (shape, s) => {
     if (!shape || !SHAPE_IDS.includes(shape)) return null;
-    if (!byShape.has(shape)) {
-      byShape.set(shape, {
-        shape, decidedPos: 0, decidedNeg: 0, hits: 0, fp: 0,
+    const key = trackMode ? `${s?.track ?? '-'}\u0000${shape}` : shape;
+    if (!byShape.has(key)) {
+      byShape.set(key, {
+        shape, ...(trackMode ? { track: s?.track ?? null } : {}),
+        decidedPos: 0, decidedNeg: 0, hits: 0, fp: 0,
         unknown: 0, edge: 0, unattributed: 0, noHand: 0,
       });
     }
-    return byShape.get(shape);
+    return byShape.get(key);
   };
   for (const c of clips) {
     // 归属率只在真的标了手势段的素材上统计；只标了 none 的素材不该稀释它
@@ -833,7 +1096,7 @@ export function gestureSummary(clips) {
       if (s.type === 'gesture') {
         segments++;
         if (!s.stats || !s.shape) continue;   // hand/shape 写错的段不计入指标，只算失败段
-        const b = bump(s.shape);
+        const b = bump(s.shape, s);
         if (!b) continue;
         // 反例段的「已判定」帧也要进弃权率的分母：它们同样做了判定（只是没命中目标手势），
         // 只把弃权帧算进分子、判定帧不算分母，会让有反例段的素材弃权率虚高。
@@ -842,7 +1105,7 @@ export function gestureSummary(clips) {
         for (const k of ['unknown', 'edge', 'unattributed', 'noHand']) b[k] += s.stats[k] || 0;
       } else if (s.type === 'state' && s.action === NO_ACTIVITY && s.gestureFalseAlarms) {
         for (const [shape, n] of Object.entries(s.gestureFalseAlarms)) {
-          const b = bump(shape);
+          const b = bump(shape, s);
           if (b) b.fp += n;
         }
       }
@@ -904,13 +1167,23 @@ export function wilson(k, n, z = 1.96) {
 /**
  * 汇总成每动作一行。反例的误报归到**实际误报的动作**上，不记在 `none`/`noArm` 头上，
  * 否则每个动作的 precision 恒为 1（PLAN §13 R1）。
- * 计数误报有两个来源：`!squat` 这类反例段（got 直接记 FP），以及 `none` 段窗口内的增量。
+ * 计数误报有两个来源：`!clap` 这类反例段（got 直接记 FP），以及 `none` 段窗口内的增量。
  */
 export function summarize(clipResults) {
   const byAction = new Map();
-  const bump = (action) => {
-    if (!byAction.has(action)) byAction.set(action, { tp: 0, fn: 0, fp: 0, repAbs: 0, repN: 0 });
-    return byAction.get(action);
+  // 多人口径：段带 track 时按 (track, action) 分组，每行带 n；否则保持旧的行结构。
+  const trackMode = clipResults.some((c) => (c.segments || [])
+    .some((s) => s && s.track !== undefined && s.track !== null));
+  const keyOf = (action, s) => (trackMode ? `${s?.track ?? '-'}\u0000${action}` : action);
+  const bump = (action, s) => {
+    const key = keyOf(action, s);
+    if (!byAction.has(key)) {
+      byAction.set(key, {
+        action, tp: 0, fn: 0, fp: 0, repAbs: 0, repN: 0,
+        ...(trackMode ? { track: s?.track ?? null } : {}),
+      });
+    }
+    return byAction.get(key);
   };
   for (const c of clipResults) {
     for (const s of c.segments) {
@@ -918,13 +1191,13 @@ export function summarize(clipResults) {
       if (s.type === 'gesture') continue;   // 手势是帧级指标，单独汇总（gestureSummary）
       if (s.type === 'rep') {
         if (s.expect) {
-          const b = bump(s.action);
+          const b = bump(s.action, s);
           b.repAbs += Math.abs(s.got - s.want);
           b.repN += s.want;
           if (s.pass) b.tp++; else b.fn++;
         } else if (s.got > 0) {
           // 反例计数段：多出来的每一次都是误报
-          bump(s.action).fp += s.got;
+          bump(s.action, s).fp += s.got;
         }
         continue;
       }
@@ -933,26 +1206,32 @@ export function summarize(clipResults) {
         if (s.got) {
           const hit = s.fail?.falseAlarms?.length ? s.fail.falseAlarms : [null];
           for (const a of hit) {
-            if (a === null) bump(s.action).fp++;
-            else bump(a).fp++;
+            if (a === null) bump(s.action, s).fp++;
+            else bump(a, s).fp++;
           }
         }
         for (const [a, n] of Object.entries(s.repFalseAlarms || {})) {
-          if (n > 0) bump(a).fp += n;
+          if (n > 0) bump(a, s).fp += n;
         }
         continue;
       }
-      if (s.got) bump(s.action).tp++; else bump(s.action).fn++;
+      if (s.got) bump(s.action, s).tp++; else bump(s.action, s).fn++;
     }
   }
   const rows = [];
-  for (const [action, b] of [...byAction.entries()].sort()) {
+  const entries = [...byAction.entries()].sort((a, b) => {
+    const aa = a[1].action; const ba = b[1].action;
+    if (aa !== ba) return aa < ba ? -1 : 1;
+    return (a[1].track ?? -1) - (b[1].track ?? -1);
+  });
+  for (const [, b] of entries) {
     const nRecall = b.tp + b.fn;
     const nPrecision = b.tp + b.fp;
     const recall = nRecall > 0 ? +(b.tp / nRecall).toFixed(3) : null;
     const precision = nPrecision > 0 ? +(b.tp / nPrecision).toFixed(3) : null;
     rows.push({
-      action,
+      action: b.action,
+      ...(trackMode ? { track: b.track } : {}),
       tp: b.tp, fn: b.fn, fp: b.fp,
       nRecall, nPrecision,
       recall, recallCI: recall === null ? null : wilson(b.tp, nRecall),
@@ -990,13 +1269,16 @@ export function postureConfusion(timeline, labels, frames) {
   const idx = new Map(labelsList.map((v, i) => [v, i]));
   const matrix = labelsList.map(() => labelsList.map(() => 0));
   const truth = new Array(timeline.length).fill(null);
+  // 每帧用哪条时间线做预测：多人时按段的 track 取，单人恒为扁平 timeline。
+  const predRows = new Array(timeline.length).fill(null);
+  const tctx = timelineContext(timeline);
   let negatedSkipped = 0;
 
-  const assign = (range, value) => {
+  const assign = (range, value, row = timeline) => {
     for (let i = 0; i < timeline.length; i++) {
-      const r = timeline[i];
-      if (r.ts < range[0] || r.ts > range[1]) continue;
-      if (truth[i] === null) truth[i] = value;
+      const r = row[i];
+      if (!r || r.ts < range[0] || r.ts > range[1]) continue;
+      if (truth[i] === null) { truth[i] = value; predRows[i] = row; }
       else if (truth[i] !== value) truth[i] = AMBIGUOUS;
     }
   };
@@ -1008,9 +1290,15 @@ export function postureConfusion(timeline, labels, frames) {
     if (!isPosture && !isNone) continue;
     let range;
     try { range = resolveRange(seg, frames); } catch { continue; }
-    if (isNone) { assign(range, 'none'); continue; }
+    // 多人：段写了 track（uid 优先）就看那个人的预测，否则回退主目标（段起点面积最大者）。
+    let row = timeline;
+    if (tctx.multi) {
+      const picked = segmentTrack(seg, range, frames, tctx, timeline);
+      if (!picked.error && picked.id != null) row = tctx.tracks.get(picked.id) || timeline;
+    }
+    if (isNone) { assign(range, 'none', row); continue; }
     if (!expect) { negatedSkipped += countTimelineFrames(timeline, range); continue; }
-    assign(range, action);
+    assign(range, action, row);
   }
 
   let counted = 0;
@@ -1019,8 +1307,8 @@ export function postureConfusion(timeline, labels, frames) {
   for (let i = 0; i < timeline.length; i++) {
     if (truth[i] === null) continue;
     if (truth[i] === AMBIGUOUS) { ambiguous++; continue; }
-    const r = timeline[i];
-    if (r.empty || !r.act) { emptySkipped++; continue; }
+    const r = (predRows[i] || timeline)[i];
+    if (!r || r.empty || !r.act) { emptySkipped++; continue; }
     const pred = POSTURE_IDS.includes(r.act.postureId) ? r.act.postureId : 'none';
     matrix[idx.get(truth[i])][idx.get(pred)]++;
     counted++;
@@ -1055,12 +1343,17 @@ export function armCooccurrence(timeline) {
   const labels = [...FLAG_IDS];
   const matrix = labels.map(() => labels.map(() => 0));
   let frames = 0;
-  for (const r of timeline) {
-    if (r.empty || !r.act) continue;
-    frames++;
-    const on = [];
-    for (let i = 0; i < labels.length; i++) if (r.act.flags[labels[i]]) on.push(i);
-    for (const i of on) for (const j of on) matrix[i][j]++;
+  // 多人时逐 track 统计：扁平 timeline 是「每帧主目标」，会把两个人的手臂旗标
+  // 拼到同一帧里，算出根本不存在的同现。
+  const sources = timeline && timeline.tracks instanceof Map ? [...timeline.tracks.values()] : [timeline];
+  for (const tl of sources) {
+    for (const r of tl) {
+      if (r.empty || !r.act) continue;
+      frames++;
+      const on = [];
+      for (let i = 0; i < labels.length; i++) if (r.act.flags[labels[i]]) on.push(i);
+      for (const i of on) for (const j of on) matrix[i][j]++;
+    }
   }
   return { labels, matrix, frames };
 }
@@ -1102,9 +1395,11 @@ export function groupSummaries(clips, key) {
   const named = groups.filter((g) => g.name !== '(未标注)');
   const degradation = [];
   if (named.length >= 2) {
-    const actions = [...new Set(named.flatMap((g) => g.summary.map((r) => r.action)))].sort();
+    // 多人口径同一动作有多个 track 行：按「track:动作」配对，不能只取第一行。
+    const losKey = (r) => (r.track !== undefined && r.track !== null ? `${r.track}:${r.action}` : r.action);
+    const actions = [...new Set(named.flatMap((g) => g.summary.map(losKey)))].sort();
     for (const action of actions) {
-      const rows = named.map((g) => g.summary.find((r) => r.action === action)).filter(Boolean);
+      const rows = named.map((g) => g.summary.find((r) => losKey(r) === action)).filter(Boolean);
       const recalls = rows.map((r) => r.recall).filter((v) => v !== null);
       const precisions = rows.map((r) => r.precision).filter((v) => v !== null);
       if (recalls.length >= 2 || precisions.length >= 2) {
@@ -1213,7 +1508,7 @@ export function toTimeline(frames, timeline, every = 1) {
       + ` | ${n(s.leg_vertical, 2)} | ${n(s.armPose.elev_L)}/${n(s.armPose.elev_R)}`
       + ` | ${s.armPose.has_world ? `${n(s.armPose.elev_torso_L)}/${n(s.armPose.elev_torso_R)}` : '无'}`
       + ` | ${r.act.postureId || '—'}`
-      + ` | ${r.act.reps.squat}/${r.act.reps.pushup}/${r.act.reps.clap}/${r.act.reps.grasp} | ${on}`
+      + ` | ${r.act.reps.clap}/${r.act.reps.grasp} | ${on}`
       + ` | ${handShape(f, 'Left')} | ${handShape(f, 'Right')} |`);
   }
   return lines.join('\n');
@@ -1368,8 +1663,6 @@ export function fitToParams(fit, { margin = 0.1 } = {}) {
   // —— 姿态门限
   const standKnee = take('stand', 'knee');
   if (standKnee) set('actions.posture.stand.kneeGt', angle(lower(standKnee)));
-  const squatKnee = take('squat_static', 'knee');
-  if (squatKnee) set('actions.posture.squat.kneeLt', angle(upper(squatKnee)));
   const sitKnee = take('sit', 'knee');
   if (sitKnee) {
     const gt = angle(lower(sitKnee));
@@ -1383,44 +1676,14 @@ export function fitToParams(fit, { margin = 0.1 } = {}) {
   }
   const standUp = take('stand', 'uprightness');
   if (standUp) set('actions.posture.stand.uprightnessGt', ratio(lower(standUp)));
-  const squatUp = take('squat_static', 'uprightness');
-  if (squatUp) set('actions.posture.squat.uprightnessGt', ratio(lower(squatUp)));
-  // 下蹲姿态的腿竖直比与计数门控同口径（下限型：蹲着时踝仍明显在髋下方）
-  const squatLv = take('squat_static', 'leg_vertical');
-  if (squatLv) set('actions.posture.squat.legVerticalGt', ratio(lower(squatLv)));
   const sitUp = take('sit', 'uprightness');
   if (sitUp) set('actions.posture.sit.uprightnessGt', ratio(lower(sitUp)));
-  const lyingUp = take('lying', 'uprightness');
-  if (lyingUp) set('actions.posture.lying.uprightnessLt', ratio(upper(lyingUp)));
   const standLv = take('stand', 'leg_vertical');
   if (standLv) set('actions.posture.stand.legVerticalGt', ratio(lower(standLv)));
   const sitLv = take('sit', 'leg_vertical');
   if (sitLv) set('actions.posture.sit.legVerticalLt', ratio(upper(sitLv)));
-  const lyingLv = take('lying', 'leg_vertical');
-  if (lyingLv) set('actions.posture.lying.legVerticalLt', ratio(upper(lyingLv)));
 
   // —— 计数：down 低、up 高；成对校验，避免拟合出永远触发不了的区间
-  const squatRep = take('squat_baseline', 'knee') || squatKnee;
-  if (squatRep && standKnee) {
-    const down = angle(upper(squatRep));
-    const up = angleUp(lower(standKnee));
-    if (pair('squat', down, up)) {
-      set('actions.reps.squat.down', down);
-      set('actions.reps.squat.up', up);
-    }
-  } else if (squatRep) {
-    // 只有「确实有深蹲分位、但缺 stand」才算缺一侧；从没标过 squat 的素材不该被告警
-    warnings.push('squat：有深蹲分位但缺少 stand/knee，无法定上阈，已跳过');
-  }
-  const pushElbow = take('pushup_baseline', 'elbow');
-  if (pushElbow) {
-    const down = angle(lower(pushElbow));
-    const up = angleUp(upper(pushElbow));
-    if (pair('pushup', down, up)) {
-      set('actions.reps.pushup.down', down);
-      set('actions.reps.pushup.up', up);
-    }
-  }
   const clap = take('clap_baseline', 'hands_close');
   if (clap) {
     const down = ratio(lower(clap));
@@ -1430,12 +1693,6 @@ export function fitToParams(fit, { margin = 0.1 } = {}) {
       set('actions.reps.clap.up', up);
     }
   }
-
-  // —— 计数门控（与姿态共用 stand/pushup 的分位）
-  if (standLv) set('actions.gates.squat.legVerticalGt', ratio(lower(standLv)));
-  if (standUp) set('actions.gates.squat.uprightnessGt', ratio(lower(standUp)));
-  const pushUp = take('pushup_baseline', 'uprightness');
-  if (pushUp) set('actions.gates.pushup.uprightnessLt', ratio(upper(pushUp)));
 
   // —— 手臂：两侧信号要合起来看，不能各自拍脑袋
   // raised 是上限型（elev < raised）：取两侧**较低**的 P95。
@@ -1488,10 +1745,20 @@ export function resampleFrames(frames, fps) {
 
 // —— 门槛 ---------------------------------------------------------------
 
+/**
+ * summary 行的唯一键：多人数据每行带 track，用 (track, action)；单人/旧报告没有 track，
+ * 退化成 action。只按 action 建 Map 会让多 track 的行互相覆盖，baseline/sweep/A-B/LOSO
+ * 只剩最后一条 track —— 门槛会假绿。
+ */
+const rowKey = (r) => `${r?.action ?? ''}\u0000${r?.track ?? ''}`;
+
+/** 行在报告里的显示名：多人时带 #track，避免两张表里的同名动作分不清。 */
+const rowLabel = (r) => (r?.track != null ? `${r.action} #${r.track}` : `${r?.action ?? ''}`);
+
 function baselineRows(raw) {
   const rows = Array.isArray(raw) ? raw : (Array.isArray(raw?.summary) ? raw.summary : null);
   if (!rows) throw new Error('baseline 需要评估报告里的 summary 数组（用 --json 导出的报告）');
-  return new Map(rows.filter((r) => r && typeof r.action === 'string').map((r) => [r.action, r]));
+  return new Map(rows.filter((r) => r && typeof r.action === 'string').map((r) => [rowKey(r), r]));
 }
 
 /**
@@ -1508,14 +1775,15 @@ export function evaluateGates(summary, opts = {}) {
   } = opts;
   const violations = [];
   for (const row of summary || []) {
+    const at = row.track != null ? { track: row.track } : {};
     if (row.recall !== null && Number.isFinite(minRecall) && row.recall < minRecall) {
-      violations.push({ action: row.action, metric: 'recall', value: row.recall, threshold: minRecall, kind: 'min' });
+      violations.push({ action: row.action, ...at, metric: 'recall', value: row.recall, threshold: minRecall, kind: 'min' });
     }
     if (row.precision !== null && Number.isFinite(minPrecision) && row.precision < minPrecision) {
-      violations.push({ action: row.action, metric: 'precision', value: row.precision, threshold: minPrecision, kind: 'min' });
+      violations.push({ action: row.action, ...at, metric: 'precision', value: row.precision, threshold: minPrecision, kind: 'min' });
     }
     if (row.countErr !== null && Number.isFinite(maxCountErr) && row.countErr > maxCountErr) {
-      violations.push({ action: row.action, metric: 'countErr', value: row.countErr, threshold: maxCountErr, kind: 'max' });
+      violations.push({ action: row.action, ...at, metric: 'countErr', value: row.countErr, threshold: maxCountErr, kind: 'max' });
     }
   }
   // 手势门槛只有在数据里真的标了手势段时才判；否则空素材会「全绿」——那是最坏的绿灯
@@ -1546,14 +1814,15 @@ export function evaluateGates(summary, opts = {}) {
   if (baseline) {
     const base = baselineRows(baseline);
     for (const row of summary || []) {
-      const b = base.get(row.action);
+      const b = base.get(rowKey(row));
       if (!b) continue;
       for (const metric of ['recall', 'precision']) {
         if (row[metric] === null || row[metric] === undefined || b[metric] === null || b[metric] === undefined) continue;
         const floor = +(b[metric] - maxDrop).toFixed(3);
         if (row[metric] < floor) {
           violations.push({
-            action: row.action, metric, value: row[metric],
+            action: row.action, ...(row.track != null ? { track: row.track } : {}),
+            metric, value: row[metric],
             threshold: floor, baseline: b[metric], kind: 'baseline',
           });
         }
@@ -1568,7 +1837,9 @@ export function evaluateGates(summary, opts = {}) {
           const delta = d[`${metric}Delta`];
           if (delta !== null && delta < -maxLosoDrop) {
             violations.push({
-              action: `${d.action}（留出 ${fold.subject}）`, metric: `loso_${metric}`,
+              action: `${d.action}（留出 ${fold.subject}）`,
+              ...(d.track != null ? { track: d.track } : {}),
+              metric: `loso_${metric}`,
               value: delta, threshold: -maxLosoDrop, kind: 'loso',
             });
           }
@@ -1634,21 +1905,29 @@ function deltaOrNull(a, b) {
 
 /** 扰动后的指标 vs 基准，只保留发生变化的行（或 --sweep-actions 指定的行）。 */
 export function diffSummary(baseRows, rows, actionsFilter = null) {
-  const base = new Map(baseRows.map((r) => [r.action, r]));
-  const byAction = new Map(rows.map((r) => [r.action, r]));
-  const actions = [...new Set([...baseRows, ...rows].map((r) => r.action))].sort();
-  return actions.map((action) => {
-    const r = byAction.get(action);
-    const b = base.get(action) || {};
+  const base = new Map(baseRows.map((r) => [rowKey(r), r]));
+  const byKey = new Map(rows.map((r) => [rowKey(r), r]));
+  const keys = [...new Set([...baseRows, ...rows].map(rowKey))].sort((ka, kb) => {
+    const a = base.get(ka) || byKey.get(ka);
+    const b = base.get(kb) || byKey.get(kb);
+    return String(a?.action ?? '').localeCompare(String(b?.action ?? ''))
+      || ((a?.track ?? -1) - (b?.track ?? -1));
+  });
+  return keys.map((key) => {
+    const r = byKey.get(key);
+    const b = base.get(key) || {};
+    const meta = r || b;
+    const extra = meta?.track != null ? { track: meta.track } : {};
     // 变体里整行消失（例如误报被压到 0）也是一种变化，不能静默丢掉
     if (!r) {
       return {
-        action, recall: null, recallDelta: null, precision: null, precisionDelta: null,
+        action: meta.action, ...extra,
+        recall: null, recallDelta: null, precision: null, precisionDelta: null,
         countErr: null, countErrDelta: null, changed: true, removed: true,
       };
     }
     const d = {
-      action,
+      action: meta.action, ...extra,
       recall: r.recall, recallDelta: deltaOrNull(b.recall, r.recall),
       precision: r.precision, precisionDelta: deltaOrNull(b.precision, r.precision),
       countErr: r.countErr, countErrDelta: deltaOrNull(b.countErr, r.countErr),
@@ -1662,14 +1941,21 @@ export function diffSummary(baseRows, rows, actionsFilter = null) {
 // —— profile 对比 -------------------------------------------------------
 
 export function compareSummaries(aRows, bRows) {
-  const actions = [...new Set([...aRows, ...bRows].map((r) => r.action))].sort();
-  const aMap = new Map(aRows.map((r) => [r.action, r]));
-  const bMap = new Map(bRows.map((r) => [r.action, r]));
-  return actions.map((action) => {
-    const a = aMap.get(action) || {};
-    const b = bMap.get(action) || {};
+  const aMap = new Map(aRows.map((r) => [rowKey(r), r]));
+  const bMap = new Map(bRows.map((r) => [rowKey(r), r]));
+  const keys = [...new Set([...aRows, ...bRows].map(rowKey))].sort((ka, kb) => {
+    const a = aMap.get(ka) || bMap.get(ka);
+    const b = aMap.get(kb) || bMap.get(kb);
+    return String(a?.action ?? '').localeCompare(String(b?.action ?? ''))
+      || ((a?.track ?? -1) - (b?.track ?? -1));
+  });
+  return keys.map((key) => {
+    const a = aMap.get(key) || {};
+    const b = bMap.get(key) || {};
+    const meta = aMap.get(key) || bMap.get(key) || {};
     const row = {
-      action,
+      action: meta.action,
+      ...(meta.track != null ? { track: meta.track } : {}),
       recallA: a.recall ?? null, recallB: b.recall ?? null, recallDelta: deltaOrNull(a.recall, b.recall),
       precisionA: a.precision ?? null, precisionB: b.precision ?? null, precisionDelta: deltaOrNull(a.precision, b.precision),
       countErrA: a.countErr ?? null, countErrB: b.countErr ?? null, countErrDelta: deltaOrNull(a.countErr, b.countErr),
@@ -1783,7 +2069,8 @@ function renderGestures(g, lines) {
   lines.push('| 手势 | 判定帧 | 命中 | recall | 误报帧 | precision | unknown | 侧对排除 | 未归属 | 未检出 |');
   lines.push('|---|---|---|---|---|---|---|---|---|---|');
   for (const r of g.shapes) {
-    lines.push(`| ${r.shape} | ${r.decidedPos} | ${r.hits} | ${r.recall ?? '—'} | ${r.fp} | ${r.precision ?? '—'}`
+    const name = r.track !== undefined && r.track !== null ? `#${r.track} ${r.shape}` : r.shape;
+    lines.push(`| ${name} | ${r.decidedPos} | ${r.hits} | ${r.recall ?? '—'} | ${r.fp} | ${r.precision ?? '—'}`
       + ` | ${r.unknown} | ${r.edge} | ${r.unattributed} | ${r.noHand} |`);
   }
   const a = g.attribution;
@@ -1822,7 +2109,8 @@ function renderGates(gates, lines) {
         : v.kind === 'missing' ? '缺少数据'
           : v.kind === 'loso' ? '留一人'
             : v.kind === 'min' ? '绝对门槛' : '上限';
-      lines.push(`| ${v.action} | ${v.metric} | ${v.value ?? '—'} | ${v.threshold ?? '—'} | ${src} |`);
+      const name = v.track != null ? `#${v.track} ${v.action}` : v.action;
+      lines.push(`| ${name} | ${v.metric} | ${v.value ?? '—'} | ${v.threshold ?? '—'} | ${src} |`);
     }
     lines.push('');
   }
@@ -1848,7 +2136,7 @@ function renderLoso(loso, lines) {
     lines.push('| 动作 | 训练 recall | 留出 recall | Δ | 训练 precision | 留出 precision | Δ |');
     lines.push('|---|---|---|---|---|---|---|');
     for (const d of rows) {
-      lines.push(`| ${d.action} | ${d.recallA ?? '—'} | ${d.recallB ?? '—'} | ${fmtDelta(d.recallDelta)}`
+      lines.push(`| ${rowLabel(d)} | ${d.recallA ?? '—'} | ${d.recallB ?? '—'} | ${fmtDelta(d.recallDelta)}`
         + ` | ${d.precisionA ?? '—'} | ${d.precisionB ?? '—'} | ${fmtDelta(d.precisionDelta)} |`);
     }
     lines.push('');
@@ -1868,7 +2156,7 @@ function renderResample(rs, lines) {
   }
   lines.push('', '| 动作 | recall Δ | precision Δ | 计数误差 Δ |', '|---|---|---|---|');
   for (const d of changed) {
-    lines.push(`| ${d.action} | ${fmtDelta(d.recallDelta)} | ${fmtDelta(d.precisionDelta)} | ${fmtDelta(d.countErrDelta)} |`);
+    lines.push(`| ${rowLabel(d)} | ${fmtDelta(d.recallDelta)} | ${fmtDelta(d.precisionDelta)} | ${fmtDelta(d.countErrDelta)} |`);
   }
   lines.push('', '> Δ = 重采样后 − 原始。15 fps 下 120 ms 只有 2 帧，`minHalfMs`/Hold 会先失效。', '');
 }
@@ -2011,7 +2299,7 @@ function renderSweep(sweep, lines) {
   lines.push('| 值 | 倍率 | 动作 | recall | Δ | precision | Δ | 计数误差/20次 | Δ |');
   lines.push('|---|---|---|---|---|---|---|---|---|');
   for (const { v, d } of rows) {
-    const action = d.removed ? `${d.action}（消失）` : d.action;
+    const action = d.removed ? `${rowLabel(d)}（消失）` : rowLabel(d);
     lines.push(`| ${v.value} | ${fmtPct(v.factor)} | ${action}`
       + ` | ${d.recall ?? '—'} | ${fmtDelta(d.recallDelta)}`
       + ` | ${d.precision ?? '—'} | ${fmtDelta(d.precisionDelta)}`
@@ -2030,13 +2318,17 @@ export function toMarkdown(report) {
   if (report.profileModel) lines.push(`- profile 声明模型：${report.profileModel}`);
   if (report.models?.length) lines.push(`- 数据模型：${report.models.join('、')}`);
   if (report.modelWarning) lines.push(`- ⚠ **${report.modelWarning}**`);
+  if (report.objects?.length) lines.push(`- 物体模型：${report.objects.map(formatObject).join('、')}`);
+  if (report.objectWarning) lines.push(`- ⚠ **${report.objectWarning}**`);
   lines.push(`- 生成时间：${new Date().toISOString()}`, '');
 
   lines.push('## 按动作汇总', '');
   lines.push('| 动作 | TP | FN | FP | recall [95%CI] (n) | precision [95%CI] (n) | 计数误差/20次 |');
   lines.push('|---|---|---|---|---|---|---|');
   for (const r of report.summary) {
-    lines.push(`| ${r.action} | ${r.tp} | ${r.fn} | ${r.fp}`
+    // 多人口径每行一个 track；旧报告没有 track 字段，输出逐字不变。
+    const name = r.track !== undefined && r.track !== null ? `#${r.track} ${r.action}` : r.action;
+    lines.push(`| ${name} | ${r.tp} | ${r.fn} | ${r.fp}`
       + ` | ${fmtRate(r.recall, r.recallCI, r.nRecall)}`
       + ` | ${fmtRate(r.precision, r.precisionCI, r.nPrecision)} | ${r.countErr ?? '—'} |`);
   }
@@ -2068,7 +2360,8 @@ export function toMarkdown(report) {
       lines.push('', '| 动作 | 期望/实测 | 区间 | 帧 | 关键信号（min/中位/max） | 实际出现 / 误报来源 |');
       lines.push('|---|---|---|---|---|---|');
       for (const s of bad) {
-        lines.push(`| ${s.action} | ${expectationText(s)} | ${intervalLabel(s)}`
+        const name = s.track !== undefined && s.track !== null ? `#${s.track} ${s.action}` : s.action;
+        lines.push(`| ${name} | ${expectationText(s)} | ${intervalLabel(s)}`
           + ` | ${s.fail?.frames ? s.fail.frames.join('–') : '—'}`
           + ` | ${signalLabel(s.fail?.signals)} | ${evidenceText(s)} |`);
       }
@@ -2087,7 +2380,7 @@ export function toMarkdown(report) {
       lines.push(`| ${k} | ${v.n} | ${v.p5} | ${v.p50} | ${v.p95} | ${v.min} | ${v.max} |`);
     }
     lines.push('',
-      '> 怎么用：深蹲的 `down` 取 `squat_static/knee` 的 P95 附近（蹲到底的角度），',
+      '> 怎么用：鼓掌的 `down` 取 `clap_baseline/hands_close` 的 P5 附近（两手合拢），',
       '> `up` 取 `stand/knee` 的 P5 附近（站直的最低角）。留 10~15° 余量，不要贴着分位写。',
       '> 分位是「这段数据里 95% 的帧都低于此值」，不是阈值本身——阈值要靠留余量。',
       '> 反例段不参与分位计算。', '');
@@ -2110,7 +2403,7 @@ export function toCompareMarkdown(report) {
   lines.push('| 动作 | recall A | B | Δ | precision A | B | Δ | 计数误差/20次 A | B | Δ |');
   lines.push('|---|---|---|---|---|---|---|---|---|---|');
   for (const d of report.deltas) {
-    lines.push(`| ${d.action} | ${d.recallA ?? '—'} | ${d.recallB ?? '—'} | ${fmtDelta(d.recallDelta)}`
+    lines.push(`| ${rowLabel(d)} | ${d.recallA ?? '—'} | ${d.recallB ?? '—'} | ${fmtDelta(d.recallDelta)}`
       + ` | ${d.precisionA ?? '—'} | ${d.precisionB ?? '—'} | ${fmtDelta(d.precisionDelta)}`
       + ` | ${d.countErrA ?? '—'} | ${d.countErrB ?? '—'} | ${fmtDelta(d.countErrDelta)} |`);
   }
@@ -2314,6 +2607,63 @@ function modelInfo(loaded, profile) {
   return { models, warning };
 }
 
+// —— R13-3 物体模型指纹 ------------------------------------------------
+// 动作阈值看 model/delegate，PPE 还要看「是不是同一个检测器 + 同一套类别顺序」。
+// 导出 meta 的 objects 段由 app.js 写；旧数据没有它时一律返回空，不阻断评估。
+
+const shortHash = (h) => String(h).slice(0, 12);
+
+/** 从多份帧文件的 meta 里汇总物体模型；只去重、不推断。 */
+export function objectsInfo(loaded) {
+  const metas = (loaded || [])
+    .map((i) => i && i.meta && i.meta.objects)
+    .filter((o) => o && typeof o === 'object' && !Array.isArray(o));
+  const byKey = new Map();
+  for (const o of metas) {
+    const item = {
+      backend: o.backend ?? null,
+      model: o.model ?? null,
+      inputSize: o.inputSize ?? null,
+      modelHash: o.modelHash ?? null,
+      labelsHash: o.labelsHash ?? null,
+    };
+    byKey.set([item.backend, item.model, item.inputSize, item.modelHash, item.labelsHash].join('|'), item);
+  }
+  const models = [...byKey.values()];
+  const warning = models.length > 1
+    ? `数据来自 ${models.length} 套物体模型（${models.map(formatObject).join('、')}）；PPE 指标不能跨模型合并`
+    : null;
+  return { models, warning, hashes: [...new Set(models.map((m) => m.modelHash).filter(Boolean))] };
+}
+
+/** 报告头用的一行物体模型描述；hash 只显示前 12 位，完整值留在 JSON 里。 */
+export function formatObject(o) {
+  const parts = [`${o.backend ?? '?'}/${o.model ?? '?'}`];
+  if (o.inputSize) parts.push(`@${o.inputSize}`);
+  if (o.modelHash) parts.push(`sha256:${shortHash(o.modelHash)}`);
+  if (o.labelsHash) parts.push(`labels:${shortHash(o.labelsHash)}`);
+  return parts.join(' ');
+}
+
+/**
+ * baseline 与当前数据的物体模型是否不同。
+ * 返回 null 表示没有可比信息或一致；返回对象表示不同（message 已含用法提示）。
+ * 没有 objects 段的旧报告不做判断——旧数据本来就没有这个字段。
+ */
+export function objectModelChange(currentHashes, baselineReport) {
+  const base = Array.isArray(baselineReport?.objects) ? baselineReport.objects : [];
+  const baseHashes = [...new Set(base.map((o) => o?.modelHash).filter(Boolean))];
+  const cur = [...new Set((currentHashes || []).filter(Boolean))];
+  if (!baseHashes.length || !cur.length) return null;
+  if (baseHashes.some((h) => cur.includes(h))) return null;
+  return {
+    current: cur,
+    baseline: baseHashes,
+    message: `baseline 与当前数据的物体模型不同（baseline=${baseHashes.map(shortHash).join('、')}`
+      + `，当前=${cur.map(shortHash).join('、')}）；确认要比较请加 --allow-model-change`,
+  };
+}
+
 /** 灵敏度扫描：同一批素材，逐个扰动值重放。只保留指标有变化的动作（或 --sweep-actions 指定的）。 */
 function runSweep(loaded, profile, args, baseSummary = null) {
   const { key, baseValue, variants } = sweepVariants(profile.params, args.sweep);
@@ -2428,9 +2778,22 @@ async function runSingle(args, loaded, profile) {
   if (args.sweep && !run.clips.length) throw new Error('--sweep 需要带 labels 的素材');
   const { models, warning } = modelInfo(loaded, profile);
   if (warning && !args.quiet) console.error(`⚠ ${warning}`);
+  const objInfo = objectsInfo(loaded);
+  if (objInfo.warning && !args.quiet) console.error(`⚠ ${objInfo.warning}`);
 
   let baseline = null;
+  let baselineObjectWarning = null;
   if (args.baseline) baseline = JSON.parse(stripBom(await readFile(args.baseline, 'utf8')));
+  if (baseline) {
+    const change = objectModelChange(objInfo.hashes, baseline);
+    if (change) {
+      // 跨模型比较 PPE 指标没有意义：模型换了，阈值与类别语义都可能变。
+      // 想继续必须显式加 --allow-model-change，避免 CI 里悄悄比较两套检测器。
+      if (!args.allowModelChange) throw new Error(change.message);
+      baselineObjectWarning = change.message;
+      if (!args.quiet) console.error(`⚠ ${change.message}`);
+    }
+  }
 
   const summary = summarize(run.clips);
   const loso = args.loso ? runLoso(evalLoaded, profile, args) : null;
@@ -2469,6 +2832,8 @@ async function runSingle(args, loaded, profile) {
     paramsHash: profile.hash,
     models,
     modelWarning: warning,
+    objects: objInfo.models,
+    objectWarning: objInfo.warning || baselineObjectWarning,
     totalFrames: run.totalFrames,
     clips: run.clips,
     summary,

@@ -12,9 +12,12 @@
 {
   "ts": 1585,                       // 毫秒，单调递增（当前实现用 performance.now；服务端将来用单调时钟）
   "video_time": 0.93,               // 媒体播放秒数；摄像头为 null。单次播放内单调，用于写 labels 的 startSec/endSec
+  // 多人模式导出**全部判定人员**（每人一条）；单人模式仍是 1 个元素，字段不变。
+  // 每条记录里的 signals/actions 仍是主目标（面积最大者）的判定。
   "persons": [
     {
       "track_id": 0,                // 无人跟踪时恒为 0
+      "track_uid": 7,               // 可选：本条轨迹的 uid（同一轨迹对象生命周期内不变；跨 id 继承尚未实现）
       "bbox": [20.2, 333, 101.9, 737],   // 像素 [x1,y1,x2,y2]
       "kp_format": "mediapipe33",   // 声明式：见下方格式表
       "kp": [[65.1, 342.2, 1], ...],// 13 个点，顺序见 kpt.js 的 KPT，像素坐标 + 置信度
@@ -40,7 +43,7 @@
     "bones_ok": { "foreArm_L": true, "thigh_R": false, "...": true }
   },
   "actions": {                      // 规则层输出
-    "posture": "stand",             // stand|sit|squat_static|lying；证据不足时为 null（如只有上半身）
+    "posture": "stand",             // stand|sit；证据不足时为 null（如只有上半身）。躺卧/下蹲已下线
     "flags": {
       "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
       "onHips": false, "armsOpen": false, "handAtHead": false,
@@ -54,8 +57,9 @@
       "handAtHeadL": false, "handAtHeadR": false,
       "carryingL": false, "carryingR": false
     },
-    "reps": { "squat": 0, "pushup": 0, "clap": 0, "grasp": 0 },
-    // 判定不可靠的原因（不是动作）：低置信 / 外推 / 换侧 / 骨骼异常 / 角度坏点
+    "reps": { "clap": 0, "grasp": 0 },   // 深蹲/俯卧撑计数已下线
+    // 判定不可靠的原因（不是动作）：低置信 / 外推 / 骨骼异常 / 角度坏点
+    // （side_switched 随深蹲/俯卧撑计数一起下线，不再产出）
     // 含义与对判定的影响见 docs/signals.md §三·九
     "unreliable": []
   },
@@ -78,16 +82,23 @@
   "verdicts": [                     // 每人的判定（含主目标）；主目标的判定同时在上面 signals/actions 里
     {
       "track_id": 2,                // 跟踪器给的稳定 id（丢失 1.5s 内不变；超时后是新 id）
+      "track_uid": 7,               // 可选：与 persons[] 同源，原样透传；缺失表示导出侧还没有 uid
       "bbox": [20.2, 333, 101.9, 737],
       "posture": "stand",
       "frozen": false,
       "flags": { "armRaised": false, "...": false },
-      "reps": { "squat": 0, "pushup": 0, "clap": 0, "grasp": 0 },
+      "reps": { "clap": 0, "grasp": 0 },   // 深蹲/俯卧撑计数已下线
+      // 该 track 被归属到的手（与帧级 hands 同结构；没有就是空数组）。
+      // 几何（kp/scale）只在 persons[] 里存一份，这里不重复。
+      "hands": [ { "handedness": "Left", "shape": "fist", "...": "..." } ],
       "ppe": {                      // 物体检测关闭时为 null
         "helmet": { "state": "missing",   // worn|missing|unknown
                     "alert": "violation", // none|suspect|violation（missing 持续 ≥ minMs 才升级）
-                    "streak_ms": 3200 },  // 连续 missing 的累计时长；unknown 时暂停不清零
-        "glove":  { "state": "unknown", "alert": "none", "streak_ms": 0 }
+                    "streak_ms": 3200,    // 连续 missing 的累计时长；unknown 时暂停不清零
+                    "reason": "未戴",      // 可选：人可读原因（旧版就有）
+                    "reason_code": "config_mismatch" }, // 可选：no_positive|config_mismatch|occluded
+        "glove":  { "state": "unknown", "alert": "none", "streak_ms": 0,
+                    "reason_code": "occluded" }
       }
     }
   ],
@@ -99,12 +110,19 @@
 
 > `hands[].shape` 是**稳定后**的结果，动作层（以及离线 `replay`）看到的就是它；
 > `shape_raw` 保留逐帧分类，用于复查稳定器是否把结果拖慢。
+> 手势去抖（`HandShapeStabilizer`）按 `track_id` 隔离：每一帧先把手归属到人，再推进
+> 该 track 自己的 L/R/U 稳定器，避免 A 的连续手势把 B 的候选计数带满（R12-2）。
+> 单人道固定用 track 0，结果与旧版逐位一致；多人时未归属到任何人的手只有 `shape_raw`，
+> `shape` 不做去抖（它们不进任何人的动作层）。
 > `unknown` 表示判不出来，不是「张开」——但动作层目前只区分「闭合/非闭合」，这一点见已知限制。
 > 离线评估器的手势指标（`action:"gesture"`）读的也是 `shape`；`orient.facing === "edge"`（手掌侧对）
 > 的帧会被当作弃权，不计入手势 recall 的分母（`docs/eval.md`）。
 >
 > 全身/远景构图里整帧检不到手时，页面会用姿态腕点裁图补检（`web/js/handroi.js`）；
 > 这类结果的 `handedness` 由腕点所在侧决定，不采信模型在「自拍镜像输入」假设下的输出。
+> 多人时补检按面积给前 `min(perception.multi.maxPersons, signals.hand.roi.maxPersonsPerFrame)`
+> 人做（主目标优先），`scale < signals.hand.roi.minScalePx` 的人跳过；每条补检结果在内部带
+> `owner_track_id`，只归属给裁出它的那个人（不进导出），同一 ROI 结果不会被两个人各用一次。
 > `actions.unreliable` 是逐帧的可靠性标记，不是动作。看失败段时先看它，
 > 用来区分「动作没做出来」和「这一帧被判为不可靠（弃权）」。
 
@@ -141,13 +159,19 @@
 
 ## 记录与导出
 
-Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 10%），导出为 **JSONL**：
+帧数上限按导出模式取（`multi.js` 的 `LOG_LIMITS`）：**单人 20000 帧，多人 6000 帧**
+（多人每帧含全部 persons 的关键点，体积随人数线性增长；PLAN §18.5 D3）。溢出时按块丢弃 10%。
+上限与实际模式写进 meta 的 `log_limit` / `export_mode`，评估器据此判断帧被截断是否正常。
+导出为 **JSONL**：
 
 ```
 第一行：{"exported_at":"...","schema":"frame.jsonl v0","kp_format":"mediapipe33",
         "model":"full","delegate":"GPU","hand_model":"hand_landmarker","infer_fps":15,
         "profile":"fitness","profile_model":"lite","params_hash":"fnv1a:1a2b3c4d",
-        "params":{...},"fps":14.4,"frame_count":562}
+        "params":{...},"fps":14.4,"frame_count":562,
+        "log_limit":20000,"export_mode":"single",
+        "objects":{"backend":"onnx","model":"ppe_smoke.onnx","inputSize":320,
+                   "modelHash":"9f2c…","labelsHash":"fnv1a:1a2b","manifestOk":true}}
 后续每行：一条帧记录（上面那种结构）
 ```
 
@@ -158,7 +182,7 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
   "click_ts": 123456.7,       // performance.now，与帧 ts 同基准
   "before_ms": 3000,          // 窗口 = 点击前 3s + 之后 2s
   "after_ms": 2000,
-  "action": "squat",          // 用户选的动作：正例动作 id/flag、none、noArm、或 !动作（反例）
+  "action": "clap",           // 用户选的动作：正例动作 id/flag、none、noArm、或 !动作（反例）
   "detected": { "posture": "stand", "flags": {...}, "reps": {...} }  // 点击时的判定快照
 }
 ```
@@ -183,6 +207,9 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
 | `params_hash` | 生效参数的 FNV-1a 指纹 | 比较两份数据是否同一套阈值，不用 diff 整份 params |
 | `params` | profile 的差分覆盖项（不是全量） | 事后能还原改了哪些键 |
 | `fps` / `frame_count` | 实测帧率 / 帧数 | 数据完整性检查 |
+| `log_limit` | 本次导出允许保留的最大帧数（单人 20000 / 多人 6000） | 帧数达到上限时是设计内截断，不是导出失败。按录制时的模式写，点「停止」后再导出也不会变 |
+| `export_mode` | `single` / `multi` | 决定 `persons[]` 是 1 人还是全部判定人员；评估器据此分组。录制期间冻结（一旦出现多人判定帧即为 `multi`） |
+| `objects` | 物体检测后端/模型/输入尺寸/权重哈希/类别哈希/清单是否通过；关闭时为 `null` 或缺省 | PPE 指标跨模型不可比；`--baseline` 用它拒绝跨模型比较。MediaPipe 后端没有 sidecar，`modelHash` 为 `null` |
 
 `params_hash` 由 `params.js` 的 `paramsHash()` 生成：先 `resolveParams()` 合并默认值，再按键排序序列化后哈希。
 **同样的参数写成不同的键顺序，指纹必须相同**；数值变一个，指纹就变。
@@ -207,3 +234,19 @@ Demo 里最多保留 20000 帧（`app.js` 的 `MAX_LOG`，溢出时按块丢弃 
 
 **必须导出**：动作层的举手判定在 `has_world` 为真时用 3D 抬臂角，为假时退回 2D。
 漏掉 `kp_world` 会让离线评估永远走 2D，报告的结论就不是页面实际执行的规则。
+
+## 多人记录的口径
+
+- `meta.export_mode = "multi"` 时 `persons[]` 是**全部判定人员**（不是只有主目标）；
+  `signals` / `actions` 仍只描述主目标，逐人结果看 `verdicts[]`。
+- 几何（`kp` / `kp_world` / `scale` / `score`）**只在 `persons[]` 里存一份**；
+  `verdicts[]` 通过 `track_id` 关联，不重复存，避免导出体积翻倍。
+- `verdicts[].hands` 是该 track 被归属到的手（与帧级 `hands[]` 同结构）；
+  帧级 `hands[]` 仍是整帧检出的全部手，供归属与手势评估重算。
+- `track_id` 在跟踪器丢失超过 1.5s 后会变化；`track_uid`（若存在）由跟踪器在轨迹创建时分配，
+  **同一轨迹对象生命周期内稳定**，但跟踪器超时后重建的是新 uid（跨 id 的 `linkAcrossIds` 尚未实现）。
+  导出层只透传、不分配；评估器按 `track_id` 分组，`label.track` 优先按 `track_uid` 解析
+  （找不到再退回 `track_id`），PPE 计时也用它做跨 id 的关联锚点。
+- 单人模式（`export_mode = "single"`）`persons[]` 恒为 1 个元素、字段不变；
+  `verdicts[]` 只多出可选字段：`hands`（没有手时为空数组）、`track_uid`（有才写）、
+  `ppe.*.reason/reason_code`（有才写），旧字段与旧版逐字一致。
