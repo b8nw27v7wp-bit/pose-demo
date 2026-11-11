@@ -60,6 +60,16 @@ export const ARM_NOTES = {
     need: '任一手被判为握拳/OK、两臂腕-肩都 <1.2 躯干长，保持 300ms',
     caveat: '没有物体检测：空手握拳、扶栏杆也会命中；手型判不出时不判',
   },
+  operating: {
+    basis: '腕进设备 ROI（矩形或多边形，强证据），或肘进 ROI（手被设备挡住时的兜底）',
+    need: '腕在 ROI 内、腕-肩 >0.65、抬臂角 90°~179°、双肩可见；或肘在 ROI 内、肘-肩 >0.35、抬臂角 60°~179°，保持 800ms（允许 300ms 内短暂遮挡）',
+    caveat: '没有设备 ROI 或检测框时不判；profile 配了 equipmentLabels 且有检测框时优先用框（腕/肘到框 ≤equipmentMaxDist），没有框的帧退回 ROI；ROI 是人工区域，设备模型不进 git；自然垂手/手和肘都被挡住时可能误判/漏判',
+  },
+  near_equipment: {
+    basis: '人体框与设备 ROI/检测框重叠（上下文事件，不要求手在设备上）',
+    need: '人体框面积 ≥30% 落在 ROI/设备框内、两肩可见、人体框竖直，保持 1000ms',
+    caveat: '只说明「人在设备旁」，不能当「在操作」；没有 ROI/检测框时不判；有检测框时取「与框重叠」和「与 ROI 重叠」的较大值（fail-closed 时只认框）；设备/手特写被检出成人时仍可能误报；profile 可开人体框有效性门（挡过小/满屏/大半出画）',
+  },
   point: {
     basis: '手臂伸出 + 该侧手判为「指方向/手枪」+ 3D 方位角朝前/侧',
     need: '需要 3D world；腕-肩 >1.25 躯干长、手臂接近水平且基本伸直，手型为 pointing/gun，保持 250ms',
@@ -91,7 +101,7 @@ const WORLD_ACTIONS = new Set(['arm_front', 'arm_side', 'point']);
 // 同时亮多个动作时，提示优先给「可信度最低」的那个：
 // 指向/持物只有弱证据，挥手比静态动作更容易漏，静态动作放最后。
 const ACTIVE_PRIORITY = [
-  'point', 'carry', 'wave', 'reach', 'hand_head', 'hips',
+  'point', 'carry', 'operating', 'near_equipment', 'wave', 'reach', 'hand_head', 'hips',
   'crossed', 'arms_open', 'both_up', 'arm_raised', 'arm_front', 'arm_side',
 ];
 
@@ -104,9 +114,42 @@ const SIDE_FLAGS = {
   point: ['pointingL', 'pointingR'],
   hand_head: ['handAtHeadL', 'handAtHeadR'],
   carry: ['carryingL', 'carryingR'],
+  operating: ['operatingL', 'operatingR'],
 };
 
 export const DEFAULT_HINT = '悬停动作名：查看判定条件与已知误判';
+
+/**
+ * operating 的生效阈值来自 profile（可能覆盖默认值），提示里不能写死 800ms/0.35，
+ * 否则换了 profile 后 tooltip 与真实判定不一致。
+ */
+function nearEquipmentNeed(cfg, holds) {
+  if (!cfg) return ARM_NOTES.near_equipment.need;
+  const pct = Number.isFinite(Number(cfg.minOverlap)) ? Math.round(Number(cfg.minOverlap) * 100) : '?';
+  const hold = Number.isFinite(Number(holds?.nearEquipment)) ? Number(holds.nearEquipment) : 1000;
+  const upright = cfg.requireUprightBox !== false ? '、人体框竖直' : '';
+  const valid = cfg.validity?.enabled
+    ? `、人框有效（高 ${Math.round(Number(cfg.validity.minHeightRatio ?? 0) * 100)}%~`
+      + `${Math.round(Number(cfg.validity.maxHeightRatio ?? 1.5) * 100)}%、出画 ≤`
+      + `${Math.round((1 - Number(cfg.validity.minInFrame ?? 0)) * 100)}%）`
+    : '';
+  return `人体框面积 ≥${pct}% 落在 ROI/设备框内、两肩可见${upright}${valid}，保持 ${hold}ms`;
+}
+
+function operatingNeed(cfg, holds) {
+  if (!cfg) return ARM_NOTES.operating.need;
+  const num = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '?';
+    // 至少保留 3 位小数再裁掉末尾 0：0.315 不能被四舍五入成 0.32，90 也不能被裁成 9
+    return n.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  };
+  const hold = Number.isFinite(Number(holds?.operating)) ? Number(holds.operating) : 800;
+  const gap = Number.isFinite(Number(holds?.operatingMaxGap)) ? Number(holds.operatingMaxGap) : 0;
+  return `腕在 ROI/设备框内、腕-肩 >${num(cfg.minReachRoi)}、抬臂角 ${num(cfg.minElev)}°~${num(cfg.maxElev)}°、双肩可见；`
+    + `或肘在 ROI/设备框内、肘-肩 >${num(cfg.minElbowReach)}、抬臂角 ${num(cfg.minElbowElev)}°~${num(cfg.maxElev)}°，`
+    + `保持 ${hold}ms（允许 ${gap}ms 内短暂遮挡）`;
+}
 
 /**
  * 生成动作面板的提示。
@@ -121,6 +164,16 @@ export const DEFAULT_HINT = '悬停动作名：查看判定条件与已知误判
  * @param {Record<string,{short:string,long:string}>|null} ctx.accuracyById 动作 id → 准确率文案
  *   （accuracy.js 的 formatAccuracy 输出）。tooltip 里带 long，当前动作的提示行里带 short；
  *   没有报告时是「未评估」，也照样显示——不把「没测过」藏起来。
+ * @param {boolean|null} ctx.operatingRoi 当前 profile 是否配置了设备 ROI。
+ *   这是静态配置，不能等 sig.armPose.operating_roi（要跑完一帧才有）；
+ *   传 null/undefined 时才退回 sig。
+ * @param {boolean|null} ctx.objectOn 物体检测开关是否打开；detector-only profile
+ *   （没有 ROI、只配 equipmentLabels）下，检测器没开/没就绪同样判不了。
+ * @param {boolean|null} ctx.objectReady 物体检测模型是否真的加载好了。
+ * @param {object|null} ctx.operatingCfg 当前生效的 signals.arm.operating（profile 可覆盖默认值）
+ * @param {object|null} ctx.operatingHolds 当前生效的 actions.holds（含 operating / operatingMaxGap）
+ * @param {object|null} ctx.nearEquipmentCfg 当前生效的 signals.arm.nearEquipment
+ * @param {object|null} ctx.nearEquipmentHolds 当前生效的 actions.holds（含 nearEquipment）
  * @returns {{
  *   byId: Record<string,{na:boolean, why:string, title:string}>,
  *   line: string,
@@ -129,7 +182,8 @@ export const DEFAULT_HINT = '悬停动作名：查看判定条件与已知误判
  */
 export function explainArmActions({
   sig = null, act = null, hands = null, handOn = false, handReady = false, imageMode = false,
-  accuracyById = null,
+  accuracyById = null, operatingRoi = null, operatingCfg = null, operatingHolds = null,
+  nearEquipmentCfg = null, nearEquipmentHolds = null, objectOn = null, objectReady = null,
 } = {}) {
   const handCount = Array.isArray(hands) ? hands.length : 0;
   const hasWorld = !!sig?.armPose?.has_world;
@@ -151,12 +205,31 @@ export function explainArmActions({
       reasons.push(worldConfigured ? '本帧没有 3D world 坐标' : '配置已关闭 3D（world.enabled=false）');
     }
     if (id === 'wave' && imageMode) reasons.push('单帧图片没有时间窗');
+    // 操作设备必须有设备证据：人工 ROI 或设备检测框，两者都没有时才标「不可用」。
+    // 只认 ROI 会把 detector-only profile（无 ROI、equipmentLabels 有值）误标成不可用。
+    if (id === 'operating' || id === 'near_equipment') {
+      // 优先用 profile 的静态配置；没有画面时也能正确标「不可用」
+      const roiConfigured = operatingRoi ?? sig?.armPose?.operating_roi;
+      const eqConfigured = Array.isArray(operatingCfg?.equipmentLabels)
+        && operatingCfg.equipmentLabels.length > 0;
+      if (roiConfigured === false && !eqConfigured) {
+        reasons.push('未配置设备 ROI/检测框（profile 的 operating.roi / operating.rois 或 equipmentLabels）');
+      } else if (roiConfigured !== true && eqConfigured) {
+        // 没有 ROI，设备证据只能来自检测框：检测器没开/没加载时同样不可用。
+        if (objectOn === false) reasons.push('物体检测已关闭（设备框来源）');
+        else if (objectReady === false) reasons.push('物体检测未加载（设备框来源）');
+      }
+    }
     return reasons.join('；');
   };
 
   const byId = {};
   for (const a of ARM_ACTIONS) {
-    const note = ARM_NOTES[a.id];
+    const note = a.id === 'operating'
+      ? { ...ARM_NOTES.operating, need: operatingNeed(operatingCfg, operatingHolds) }
+      : a.id === 'near_equipment'
+        ? { ...ARM_NOTES.near_equipment, need: nearEquipmentNeed(nearEquipmentCfg, nearEquipmentHolds) }
+        : ARM_NOTES[a.id];
     const why = naReason(a.id);
     const acc = accuracyById?.[a.id];
     const parts = [`${a.name}（依据：${note.basis}）`, `条件：${note.need}`, `误判/漏判：${note.caveat}`];

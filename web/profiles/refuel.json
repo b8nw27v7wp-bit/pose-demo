@@ -1,0 +1,24 @@
+{
+  "name": "refuel",
+  "note": "加油作业：操作阀门/仪表。固定机位用 ROI 圈出设备区域（归一化画面坐标），手/肘进入该区域并保持 1500ms 算「操作设备」；允许 600ms 内的短暂遮挡（Hold 修正为「真值帧间隔超过 maxGap 也重置」后按实测采样间隔重调：中位 138ms / p90 365ms；300ms 会把长正例段切碎）。minElbowVis 0.21 / minElbowReach 0.315 是在 58s 演示片复核标注上调的（6 正/7 反）。当前代码+参数在 563 帧复核导出上：operating TP5/FN1/FP3（段级 R0.833/P0.625）；near_equipment 用 minOverlap 0.5 补「手被设备挡住」的上下文（TP3/FN3/FP2），两者并集覆盖 6/6 正例段。样本很少，换机位必须重标重校。ROI 不是物体检测。",
+  "params": {
+    "signals": {
+      "arm": {
+        "operating": {
+          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 },
+          "minElbowVis": 0.21,
+          "minElbowReach": 0.315
+        },
+        "nearEquipment": {
+          "minOverlap": 0.5
+        }
+      }
+    },
+    "actions": {
+      "holds": {
+        "operating": 1500,
+        "operatingMaxGap": 600
+      }
+    }
+  }
+}

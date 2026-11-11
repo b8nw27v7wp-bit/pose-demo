@@ -9,6 +9,8 @@
 // 用法：
 //   npm run accuracy                     # 读 eval-data/ → web/accuracy.json
 //   node web/test/accuracy-report.mjs --dir eval-data --out web/accuracy.json --min-samples 20
+//   node web/test/accuracy-report.mjs --dir eval-data/refuel/eval --profile web/profiles/refuel.json
+//     ↑ 有 ROI/场景阈值的动作（如 operating）必须带 profile，否则回放时 ROI 缺失、operating 恒为 false
 
 import { execFile } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
@@ -110,15 +112,22 @@ export function buildAccuracyReport(evalReport, { dir = 'eval-data', minSamples 
 }
 
 function parseArgs(argv) {
-  const out = { dir: 'eval-data', out: 'web/accuracy.json', minSamples: DEFAULT_MIN_SAMPLES, quiet: false };
+  const out = {
+    dir: 'eval-data', out: 'web/accuracy.json', minSamples: DEFAULT_MIN_SAMPLES,
+    profile: null, quiet: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dir') out.dir = argv[++i];
     else if (a === '--out') out.out = argv[++i];
     else if (a === '--min-samples') out.minSamples = Number(argv[++i]);
+    // 有 ROI/场景阈值的动作（operating、refuel 类 profile）必须带 profile，
+    // 否则评估器按默认参数回放，operating 恒为 false（ROI 不知道在哪）。
+    else if (a === '--profile') out.profile = argv[++i];
     else if (a === '--quiet') out.quiet = true;
     else if (a === '-h' || a === '--help') {
-      console.log('用法：node web/test/accuracy-report.mjs [--dir eval-data] [--out web/accuracy.json] [--min-samples 20]');
+      console.log('用法：node web/test/accuracy-report.mjs [--dir eval-data] [--out web/accuracy.json] '
+        + '[--min-samples 20] [--profile web/profiles/xxx.json]');
       process.exit(0);
     } else {
       throw new Error(`未知参数：${a}`);
@@ -130,10 +139,12 @@ function parseArgs(argv) {
   return out;
 }
 
-function runEvaluator(dir) {
+function runEvaluator(dir, profile = null) {
   const evalPath = path.join(ROOT, 'web/test/evaluate.mjs');
+  const argv = [evalPath, '--dir', dir, '--json'];
+  if (profile) argv.push('--profile', profile);
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [evalPath, '--dir', dir, '--json'], {
+    execFile(process.execPath, argv, {
       cwd: ROOT,
       maxBuffer: 64 * 1024 * 1024,
     }, (err, stdout, stderr) => {
@@ -153,7 +164,7 @@ function runEvaluator(dir) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const evalReport = await runEvaluator(args.dir);
+  const evalReport = await runEvaluator(args.dir, args.profile);
   const report = buildAccuracyReport(evalReport, { dir: args.dir, minSamples: args.minSamples });
   const outPath = path.resolve(ROOT, args.out);
   await writeFile(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');

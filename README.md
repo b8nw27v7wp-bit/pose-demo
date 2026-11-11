@@ -8,7 +8,7 @@
 > Python 服务端引擎与 YAML 规则仍只在 `PLAN.md` 的路线中，**本版没有实现**。
 > 阈值是量级参考，尚未用实拍素材完成校准；具体验证范围见「初始版验证范围」。
 > **动作集已收敛**：躺卧、下蹲、深蹲/俯卧撑计数已下线（需要全身或地面机位，桌面摄像头判不了），
-> 当前是 2 个姿态 + 12 个手臂动作 + 8 种手势 + 2 个计数。理由与恢复方式见「能识别什么」。
+> 当前是 2 个姿态 + 13 个手臂动作 + 1 个上下文事件（在设备旁）+ 8 种手势 + 2 个计数。理由与恢复方式见「能识别什么」。
 
 定位与设计见 `IDEA.md`，路线见 `PLAN.md`，数据契约与信号定义见 `docs/`。
 
@@ -44,6 +44,7 @@ web/                    浏览器 Demo（纯静态，无构建链）
   js/pose.js            L1 姿态适配：MediaPipe Pose → 统一 frame 契约
   js/hands.js           L1 手部适配：MediaPipe Hand（21 点/手）+ 腕部 ROI 补检
   js/handroi.js         腕部 ROI 的几何（纯函数，可单测）
+  js/geometry.js        设备多边形 ROI / 人框有效性 / 头部关键点（纯函数，可单测）
   js/handshape.js       手势分类（纯函数，可单测）
   js/signals.js         L2 信号层：One Euro、2D/3D 角度、Hold、RepCounter、骨骼一致性、遮挡外推
   js/stats.js           分布统计（分位 / 重合度，只给评估工具用）
@@ -53,6 +54,7 @@ web/                    浏览器 Demo（纯静态，无构建链）
   js/app.js             组装：输入源 → 感知 → 信号 → 动作 → UI/导出
   profiles/             场景 profile（只写与默认阈值的差异）
   test/verify.html      自检页：?mode=image|video|hand，结果写进 window.__verifyResult
+  test/geometry-test.mjs 多边形 ROI / 人框有效性 / 头部关键点的纯函数单测
   test/logic-test.mjs   信号层/动作层/手势分类的确定性单测
   test/evaluate.mjs     离线评估与阈值拟合（导出帧 → recall/precision）
   test/eval-test.mjs    评估器自身的单测
@@ -73,10 +75,48 @@ serve.py                本地静态服务器
 
 ## 能识别什么
 
-**姿态**：站立 / 坐
-**手臂**：举手 / 双手高举 / 挥手 / 抱臂 / 叉腰 / 张开双臂 / 手在头部附近 / 伸手 / 持物 / 指向 / 前平举 / 侧平举
+**姿态**：站立 / 坐 / 上半身直立 / 上半身前倾
+（后两个只在「肩+髋可见、膝/踝不可见」时输出，是**上半身推断**，不等于站/坐）
+**手臂**：举手 / 双手高举 / 挥手 / 抱臂 / 叉腰 / 张开双臂 / 手在头部附近 / 伸手 / 持物 / 指向 / 前平举 / 侧平举 / 操作设备（阀门/仪表）
+**上下文**：在设备旁（`near_equipment`，人体框与设备 ROI/检测框重叠；不要求手在设备上）
 **手势**（每只手单独识别）：握拳 / 张开 / 剪刀手 / 指方向 / 竖拇指 / OK / 手枪 / 摇滚
 **计数**：鼓掌 / 拿取
+
+**操作设备（阀门/仪表）** 是「持续在做」的事件，不是瞬时手势：任一侧手腕进入 profile 配置的
+**设备 ROI**（或检测到的设备框附近）、手在肩以下、两肩可见，并且持续 ≥800ms 才成立
+（允许 600ms 内的短暂遮挡——profile 可调；refuel 档按实测采样间隔从 300ms 调到 600ms，
+手腕被面板挡住几帧不会把计时清零）。既没有 ROI 也没有设备框时
+**不判**——只有「伸手」这一条弱证据，会把拿东西/扶栏杆误报成操作设备。
+ROI 支持旧矩形 `roi: {x,y,w,h}` 和新的多边形/多区域 `rois: [{id, points}]`（归一化 0~1，
+`rois` 非空时旧矩形不参与；非法配置 fail-closed）。示例见 `web/profiles/refuel.json`
+（`?profile=/web/profiles/refuel.json`，保持窗 1500ms、肘兜底 `minElbowVis 0.21 /
+minElbowReach 0.315`；563 帧复核导出上 TP5/FN1/FP3，段级 R 0.833 / P 0.625）和
+`web/profiles/refuel-polygon.json`（与 refuel 矩形等价的多边形接线示例）。换机位必须重标重校。
+
+**在设备旁（`near_equipment`）** 是独立的上下文事件，**不要**把它并进 `operating`：它只回答
+「人在设备区域里」，人体框 ≥50% 落在 ROI/设备框内（refuel 档）、两肩可见、保持 1s。refuel 上它
+自身 TP3/FN3/FP2（段级 R 0.5 / P 0.6），但补上了 `operating` 唯一漏掉的 20.4–23.9s
+（手被设备挡住）——两个动作的并集覆盖 **6/6** 正例段。它也会在手套/设备特写被误检成人时
+触发，所以只能当上下文，不能当「在操作」。profile 可选开 `nearEquipment.validity` 挡掉
+过小/满屏/大半出画的「人框」（默认关闭；`web/profiles/refuel-strict.json` 是 A/B 用的实验档）。
+同一份 563 帧 refuel 导出上，多边形档与 refuel 档的 operating/near_equipment TP/FN/FP 完全一致
+（5/1/3、3/3/2）；strict 档也一致——该片段没有触发人框门，门的效果仍待更多特写素材验证。
+
+**PPE 几何**：头部区域优先用 9 个头面部关键点（鼻/眼/耳，`persons[].kp_head`），鼻尖不可见但耳朵
+可见时仍能判；旧数据没有该字段时退回鼻尖。手套区域优先用手部 21 点 bbox，手未检出/未归属时
+退回腕点方框。两条路径都会在 `verdicts[].ppe` 里写 `source`/`box`，便于离线审计。
+
+**设备检测框**：profile 配 `operating.equipmentLabels` 并打开物体检测后，
+`operating` 优先用「腕/肘到检测框边 ≤ `equipmentMaxDist·scale`」，ROI 只作检测不到时的兜底；
+`near_equipment` 取「人体框与检测框重叠」和「与 ROI 重叠」的较大值（检测框只框设备本体，
+只认框会把人站在面板前的正例压掉）。
+仓库**不附带**训练好的权重，但完整链路已跑通：`web/profiles/refuel-equipment.json`
+（panel/valve/gauge，ONNX 320）在同一份 refuel 导出上把 `operating` 从 ROI-only 的 3/3/3
+变成 **3/3/2**，召回不变；8 段街景/姿态硬负例从 6/8 触发降到 **0/8**。
+模型是用同一段 58s 演示片的分镜框训练的（同集冒烟，valve 无 val 实例、gauge 基本检不到），
+**不能当泛化准确率**。训练、导出、sidecar 与验收见
+[`docs/equipment-detector.md`](docs/equipment-detector.md)；信号导出带 `operating_equipment`
+说明本帧是否有设备检测框（不代表这次判定一定用了框）。
 
 > **本版不再判躺卧、下蹲与深蹲/俯卧撑计数**。这三类需要膝、踝同时可见、机位能拍到全身
 > 或地面，桌面摄像头和上半身构图下判不了——不是识别失败，是输入里没有这些证据。
@@ -97,10 +137,12 @@ serve.py                本地静态服务器
 （`perception.objects.backend='onnx'`，类别名由 profile 的 `labels` 按训练顺序给出），
 训练/导出/接入见 `docs/ppe-training.md`。
 
-**只有上半身在画面里时**（桌面摄像头最常见的构图）：站/坐缺少膝、踝证据，
-姿态会显示「上半身 · 下半身不可见（出画/遮挡），站/坐无法判定」——这是信息不足，不是识别失败。
-手臂动作、手势和鼓掌计数照常工作：尺度锚点自动改用肩宽，直立度改用鼻→肩轴
-（见 `docs/signals.md` §三·八）。想判站/坐就把摄像头拉远到能拍到膝盖。
+**只有上半身在画面里时**（桌面摄像头最常见的构图）：站/坐缺少膝、踝证据，但肩+髋仍能给出
+躯干朝向。此时姿态输出 **`upper_upright` 上半身直立** 或 **`upper_lean` 上半身前倾**，
+面板同时标「仅上半身可见 · 推断」——它不是站/坐：坐着但躯干挺直也会命中上半身直立。
+髋也看不到时不猜（显示「上半身 · 下半身不可见」）。手臂动作、手势和鼓掌计数照常工作：
+尺度锚点自动改用肩宽，直立度改用鼻→肩轴（见 `docs/signals.md` §三·八）。想判站/坐就把摄像头
+拉远到能拍到膝盖；膝/踝一旦可用，站/坐优先于上半身姿态。
 
 手臂动作大多只用姿态骨架就能判（肩、肘、腕三点 + 归一化位置）；
 **伸手 / 持物 / 指向 / 拿取例外**：它们需要「手是张开还是握紧」，依赖手部模型。
@@ -133,24 +175,25 @@ serve.py                本地静态服务器
 伸手只认「张开」，指向只认「指方向/手枪」，两者不再同时亮。文案与判据同源于
 `web/js/armhint.js`，改判据时要一起改。
 
-点面板右侧的**「准确率」**展开 12 个动作的**实测召回/精确率**（来自评估报告，见下文
-「量化动作准确率」）。每个方向样本 <20 时不报百分比；没有报告或没有标注数据时显示「未评估」——
+点面板右侧的**「准确率」**展开 14 个动作的**实测召回/精确率**（来自评估报告，见下文
+「量化动作准确率」）。每个方向样本 <20 段（手势为帧）时不报百分比；没有报告或没有标注数据时显示「未评估」——
 不拿规则自估或合成样例冒充实拍准确率。
 
 ## 验证
 
 ```bash
-npm test                            # 233 逻辑 + 31 动作提示 + 34 准确率 + 285 评估器 + 46 难例 + 18 自动标注 + 23 清单 + 101 多人 + 31 ONNX + 34 PPE + 19 PPE 评估；合计 855 项
-node web/test/logic-test.mjs        # 233 项：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立）/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/统计/拿取阶段机/注册表 flag 一致/上半身构图/腕部 ROI/手归属/平举物理门/换侧滞回/角度突变剔除/不可靠原因/手-臂对应/手型与左右侧绑定
-node web/test/armhint-test.mjs      # 31 项：12 个动作的提示覆盖、手部关闭/未加载/未检出、无 3D/配置关闭、单帧、髋不可见、置信不足、多动作提示优先级、准确率文案（提示行与 tooltip）、左右手粒度
-node web/test/accuracy-test.mjs     # 34 项：flag→id 映射、n/95%CI 保留、样本不足不报百分比、未评估、合成来源标记、档位边界、报告加载容错、参数指纹过期检测、多 track 池化
-node web/test/eval-test.mjs         # 285 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样、多人逐 track 与 label.track/uid、旧单人回归、物体模型指纹与跨模型 baseline 拒绝、多 track baseline/sweep/A-B、逐 track 抖动与姿态混淆矩阵）
+npm test                            # 50 几何 + 300 逻辑 + 46 动作提示 + 36 准确率 + 297 评估器 + 46 难例 + 18 自动标注 + 23 清单 + 106 多人 + 31 ONNX + 52 PPE + 19 PPE 评估；合计 1024 项
+node web/test/geometry-test.mjs     # 50 项：旧矩形规整、多边形配置/点内测试/面积/矩形裁剪、多 zone 最大重叠、resolveRegions 优先级与 fail-closed、人框有效性、头部 9 点换算
+node web/test/logic-test.mjs        # 300 项：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立 vs 上半身直立/前倾）/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/统计/拿取阶段机/注册表 flag 一致/上半身构图/腕部 ROI/手归属/平举物理门/换侧滞回/角度突变剔除/不可靠原因/手-臂对应/手型与左右侧绑定/操作设备掉帧容忍（含引擎漏调用的大间隔）/设备框与 ROI 的 union/fail-closed/多边形 ROI/人框有效性/operating 不成立时不报 zone
+node web/test/armhint-test.mjs      # 46 项：14 个动作的提示覆盖、手部关闭/未加载/未检出、无 3D/配置关闭、单帧、髋不可见、置信不足、多动作提示优先级、准确率文案（提示行与 tooltip）、左右手粒度、无画面时按 profile 标 ROI/检测框不可用（detector-only 还要求物体检测已开且就绪）、人框有效性文案
+node web/test/accuracy-test.mjs     # 36 项：flag→id 映射、n/95%CI 保留、样本不足不报百分比（含段数与 TP/FN/FP）、未评估、合成来源标记、profile/数据源目录透传、档位边界、报告加载容错、参数指纹过期检测、多 track 池化
+node web/test/eval-test.mjs         # 297 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样、多人逐 track 与 label.track/uid、旧单人回归、物体模型指纹与跨模型 baseline 拒绝、多 track baseline/sweep/A-B、逐 track 抖动与姿态混淆矩阵、帧尺寸透传、objects 接线与 operating 离线回放、上下文事件不计入 noArm/none、kp_head/多边形回放）
 node web/test/hardcase-test.mjs     # 46 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口、!动作/noArm 反例导出、尾部锚点（区分播完与暂停）
 node web/test/autolabel-test.mjs    # 18 项：区间合并/丢弃、计数周期、草稿内容与自评全通过、注册表覆盖
 node web/test/manifest-test.mjs     # 23 项：清单字段与文件校验（含 heavy 档位）、覆盖度、计数与反例、动作 id/flag 等价、清单骨架、注册表覆盖
-node web/test/multi-test.mjs        # 101 项：跟踪 id 稳定/防换 id/超时换 id、每人独立状态机与 gap 重置、手部归属（bbox 内/腕部外扩 + 次近人 margin）、逐 track 手势去抖隔离、ROI 预算与 minScalePx、PPE 标签/几何/unknown 语义/持续门槛、平铺几何、运动/外观/最优分配、导出上限与 meta 接线
+node web/test/multi-test.mjs        # 106 项：跟踪 id 稳定/防换 id/超时换 id、每人独立状态机与 gap 重置、手部归属（bbox 内/腕部外扩 + 次近人 margin）、逐 track 手势去抖隔离、ROI 预算与 minScalePx、PPE 标签/几何/unknown 语义/持续门槛、平铺几何、运动/外观/最优分配、物体框坐标（像素/归一化）、导出上限与 meta 接线、face/hand 区域
 node web/test/onnx-test.mjs         # 31 项：YOLOv8 输出解码（[C,N]/[N,C]）、逐类别 NMS、letterbox 逆变换、形状/缺省参数校验、sidecar 类别顺序/inputSize/缺失校验、生成脚本的 --labels 路径/注释解析
-node web/test/ppe-test.mjs          # 34 项：track_uid 稳定与旧数据回退、PPE 计时随 id 变化、requirePositive 窗口护栏（按帧去重）、reason_code（no_positive/config_mismatch/occluded）
+node web/test/ppe-test.mjs          # 52 项：track_uid 稳定与旧数据回退、PPE 计时随 id 变化、requirePositive 窗口护栏（按帧去重）、reason_code（no_positive/config_mismatch/occluded）、头部 face 区域、手套 hand 区域、hands 透传、短 kp_head 兜底
 node web/test/ppe-eval.mjs --self-test  # 19 项：PPE 事件评估骨架（多 track、unknown 暂停/弃权、label.track 中途进场与 uid 绑定、bbox 失配、段级 camera 分组、旧数据明确报错）
 ```
 
@@ -233,14 +276,29 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.clap.down
 npm run accuracy                    # 读 eval-data/ → 写 web/accuracy.json
 ```
 
-页面只显示**这个文件里的实测值**，不自己估。每个方向样本 <20 时不报百分比（n=1 的 100% 会骗人）；
+页面只显示**这个文件里的实测值**，不自己估。手臂动作按**标注段**计样本（TP/FN/FP 都是一个段是否命中），
+每个方向样本 <20 段时不报百分比（n=1 的 100% 会骗人）；手势是帧级指标。
 没有报告或没有标注数据时显示「未评估」。合成样例会被标成「合成样例自检」，不会冒充实拍准确率。
 
+带设备 ROI/场景阈值的素材（如 `operating`）必须把同一个 profile 传给评估器，否则回放时没有 ROI：
+
+```bash
+node web/test/accuracy-report.mjs \
+  --dir eval-data/refuel/eval \
+  --profile web/profiles/refuel.json \
+  --out web/accuracy.json
+```
+
 `autolabel` 只生成正例；反例必须人工补，否则 precision 恒为 1（见 `docs/data-collection.md` §六）。
+新素材（新机位/新人员）的接入、ROI 重画、接触表复核与 `near_equipment` 标注口径见
+[`docs/annotation-kit.md`](docs/annotation-kit.md)。仓库目前没有第二段设备作业视频；
+8 段非设备素材（MOT17 街景 + 姿态样例）的硬负例压力测试里 **6 段触发** `operating`
+（如 MOT17-05 57/102 帧、走路样例 10/20 帧）——它证明这条规则是
+「手/肘在矩形区域 + 抬臂角」，没有物体证据，不能靠调阈值变成设备专用判据。
 清单校验的退出码：0 达标 / 2 覆盖不足 / 1 清单有错，可直接进 CI。
 `--max-count-err` 的单位是**每 20 次的绝对误差**（验收口径）：20 次里错 1 次记 1，多算一倍或完全漏数是 20。
 
-报告按顺序包含：每动作 recall/precision（带 **Wilson 95% 区间和样本量 n**）、门槛、
+报告按顺序包含：每动作 recall/precision（带 **Wilson 95% 区间和样本量 n**，手臂动作的 n 是段数，手势是帧数）、门槛、
 **留一人验证（LOSO）**、**帧率敏感性**、**姿态混淆矩阵**、**手臂共现矩阵**、
 **按机位/受试分组与跨组退化**、**事件时延与抖动**、失败区间、灵敏度扫描、
 **建议 profile 覆盖（`--fit-out`）**、阈值分位。只有一行数字的报告没有用——先看 n，再看比例。
@@ -398,17 +456,19 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 
 以下结论来自当前仓库的自动化测试、合成样例与样例视频；**不代表实拍准确率**。
 
-- 逻辑单测 **233/233**：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立）/置信冻结/手势分类/
+- 几何单测 **50/50**：旧矩形规整、多边形点内测试/面积/矩形裁剪、多 zone 最大重叠、
+  `resolveRegions` 优先级与 fail-closed、人框有效性、头部 9 点换算
+- 逻辑单测 **300/300**：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立 vs 上半身直立/前倾）/置信冻结/手势分类/
   可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/
-  上半身构图/腕部 ROI/手-臂对应/换侧滞回/角度突变剔除/不可靠原因/手型与左右侧绑定
-- 动作提示单测 **31/31**：12 个动作的 tooltip 全覆盖；手部模型关闭/未加载/未检出、无 3D、
-  配置关闭 3D、单帧、髋不可见、置信不足各有提示；多动作同时亮时按可信度最低的那个讲；
+  上半身构图/腕部 ROI/手-臂对应/换侧滞回/角度突变剔除/不可靠原因/手型与左右侧绑定/多边形 ROI/人框有效性
+- 动作提示单测 **46/46**：14 个动作的 tooltip 全覆盖；手部模型关闭/未加载/未检出、无 3D、
+  配置关闭 3D、单帧、髋不可见、置信不足各有提示；无画面时也按 profile 标出 operating 的 ROI 不可用；多动作同时亮时按可信度最低的那个讲；
   提示行与 tooltip 都能带出实测准确率或「未评估」，并标出是哪只手。
-  无头页面确认 12 条 tooltip、提示行与准确率明细（12 行）真的渲染，且 1440×900 仍无整页滚动
-- 准确率单测 **34/34**：评估报告 flag→动作 id 映射、n/95%CI 原样保留、样本不足不报百分比、
+  无头页面确认 14 条 tooltip、提示行与准确率明细（14 行）真的渲染，且 1440×900 仍无整页滚动
+- 准确率单测 **36/36**：评估报告 flag→动作 id 映射、n/95%CI 原样保留、样本不足不报百分比但保留段数/TP/FN/FP、
   没有数据写「未评估」、合成来源标记、档位边界、报告加载的 404/格式错误/网络异常容错、
   参数指纹不一致时标记报告过期
-- 评估器单测 **285/285**：反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson 区间、
+- 评估器单测 **297/297**：反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson 区间、
   门槛、灵敏度扫描、A/B、时延与抖动、`video_time` 回绕、手势帧级指标/弃权/归属、
   分位→profile、LOSO、帧率重采样、多人逐 track 回放与 `label.track` 绑定、旧单人数据回归
 - 难例/自动标注/清单单测 **46 + 18 + 23**：窗口边界、两种 label 时间基、反例导出、
@@ -468,10 +528,19 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
   训练→导出 ONNX→浏览器 ORT→PPE 判定这条链路已跑通（`npm run check:ppe`），但数据量、机位差异、
   小目标都还没解决，**没有任何实拍准确率**。判定逻辑（看不见≠没戴、连续 3s、手套只报疑似）有单测，
   但"准不准"仍未知。见 `docs/ppe-training.md`。
+- **设备检测器只是同集冒烟**：panel/valve/gauge 用 refuel 同一段 58s 演示片的分镜框 +
+  RF100 gauge 训练，val mAP50 0.692（panel 0.995 / gauge 0.39 / **valve 没有 val 实例**），
+  gauge 在 320/0.35 下基本检不到。同一份导出上它能把 `operating` 的 1 个特写 FP 压掉、
+  8 段硬负例 8/8 不触发，但换机位/换人完全没有验证；模型不进 git（`web/models/`），
+  训练与接入见 `docs/equipment-detector.md`。
 - 物体检测的 GPU delegate 对该模型会 trap（wasm divide by zero，且会污染整个运行时），
   默认走 CPU；换自训模型后需要自己验证能否上 GPU。
 - 多人**姿态/手势**已能按 track 评估（`evaluate.mjs` 的逐 track 回放与 labels 的 `track` 字段）；
   多人 **PPE 事件**的 recall/precision 还没接进主报告（先用独立的 PPE 评估工具）。
+- 单人道有**漏检补救**（`perception.single.fallback`，默认开）：VIDEO 模式整帧 0 人时用
+  IMAGE 模式 0.3 再检一次。refuel 样例（大量半身/特写）无判定帧 772 → 546，但特写段会多
+  少量把「手/设备」当上半身的误检。它只提高检出率，不改变动作判定；数字见
+  `docs/multi-and-objects.md` §五。
 - Python 服务端引擎、YAML 规则、RTSP 多路不在本版内，见 `PLAN.md`。
 
 ## 插图

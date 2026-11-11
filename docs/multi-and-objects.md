@@ -50,7 +50,7 @@ MOT17 实测对夜景/远景提升很大、对拥挤近景提升有限且误检�
 
 - 两条后端，输出统一成 `{label, score, box:[x1,y1,x2,y2]}`，与 `person.bbox` 同口径，判定层不必区分来源：
   - `backend: "mediapipe"`（默认）：MediaPipe Tasks `ObjectDetector`，任何满足 Tasks 格式的 `.tflite` 都能换。先上 EfficientDet-Lite0（Apache-2.0，COCO 80 类）验证链路。
-  - `backend: "onnx"`：`web/js/objects-onnx.js` + onnxruntime-web，吃 Ultralytics 导出的 YOLOv8 ONNX（`[1, 4+nc, N]`，逐类别 NMS）。给自训的安全帽/手套模型用，训练/导出步骤见 `docs/ppe-training.md`。
+  - `backend: "onnx"`：`web/js/objects-onnx.js` + onnxruntime-web，吃 Ultralytics 导出的 YOLOv8 ONNX（`[1, 4+nc, N]`，逐类别 NMS）。给自训的安全帽/手套、阀门/仪表模型用，训练/导出步骤见 `docs/ppe-training.md` 与 `docs/equipment-detector.md`。设备类别还可以被 `operating` / `near_equipment` 用作物体证据（见 `docs/signals.md`）。
 - **标签来源不同**：MediaPipe 从模型 label map（`categoryName`）读；ONNX 没有 label map，必须由 profile 的 `perception.objects.labels` 按训练时 `data.yaml` 的**顺序**给出。顺序写错不会报错，只会把类别张冠李戴——`headless-ppe-onnx.mjs` 会检查 `no_helmet` 有没有被当成 `helmet`。
 - **ONNX 推理是异步的**：视频循环里不能 await（会卡住 rAF），`app.js` 用"同一时刻只跑一帧 + 上一帧结果"的方式，PPE 用到的框最多晚一帧；图片路径会 await。
 
@@ -76,8 +76,12 @@ MOT17 实测对夜景/远景提升很大、对拥挤近景提升有限且误检�
 
 | 区域 | 判定 | 兜底 |
 |---|---|---|
-| 头部 | 鼻尖 + `headBoxScale×躯干长` 的方框 | 鼻尖不可见 → 人框顶部 22% 高、45% 宽，`visible=false` |
-| 腕部 | 腕点 + `gloveBoxScale×躯干长` 的方框 | 腕不可见 → `unknown` |
+| 头部 | 优先用 9 个头面部关键点（鼻/眼/耳，`persons[].kp_head`）定框：取可见眼/耳，左右两侧都要有点，按均值剔离群点，`half = max(headBoxScale×躯干长, 0.6×展宽)` 并向上覆盖帽檐 | 脸点不足/单侧 → 鼻尖 + `headBoxScale×躯干长`（旧几何）；鼻尖也不可见 → 人框顶部 22% 高、45% 宽，`visible=false` |
+| 腕部/手套 | 优先手部 21 点 bbox + `gloveHand.pad`（默认 0.15）外扩；左右侧按最近姿态腕点绑定，不信任 handedness | 手未检出/未归属 → 腕点 + `gloveBoxScale×躯干长` 方框；腕不可见 → `unknown` |
+
+头部 `source` 取 `face | nose | bbox`；手套每侧 `source` 取 `hand | wrist | none`，并带 `side_from`
+（`slot | nearest_wrist | handedness | pose`）。这些字段会写进 `verdicts[].ppe`，便于离线审计。
+旧导出没有 `kp_head` 时自动走鼻尖路径，行为与旧版一致。
 
 归属判据是"检测框中心落在区域内"且分数 ≥ `minScore`。刻意不用 IoU：安全帽框通常比头部框小很多，IoU 会把正确的帽子判掉。
 
@@ -85,7 +89,7 @@ MOT17 实测对夜景/远景提升很大、对拥挤近景提升有限且误检�
 
 ## 四、数据契约
 
-`pushLog()` 每帧新增两个字段，**老字段完全不变**（`signals/actions` 仍是主目标的判定），所以旧流程不受影响。多人导出时 `persons[]` 是**全部判定人员**（每人一条，`[0]` 仍是主目标）；单人导出仍是 1 条：
+`pushLog()` 每帧新增两个字段，**老字段完全不变**（`signals/actions` 仍是主目标的判定），所以旧流程不受影响。多人导出时 `persons[]` 是**全部判定人员**（每人一条，`[0]` 仍是主目标）；单人导出仍是 1 条。`persons[].kp_head`（可选，9 点）供 PPE 头部区域使用，旧导出没有它时退回鼻尖：
 
 ```json
 {
@@ -93,8 +97,10 @@ MOT17 实测对夜景/远景提升很大、对拥挤近景提升有限且误检�
   "signals": { ... }, "actions": { ... },
   "verdicts": [
     { "track_id": 2, "bbox": [...], "posture": "stand", "flags": {...}, "reps": {...},
-      "ppe": { "helmet": {"state":"missing","alert":"violation","streak_ms":3200},
-               "glove":  {"state":"unknown","alert":"none","streak_ms":0} } }
+      "ppe": { "helmet": {"state":"missing","alert":"violation","streak_ms":3200,
+                           "source":"face","box":[200,80,280,160]},
+               "glove":  {"state":"unknown","alert":"none","streak_ms":0,
+                           "L":{"state":"worn","source":"hand","side_from":"slot"}} } }
   ],
   "objects": [ { "label": "person", "score": 0.87, "box": [38,10,202,515] } ]
 }
@@ -114,12 +120,23 @@ MOT17 实测对夜景/远景提升很大、对拥挤近景提升有限且误检�
 
 `?profile=/web/profiles/safety.json` 直接进安全档。
 
+### 单人道漏检补救（`perception.single.fallback`）
+
+VIDEO 模式的检测阈值是 0.5，半身、贴边、被设备挡住的人经常整帧 0 人。补救打开后，
+**仅在这一帧**用 IMAGE 模式（detConf 0.3）再检一次，按 `fallbackMinScore` 过滤后交给
+同一条动作流水线；正常帧仍走 VIDEO 模式（模型内跟踪更稳），所以只在漏检帧多付一次推理。
+IMAGE 估计器是懒加载的，建失败会记住失败、不每帧重试（与多人开关失败同一个坑）。
+
+在 `eval-data/refuel/oil-sample-demo.mp4`（480×272 / 58s，大量半身与特写）上实测：
+**无判定帧 772 → 546（−29%）**；代价是特写段会多出一些「手/设备被当成上半身」的误检
+（2.0~5.6s 段 17 → 26 帧）。它提高的是**检出率**，不是动作正确率——动作数字仍须标注。
+
 ---
 
 ## 六、验证与已知限制
 
 ```bash
-npm run test:multi     # 66 项：跟踪 id 稳定/防换 id/超时、流水线隔离、手部归属、PPE 语义与时序、平铺几何、运动/外观/最优分配
+npm run test:multi     # 106 项：跟踪 id 稳定/防换 id/超时、流水线隔离、手部归属、PPE 语义与时序、face/hand 区域、平铺几何、运动/外观/最优分配
 npm run serve -- 8799
 node web/test/headless-multi.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-two.webm"
                        # 19 项：真模型真视频，双人轨迹、物体框、safety 档、零 JS 错误
@@ -190,7 +207,7 @@ ONNX 后端（~28fps）；efficientdet 只用于 COCO 通用物体演示。
 > 150ms 间隔约 2/3 占空比。`state.timing.objects` 只测到主线程提交（~0.5ms），
 > 不能当推理成本——吞吐脚本会同时输出 `objectRunMs`。
 
-**已实测**：双人视频 2 条轨迹 + 2 条独立判定；物体检测 4 个框（person/bus）；PPE 在 COCO 模型下全部 `unknown`（正确：COCO 没有安全帽类别，护栏生效）；无 JS 异常；自训 YOLOv8n 冒烟模型在浏览器里跑通 ONNX→PPE（helmet 判定 `worn`）。
+**已实测**：双人视频 2 条轨迹 + 2 条独立判定；物体检测 4 个框（person/bus）；PPE 在 COCO 模型下全部 `unknown`（正确：COCO 没有安全帽类别，护栏生效）；无 JS 异常；自训 YOLOv8n 冒烟模型在浏览器里跑通 ONNX→PPE（helmet 判定 `worn`）。设备检测器（panel/valve/gauge）也在 refuel 58s 演示片上跑通 ONNX→`operating`：590 帧里 310 帧有设备框，页面无 JS 错误；同输入 A/B 让 `operating` 从 3/3/3 变成 3/3/2，8 段硬负例从 6/8 触发降到 0/8（`docs/equipment-detector.md`）。
 
 **未验证**：
 

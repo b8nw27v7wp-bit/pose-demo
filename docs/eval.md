@@ -162,8 +162,9 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 
 | 类别 | 取值 |
 |---|---|
-| 姿态 | `stand` / `sit`（`squat_static` / `lying` 已下线，写了会被 `parseSegment` 拒绝）|
-| 手臂 | `armRaised` / `bothHandsUp` / `waving` / `crossed` / `onHips` / `armsOpen` / `handAtHead` / `reaching` / `carrying` / `pointing` / `armFront` / `armSide` |
+| 姿态 | `stand` / `sit` / `upper_upright` / `upper_lean`（`squat_static` / `lying` 已下线，写了会被 `parseSegment` 拒绝）。后两个只用于上半身构图，标注时按「躯干直立/前倾」标，不要拿它们当站/坐 |
+| 手臂 | `armRaised` / `bothHandsUp` / `waving` / `crossed` / `onHips` / `armsOpen` / `handAtHead` / `reaching` / `carrying` / `operating` / `near_equipment` / `pointing` / `armFront` / `armSide` |
+| 上下文 | `near_equipment` 是上下文事件（人在设备旁），**不能**和 `operating` 互相替代 |
 | 计数 | `clap` / `grasp`（`squat` / `pushup` 已下线）|
 | 手势 | `gesture` —— 另给 `hand`（`L` / `R` / `any`）与 `shape`（`fist` / `open` / `victory` / `pointing` / `thumbs_up` / `ok` / `gun` / `rock`） |
 | 复合反例 | `none` —— 姿态和手臂都不得出现（人不在场 / 完全无动作） |
@@ -172,6 +173,17 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 
 动作名也接受 `ARM_ACTIONS` 里的 id（`arm_raised` / `reach` / `carry` / `point` …），
 两种写法等价，评估器内部会归一。
+
+> **`operating` 的离线回放**：设备 ROI 是归一化画面坐标，信号层需要 `persons[].frame_w/frame_h`
+> 换算成像素。当前导出已带这两个字段；旧导出没有时评估器按「有 ROI 但不知道帧尺寸」弃权，
+> `operating` 恒为 false——不是漏判，是这份数据回放不了。`near_equipment` 复用同一个 ROI，
+> 也受同样限制。另外评估/生成准确率时要带 `--profile web/profiles/xxx.json`；
+> 默认参数里没有 ROI，不传 profile 同样会让 `operating` / `near_equipment` 恒为 false。
+>
+> 配了设备检测框（`operating.equipmentLabels`）的 profile 还要求导出帧里带 `objects`
+> （每帧物体框数组）。旧导出没有 `objects` 时，检测框分支等于没有证据：`equipmentFallbackRoi=true`
+> 会退回 ROI，`false` 则一律不判——这不是规则的问题。跨 profile 的 A/B 必须用**同一份导出**，
+> 不同播放之间的姿势/手部检出差异足以把 5/1/3 变成 3/3/3（见 `docs/equipment-detector.md` §6）。
 
 **逐侧粒度**：导出帧的 `actions.flags` 现在带 `armRaisedL/R`、`wavingL/R`、`reachingL/R`、
 `pointingL/R`、`handAtHeadL/R`、`carryingL/R`，界面也会显示「左手举手」这类粒度；
@@ -192,6 +204,8 @@ recall/precision，下一步给段加 `"side":"L"` 并让 `evaluate.mjs` 读逐�
 | 站立时乱计数也要算 | 标 `none` 段 | `none` 窗口内的计数增量会让该段失败，并归到对应动作的 FP |
 
 `none` 与 `noArm` 的差别：`noArm` 不把站立/坐下当成错误，也不追究计数；`none` 什么都不允许，并把窗口内的计数误报算进去。
+
+`near_equipment` 是**上下文事件**，不是手臂动作：`noArm` 和 `none` 都不把它算作误报（否则「站在设备旁不动」会被判成手臂误报，还会把 FP 记到 `near_equipment` 的精确率上）。它自己作为动作的正/反例仍然照常评估。
 
 ### 手势段
 

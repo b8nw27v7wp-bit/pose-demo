@@ -90,27 +90,30 @@ export function formatAccuracy(row, { minSamples = MIN_SAMPLES, synthetic = fals
 
   const bits = [];
   const detail = [];
+  // 手臂动作的 n 是**标注段数**，不是帧数（手势才是帧级）。不写清楚，
+  // 页面上的 n=6 会被当成「只测了 6 帧」。
   if (recallUsable) {
     bits.push(`召${pct(row.recall)}`);
     const ci = ciText(row.recallCI);
-    detail.push(`召回 ${pct(row.recall)}${ci ? `（95%CI ${ci}，n=${nR}）` : `（n=${nR}）`}`);
+    detail.push(`召回 ${pct(row.recall)}${ci ? `（95%CI ${ci}，n=${nR} 段）` : `（n=${nR} 段）`}`);
   } else if (row.recall != null) {
-    detail.push(`召回样本不足（n=${nR} < ${minSamples}）`);
+    // 不报百分比，但把原始 TP/FN 放出来：样本不足不等于没有数据。
+    detail.push(`召回样本不足（TP=${row.tp ?? 0} / FN=${row.fn ?? 0}，n=${nR} 段 < ${minSamples}）`);
   }
   if (precisionUsable) {
     bits.push(`精${pct(row.precision)}`);
     const ci = ciText(row.precisionCI);
-    detail.push(`精确 ${pct(row.precision)}${ci ? `（95%CI ${ci}，n=${nP}）` : `（n=${nP}）`}`);
+    detail.push(`精确 ${pct(row.precision)}${ci ? `（95%CI ${ci}，n=${nP} 段）` : `（n=${nP} 段）`}`);
   } else if (row.precision != null) {
-    detail.push(`精确样本不足（n=${nP} < ${minSamples}）`);
+    detail.push(`精确样本不足（TP=${row.tp ?? 0} / FP=${row.fp ?? 0}，n=${nP} 段 < ${minSamples}）`);
   } else {
     detail.push('精确未测（没有反例段）');
   }
 
   if (!bits.length) {
     return {
-      short: `样本不足(n=${Math.max(nR, nP)})`,
-      long: `样本不足：${detail.join(' · ')}；每个方向至少 ${minSamples} 个样本才报百分比`,
+      short: `样本不足(n=${Math.max(nR, nP)}段)`,
+      long: `样本不足：${detail.join(' · ')}；每个方向至少 ${minSamples} 个样本（段）才报百分比`,
       level: 'none', recall: row.recall, precision: row.precision,
     };
   }

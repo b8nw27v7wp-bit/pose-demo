@@ -8,6 +8,7 @@ import {
   accuracyFor, formatAccuracy, accuracyTier, accuracyStale, loadAccuracyReport, MIN_SAMPLES,
 } from '../js/accuracy.js';
 import { buildAccuracyReport } from './accuracy-report.mjs';
+import { ARM_ACTIONS } from '../js/actions.js';
 
 let pass = 0;
 let fail = 0;
@@ -48,9 +49,11 @@ check('flag → 动作 id', rep.actions.arm_raised?.recall === 0.89 && rep.actio
 check('n 与 CI 原样保留',
   rep.actions.arm_raised?.recallCI?.[0] === 0.77 && rep.actions.arm_raised?.nPrecision === 48);
 check('未出现的动作是 null', rep.actions.wave === null && rep.actions.point === null);
-check('12 个手臂动作全部列出', Object.keys(rep.actions).length === 12);
+check('注册表里每个手臂动作都列出', Object.keys(rep.actions).length === ARM_ACTIONS.length,
+  `${Object.keys(rep.actions).length}/${ARM_ACTIONS.length}`);
 check('实拍素材不标合成', rep.source.synthetic === false && !/不代表实拍/.test(rep.source.note));
 check('minSamples / 参数指纹带入', rep.minSamples === 20 && rep.paramsHash === 'fnv1a:test');
+check('profile 与数据源目录带入', rep.profile === '默认阈值' && rep.source.dir === 'eval-data');
 
 const synth = buildAccuracyReport({
   ...evalReport, clips: [{ clip: 'sample（合成数据，非实拍）', note: '' }],
@@ -90,9 +93,11 @@ const good = formatAccuracy({ ...row, recall: 0.95, precision: 0.9 }, { minSampl
 check('达到验收线 → good', good.level === 'good');
 const bad = formatAccuracy({ ...row, recall: 0.6, precision: 0.9 }, { minSamples: 20 });
 check('明显偏低 → bad', bad.level === 'bad');
-const few = formatAccuracy({ ...row, nRecall: 3, nPrecision: 3 }, { minSamples: 20 });
+const few = formatAccuracy({ ...row, tp: 2, fn: 1, fp: 1, nRecall: 3, nPrecision: 3 }, { minSamples: 20 });
 check('样本不足 → 不报百分比',
   few.short.includes('样本不足') && few.level === 'none' && !few.short.includes('%'), few.short);
+check('样本不足写明「段」与原始 TP/FN/FP',
+  few.short.includes('段') && /TP=2/.test(few.long) && /FN=1/.test(few.long) && /FP=1/.test(few.long), few.long);
 
 const none = formatAccuracy(null);
 check('无数据 → 未评估', none.short === '未评估' && none.level === 'none', none.short);

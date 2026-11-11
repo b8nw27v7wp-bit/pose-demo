@@ -209,10 +209,16 @@ export function toObjects(result, w, h) {
   for (const d of list) {
     const bb = d.boundingBox;
     if (!bb) continue;
-    const x1 = bb.originX * w;
-    const y1 = bb.originY * h;
-    const x2 = (bb.originX + bb.width) * w;
-    const y2 = (bb.originY + bb.height) * h;
+    // MediaPipe Tasks 的 BoundingBox 是**输入图像像素**（originX/width 已在像素域），
+    // 之前无条件乘 w/h 会把框放大到 w² 倍，PPE 的几何归属、和姿态框/ROI 的比较都会错位。
+    // 兼容极少数返回归一化坐标的实现：坐标和尺寸都 ≤1.5 时按归一化处理。
+    const normalized = bb.originX + bb.width <= 1.5 && bb.originY + bb.height <= 1.5;
+    const sx = normalized ? w : 1;
+    const sy = normalized ? h : 1;
+    const x1 = bb.originX * sx;
+    const y1 = bb.originY * sy;
+    const x2 = (bb.originX + bb.width) * sx;
+    const y2 = (bb.originY + bb.height) * sy;
     const cat = d.categories?.[0] || {};
     out.push({
       category: cat.index ?? -1,

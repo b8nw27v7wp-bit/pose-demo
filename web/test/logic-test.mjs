@@ -65,6 +65,28 @@ console.log('\n[3] Hold');
   check('duration 用外部时间戳', near(h.duration, 500, 1), `duration=${h.duration}`);
   check('条件断开即失活', h.update(false, 600) === false);
   check('重新计时', h.update(true, 700) === false && h.update(true, 800) === false);
+
+  // maxGapMs：短暂掉帧不重置计时（默认 0 = 与旧行为完全一致）
+  const hg = new Hold(400, 250);
+  hg.update(true, 0);
+  hg.update(true, 200);
+  check('gap 内掉帧不重置（掉帧时仍未满 400ms）', hg.update(false, 300) === false);
+  check('gap 结束后继续累计，400ms 成立', hg.update(true, 400) === true);
+  check('已成立后 gap 内掉帧仍保持 active', hg.update(false, 500) === true);
+  check('超过 maxGapMs 才重置', hg.update(false, 800) === false && hg.update(true, 900) === false);
+
+  // 两次「真」之间没有 false 帧（人短暂丢失 / 引擎没被调用）时，maxGap 也要生效
+  const hgGap = new Hold(400, 250);
+  hgGap.update(true, 0);
+  hgGap.update(true, 200);
+  check('真值帧间隔 >maxGap → 重新计时', hgGap.update(true, 1000) === false);
+  check('重新计时后 ≤maxGap 更新可累计到 400ms',
+    hgGap.update(true, 1200) === false && hgGap.update(true, 1400) === true);
+
+  // maxGapMs=0 保持旧语义：只看 cond，不看调用间隔
+  const hgZero = new Hold(400, 0);
+  hgZero.update(true, 0);
+  check('maxGap=0 不受调用间隔影响', hgZero.update(true, 4999) === true);
 }
 
 // —— 4. RepCounter 滞回 / 最小周期 / abort ——
@@ -497,10 +519,36 @@ console.log('\n[13] 可见性门控');
   hiddenLegs[11] = [40, 380, 0]; hiddenLegs[12] = [360, 380, 0];
   const sHidden = new SignalEngine().update(person(hiddenLegs), 1000);
   check('膝/踝不可见 → knee_pick=NaN', Number.isNaN(sHidden.knee_pick), `knee=${sHidden.knee_pick}`);
+  // 肩+髋仍然可信：只判「上半身直立」，不冒充站/坐（legs_visible=false）
+  check('膝/踝不可见但肩髋可见 → upper_body=true', sHidden.upper_body === true);
+  check('肩髋可见时 legs_visible=false', sHidden.legs_visible === false);
+  // 横着的框（手臂/设备特写）不能凭猜出来的髋判上半身朝向
+  const sWide = new SignalEngine().update({ ...person(hiddenLegs), bbox: [0, 0, 220, 147] }, 1000);
+  check('横向大框 → upper_body=false', sWide.upper_body === false,
+    `bbox=220×147 upper=${sWide.upper_body}`);
+  const sTall = new SignalEngine().update({ ...person(hiddenLegs), bbox: [0, 0, 103, 267] }, 1000);
+  check('竖长框 → upper_body=true', sTall.upper_body === true,
+    `bbox=103×267 upper=${sTall.upper_body}`);
   const aeHidden = new ActionEngine();
   let rHidden = null;
   for (let i = 0; i < 12; i++) rHidden = aeHidden.update(sHidden, 1000 + i * 100);
-  check('腿不可见 → 不硬凑站/坐', rHidden.postureId === null, `posture=${rHidden.postureId}`);
+  check('腿不可见 → 上半身直立（推断），不硬凑站/坐',
+    rHidden.postureId === 'upper_upright', `posture=${rHidden.postureId}`);
+
+  // 同一半身构图、躯干明显前倾：判上半身前倾，而不是直立
+  const aeLean = new ActionEngine();
+  const leanSig = mkSig({ upper_body: true, uprightness: 0.5, knee_pick: NaN, leg_vertical: NaN });
+  let rLean = null;
+  for (let i = 0; i < 12; i++) rLean = aeLean.update(leanSig, 1000 + i * 100);
+  check('上半身构图 + 躯干前倾 → upper_lean', rLean.postureId === 'upper_lean',
+    `posture=${rLean.postureId}`);
+
+  // 躯干接近水平（可能是躺卧）时不猜上半身姿态
+  const aeLevel = new ActionEngine();
+  const levelSig = mkSig({ upper_body: true, uprightness: 0, knee_pick: NaN, leg_vertical: NaN });
+  let rLevel = null;
+  for (let i = 0; i < 12; i++) rLevel = aeLevel.update(levelSig, 1000 + i * 100);
+  check('躯干接近水平 → 不判上半身姿态', rLevel.postureId === null, `posture=${rLevel.postureId}`);
 }
 
 // —— 14. 抱臂判定要抗转身 ——
@@ -1285,6 +1333,8 @@ console.log('\n[26] 上半身构图');
   check('尺度改用肩宽×1.4', near(s.scale, 140 * 1.4, 8), `scale=${s.scale.toFixed(1)}`);
   check('腿竖直比仍是 NaN（没有腿）', Number.isNaN(s.leg_vertical),
     `leg_v=${s.leg_vertical}`);
+  // 髋几乎不可见时躯干轴不成立：不能拿「猜出来的髋」判上半身朝向
+  check('髋不可见 → upper_body=false', s.upper_body === false);
   check('髋不可见时不判叉腰（腕贴"猜出来的髋"不算）', s.armPose.on_hips === false);
   check('胸前高度仍可用（髋按肩下方一个躯干长补）', s.armPose.chest_height === true);
 
@@ -1385,6 +1435,360 @@ console.log('\n[28] 稳健性');
   const aeOut = new ActionEngine();
   const rOut = aeOut.update(mkSig({ angle_outliers: ['2d:knee_L'] }), 1000);
   check('角度坏点帧标注 angle_outlier', rOut.unreliable.includes('angle_outlier'), rOut.unreliable.join(','));
+}
+
+// —— 29. 操作阀门/仪表（设备 ROI + 持续 800ms）——
+console.log('\n[29] 操作设备');
+{
+  const opPerson = (kp, o = {}) => ({ ...person(kp, 0.9), frame_w: 500, frame_h: 500, ...o });
+  const roi = { x: 0.1, y: 0.3, w: 0.2, h: 0.2 };   // 左腕 [80,200] → 归一化 (0.16,0.40) 在框内
+  const withRoi = { signals: { arm: { operating: { roi } } } };
+
+  const seOn = new SignalEngine(withRoi);
+  const sOn = seOn.update(opPerson(standKp), 1000);
+  check('设备 ROI 内、肩以下前伸 → operating=true', sOn.arm.operating_any === true,
+    `L=${sOn.arm.operating_L} R=${sOn.arm.operating_R}`);
+  check('左右手粒度跟着信号走', sOn.arm.operating_L === true && sOn.arm.operating_R === true);
+
+  // 没有 ROI 时必须明显前伸：自然垂手（reach≈0.84）不算
+  const sOff = new SignalEngine().update(opPerson(standKp), 1000);
+  check('无 ROI 时自然垂手不算操作', sOff.arm.operating_any === false);
+
+  // 双手都举到肩上：抬臂角 <90°，不算操作。肘也要移出 ROI，
+  // 否则「手举起但肘在设备区域」会按肘兜底算操作（这是预期行为，不是手判据）。
+  const raised = standKp.map((p, i) => (i === 5 ? [80, 40, 1]
+    : i === 6 ? [120, 40, 1]
+      : i === 3 ? [300, 300, 1]
+        : i === 4 ? [320, 300, 1] : p));
+  const sRaised = new SignalEngine(withRoi).update(opPerson(raised), 1000);
+  check('手在肩上方、肘也不在 ROI → 不算操作', sRaised.arm.operating_any === false,
+    `L=${sRaised.arm.operating_L} R=${sRaised.arm.operating_R}`);
+
+  // 两肩不可见（只检出一只手臂）不算
+  const noShoulder = standKp.map((p, i) => (i === 1 || i === 2 ? [p[0], p[1], 0.05] : p));
+  const sNoSh = new SignalEngine(withRoi).update(opPerson(noShoulder), 1000);
+  check('肩不可见不判操作', sNoSh.arm.operating_any === false);
+
+  // 手在 ROI 外不算
+  const farRoi = { x: 0.8, y: 0.8, w: 0.15, h: 0.15 };
+  const sFar = new SignalEngine({ signals: { arm: { operating: { roi: farRoi } } } })
+    .update(opPerson(standKp), 1000);
+  check('手在设备 ROI 外不算操作', sFar.arm.operating_any === false);
+
+  // 手被设备挡住（腕在 ROI 外）时，肘在 ROI 内仍算「手臂在设备上」
+  const elbowRoi = { x: 0.1, y: 0.2, w: 0.2, h: 0.2 };   // 像素 50~150 × 100~200
+  const wristOut = standKp.map((p, i) => (i === 5 ? [300, 300, 1] : i === 6 ? [320, 300, 1] : p));
+  const sElbow = new SignalEngine({ signals: { arm: { operating: { roi: elbowRoi } } } })
+    .update(opPerson(wristOut), 1000);
+  check('腕在 ROI 外、肘在 ROI 内 → 用肘兜底判操作',
+    sElbow.arm.operating_any === true && sElbow.arm.operating_L === false
+    && (sElbow.arm.operating_elbow_L || sElbow.arm.operating_elbow_R));
+  const sElbowOut = new SignalEngine({ signals: { arm: { operating: { roi: farRoi } } } })
+    .update(opPerson(wristOut), 1000);
+  check('腕和肘都不在 ROI → 不算操作', sElbowOut.arm.operating_any === false);
+
+  // 动作层：800ms 才成立，前 400ms 不亮
+  const seHold = new SignalEngine(withRoi);
+  const aeHold = new ActionEngine(withRoi);
+  let early = null;
+  for (let i = 0; i <= 4; i++) early = aeHold.update(seHold.update(opPerson(standKp), 1000 + i * 100), 1000 + i * 100);
+  check('操作设备需持续 800ms（400ms 不成立）', early.flags.operating === false);
+  let held = null;
+  for (let i = 5; i <= 9; i++) held = aeHold.update(seHold.update(opPerson(standKp), 1000 + i * 100), 1000 + i * 100);
+  check('连续 800ms → operating 成立', held.flags.operating === true,
+    `operating=${held.flags.operating} L=${held.flags.operatingL} R=${held.flags.operatingR}`);
+
+  // 掉帧容忍（holds.operatingMaxGap=300）：100ms 的遮挡不重置 800ms 计时
+  const opSig = (on) => mkSig({
+    arm: { ...mkSig().arm, operating_any: on, operating_L: on, operating_R: false },
+  });
+  const aeGap = new ActionEngine();
+  let gapRes = null;
+  for (let i = 0; i <= 4; i++) gapRes = aeGap.update(opSig(true), 1000 + i * 100);
+  gapRes = aeGap.update(opSig(false), 1500);
+  check('100ms 掉帧时仍未满 800ms', gapRes.flags.operating === false);
+  for (let i = 6; i <= 8; i++) gapRes = aeGap.update(opSig(true), 1000 + i * 100);
+  check('掉帧后继续累计 → 800ms 成立', gapRes.flags.operating === true,
+    `operating=${gapRes.flags.operating}`);
+
+  // 超过 300ms 的间隔仍算中断：重新计满 800ms 才成立
+  const aeGapLong = new ActionEngine();
+  let longRes = null;
+  for (let i = 0; i <= 4; i++) longRes = aeGapLong.update(opSig(true), 1000 + i * 100);
+  for (let i = 5; i <= 8; i++) longRes = aeGapLong.update(opSig(false), 1000 + i * 100);
+  longRes = aeGapLong.update(opSig(true), 1900);
+  check('400ms 间隔 → 计时已重置', longRes.flags.operating === false);
+  for (let t = 1900; t <= 2700; t += 100) longRes = aeGapLong.update(opSig(true), t);
+  check('重新连续 800ms → operating 成立', longRes.flags.operating === true,
+    `operating=${longRes.flags.operating}`);
+}
+
+// —— 30. 在设备旁（上下文事件：人体框与 ROI 重叠 + 1s）——
+console.log('\n[30] 在设备旁');
+{
+  const roi = { x: 0.1, y: 0.3, w: 0.2, h: 0.2 };   // 像素 50~150 × 150~250
+  const nearPerson = (bbox, o = {}) => ({
+    ...person(standKp, 0.9), bbox, frame_w: 500, frame_h: 500, ...o,
+  });
+  const sigWith = (bbox, o) => new SignalEngine({ signals: { arm: { operating: { roi } } } })
+    .update(nearPerson(bbox, o), 1000);
+
+  const inside = sigWith([50, 150, 150, 250]);
+  check('人体框在 ROI 内 → near_equipment=true', inside.arm.near_equipment === true,
+    `overlap=${inside.arm.near_equipment_overlap}`);
+  check('重叠比例=1', near(inside.arm.near_equipment_overlap, 1, 0.01));
+
+  const half = sigWith([0, 150, 100, 300]);   // 5000 / 15000 ≈ 0.333，且是竖直框
+  check('重叠 ≥30% → true', half.arm.near_equipment === true,
+    `overlap=${half.arm.near_equipment_overlap?.toFixed(3)}`);
+
+  const outside = sigWith([300, 300, 400, 400]);
+  check('人体框在 ROI 外 → false', outside.arm.near_equipment === false);
+
+  const horizontal = sigWith([0, 150, 250, 250]); // 横向框，疑似特写误检
+  check('横向框 → false（几何门）', horizontal.arm.near_equipment === false,
+    `overlap=${horizontal.arm.near_equipment_overlap?.toFixed(3)}`);
+
+  const noRoi = new SignalEngine().update(nearPerson([50, 150, 150, 250]), 1000);
+  check('无 ROI → false', noRoi.arm.near_equipment === false);
+
+  const noSh = standKp.map((p, i) => (i === 1 || i === 2 ? [p[0], p[1], 0.05] : p));
+  const lowSh = sigWith([50, 150, 150, 250], { kp: noSh });
+  check('两肩不可见 → false', lowSh.arm.near_equipment === false);
+
+  // 动作层：1s 才成立
+  const seH = new SignalEngine({ signals: { arm: { operating: { roi } } } });
+  const aeH = new ActionEngine({ actions: { holds: { nearEquipment: 1000 } } });
+  let early = null;
+  for (let i = 0; i <= 4; i++) early = aeH.update(seH.update(nearPerson([50, 150, 150, 250]), 1000 + i * 100), 1000 + i * 100);
+  check('500ms 不成立', early.flags.nearEquipment === false);
+  let held = null;
+  for (let i = 5; i <= 10; i++) held = aeH.update(seH.update(nearPerson([50, 150, 150, 250]), 1000 + i * 100), 1000 + i * 100);
+  check('连续 1000ms → nearEquipment 成立', held.flags.nearEquipment === true);
+}
+
+// —— 31. 设备检测框：有框用框，无框退回 ROI ——
+console.log('\n[31] 设备检测框');
+{
+  const eqPerson = (o = {}) => ({
+    ...person(standKp, 0.9), bbox: [0, 0, 500, 500], frame_w: 500, frame_h: 500, ...o,
+  });
+  const eqObj = (label, box, score = 0.9) => ({ label, score, box });
+  const withEq = {
+    signals: { arm: { operating: {
+      roi: null, equipmentLabels: ['valve'], equipmentMinScore: 0.3, equipmentMaxDist: 0.35,
+    } } },
+  };
+  const base = eqPerson();
+
+  const on = new SignalEngine(withEq).update(base, 1000, [eqObj('valve', [50, 150, 150, 250])]);
+  check('腕在设备检测框内 → operating',
+    on.arm.operating_any === true && on.arm.operating_equipment === true,
+    `any=${on.arm.operating_any} eq=${on.arm.operating_equipment}`);
+
+  const far = new SignalEngine(withEq).update(base, 1000, [eqObj('valve', [300, 300, 400, 400])]);
+  check('设备框离腕很远 → 不算操作', far.arm.operating_any === false);
+
+  const wrong = new SignalEngine(withEq).update(base, 1000, [eqObj('person', [50, 150, 150, 250])]);
+  check('非设备类别不算设备框', wrong.arm.operating_any === false && wrong.arm.operating_equipment === false);
+
+  const both = {
+    signals: { arm: { operating: {
+      roi: { x: 0.1, y: 0.3, w: 0.2, h: 0.2 },
+      equipmentLabels: ['valve'], equipmentMinScore: 0.3,
+    } } },
+  };
+  const boxFar = new SignalEngine(both).update(base, 1000, [eqObj('valve', [300, 300, 400, 400])]);
+  check('有设备框时 ROI 只作兜底（框远则不判）', boxFar.arm.operating_any === false);
+  const noEq = new SignalEngine(both).update(base, 1000, []);
+  check('无设备检测时退回 ROI', noEq.arm.operating_any === true);
+
+  const near = new SignalEngine(withEq).update(
+    eqPerson({ bbox: [0, 150, 100, 300] }), 1000, [eqObj('valve', [50, 150, 150, 250])],
+  );
+  check('人体框与设备框重叠 → near_equipment', near.arm.near_equipment === true);
+
+  // 有设备框、但框没盖住人 → ROI 重叠仍参与（union）。
+  // 检测框只框设备本体，人在面板前时与框的重叠很小，不能因此丢掉 ROI 证据。
+  const unionRoi = new SignalEngine(both).update(
+    eqPerson({ bbox: [50, 150, 150, 250] }), 1000, [eqObj('valve', [300, 300, 400, 400])],
+  );
+  check('有框但人体框与 ROI 重叠 → near_equipment（取较大值）',
+    unionRoi.arm.near_equipment === true,
+    `overlap=${unionRoi.arm.near_equipment_overlap?.toFixed(3)}`);
+
+  // fail-closed：配了设备类别、明确关闭 ROI 兜底时，本帧没框就「没有物体证据」，一律不判。
+  // 这是让硬负例（街景里有人走过 ROI）不再误报 operating 的开关。
+  const closed = {
+    signals: { arm: { operating: {
+      roi: { x: 0.1, y: 0.3, w: 0.2, h: 0.2 },
+      equipmentLabels: ['valve'], equipmentMinScore: 0.3,
+      equipmentFallbackRoi: false,
+    } } },
+  };
+  const closedNoBox = new SignalEngine(closed).update(eqPerson(), 1000, []);
+  check('fail-closed：无设备框 → operating=false（即使 ROI 里有手）',
+    closedNoBox.arm.operating_any === false, `any=${closedNoBox.arm.operating_any}`);
+  check('fail-closed：无设备框 → near_equipment=false',
+    closedNoBox.arm.near_equipment === false && !Number.isFinite(closedNoBox.arm.near_equipment_overlap));
+  const closedWithBox = new SignalEngine(closed).update(eqPerson(), 1000, [eqObj('valve', [50, 150, 150, 250])]);
+  check('fail-closed：有设备框仍照常判 operating', closedWithBox.arm.operating_any === true);
+  const closedNear = new SignalEngine(closed).update(
+    eqPerson({ bbox: [0, 150, 100, 300] }), 1000, [eqObj('valve', [50, 150, 150, 250])],
+  );
+  check('fail-closed：有设备框仍算 near_equipment', closedNear.arm.near_equipment === true);
+  const closedRoiOnly = new SignalEngine(closed).update(
+    eqPerson({ bbox: [50, 150, 150, 250] }), 1000, [eqObj('valve', [300, 300, 400, 400])],
+  );
+  check('fail-closed：有框但人体框只与 ROI 重叠 → near_equipment=false',
+    closedRoiOnly.arm.near_equipment === false,
+    `overlap=${closedRoiOnly.arm.near_equipment_overlap?.toFixed(3)}`);
+  check('默认（true）保持旧行为：无框退回 ROI',
+    new SignalEngine(both).update(base, 1000, []).arm.operating_any === true);
+}
+
+// —— 32. 多边形 ROI / 人框有效性 ——
+console.log('\n[32] 多边形 ROI 与人框有效性');
+{
+  const opPerson = (kp, o = {}) => ({ ...person(kp, 0.9), frame_w: 500, frame_h: 500, ...o });
+  const square = [[0.1, 0.3], [0.3, 0.3], [0.3, 0.5], [0.1, 0.5]];
+  const zone = (id, points) => ({ id, points });
+  const polyCfg = (extra = {}) => ({
+    signals: { arm: { operating: { rois: [zone('panel', square)], ...extra } } },
+  });
+
+  const sPoly = new SignalEngine(polyCfg()).update(opPerson(standKp), 1000);
+  check('多边形 ROI 与旧矩形等价 → operating', sPoly.arm.operating_any === true
+    && sPoly.arm.operating_roi_zone === 'panel', `zone=${sPoly.arm.operating_roi_zone}`);
+  check('armPose 标出 polygon mode 与 zone 数',
+    sPoly.armPose.operating_roi_mode === 'polygon' && sPoly.armPose.operating_roi_zones === 1);
+
+  const sSecond = new SignalEngine({
+    signals: { arm: { operating: { rois: [
+      zone('far', [[0.8, 0.8], [0.9, 0.8], [0.9, 0.9], [0.8, 0.9]]),
+      zone('near', square),
+    ] } } },
+  }).update(opPerson(standKp), 1000);
+  check('多 zone 任一命中，并报出 zone id',
+    sSecond.arm.operating_any === true && sSecond.arm.operating_roi_zone === 'near');
+
+  const sPrefer = new SignalEngine({
+    signals: { arm: { operating: {
+      roi: { x: 0.8, y: 0.8, w: 0.1, h: 0.1 },
+      rois: [zone('near', square)],
+    } } },
+  }).update(opPerson(standKp), 1000);
+  check('rois 非空时忽略旧 roi', sPrefer.arm.operating_any === true);
+
+  const sInvalid = new SignalEngine({
+    signals: { arm: { operating: {
+      roi: square ? { x: 0.1, y: 0.3, w: 0.2, h: 0.2 } : null,
+      rois: [{ id: 'bad', points: [[0, 0], [1, 0]] }],
+    } } },
+  }).update(opPerson(standKp), 1000);
+  check('非空非法 rois fail-closed（不退回旧 roi）',
+    sInvalid.arm.operating_any === false && sInvalid.armPose.operating_roi === false);
+
+  const sEmpty = new SignalEngine({
+    signals: { arm: { operating: {
+      roi: { x: 0.1, y: 0.3, w: 0.2, h: 0.2 }, rois: [],
+    } } },
+  }).update(opPerson(standKp), 1000);
+  check('空 rois 回退旧矩形', sEmpty.arm.operating_any === true);
+
+  const sNoDim = new SignalEngine(polyCfg()).update(opPerson(standKp, { frame_w: 0, frame_h: 0 }), 1000);
+  check('多边形 ROI 缺帧尺寸 → 不猜', sNoDim.arm.operating_any === false
+    && sNoDim.armPose.operating_roi === true);
+
+  // 手在 zone 里但抬臂角不满足：operating=false 时不能上报命中的 zone（诊断不能带偏）
+  const highKp = standKp.map((p, i) => (i === 5 || i === 6 ? [p[0], 40, 1] : p));
+  const highZone = [[0.1, 0.08], [0.3, 0.08], [0.3, 0.2], [0.1, 0.2]];
+  const sHigh = new SignalEngine({
+    signals: { arm: { operating: { rois: [zone('high', highZone)] } } },
+  }).update(opPerson(highKp), 1000);
+  check('operating 不成立时不报 zone',
+    sHigh.arm.operating_any === false && sHigh.arm.operating_roi_zone === null,
+    `any=${sHigh.arm.operating_any} zone=${sHigh.arm.operating_roi_zone}`);
+
+  // near_equipment：多边形重叠与来源
+  const nearPoly = new SignalEngine(polyCfg()).update(
+    opPerson(standKp, { bbox: [50, 150, 150, 250] }), 1000,
+  );
+  check('near_equipment 多边形重叠 → true / source=polygon',
+    nearPoly.arm.near_equipment === true
+    && nearPoly.arm.near_equipment_source === 'polygon'
+    && nearPoly.arm.near_equipment_zone === 'panel',
+    `${nearPoly.arm.near_equipment_source}/${nearPoly.arm.near_equipment_zone}`);
+
+  const nearSecond = new SignalEngine({
+    signals: { arm: { operating: { rois: [
+      zone('small', [[0.1, 0.3], [0.15, 0.3], [0.15, 0.35], [0.1, 0.35]]),
+      zone('big', square),
+    ] } } },
+  }).update(opPerson(standKp, { bbox: [50, 150, 150, 250] }), 1000);
+  check('near_equipment 多 zone 取最大重叠 id',
+    nearSecond.arm.near_equipment_zone === 'big',
+    `${nearSecond.arm.near_equipment_zone}/${nearSecond.arm.near_equipment_overlap}`);
+
+  // 设备框 + 多边形 union
+  const union = new SignalEngine({
+    signals: { arm: { operating: {
+      rois: [zone('panel', square)],
+      equipmentLabels: ['valve'], equipmentMinScore: 0.3,
+    }, nearEquipment: { minOverlap: 0.2 } } },
+  }).update(opPerson(standKp, { bbox: [50, 150, 150, 250] }), 1000,
+    [{ label: 'valve', score: 0.9, box: [300, 300, 400, 400] }]);
+  check('设备框与多边形 union（框远仍看 ROI）',
+    union.arm.near_equipment === true && union.arm.near_equipment_source === 'polygon');
+
+  const closed = new SignalEngine({
+    signals: { arm: { operating: {
+      rois: [zone('panel', square)], equipmentLabels: ['valve'],
+      equipmentFallbackRoi: false,
+    } } },
+  }).update(opPerson(standKp), 1000, []);
+  check('fail-closed 下多边形不参与', closed.arm.operating_any === false
+    && closed.arm.near_equipment === false);
+
+  // 人框有效性门：默认关；开启后挡过小/满屏/低躯干
+  const validCfg = (o = {}) => ({
+    signals: { arm: { operating: { roi: { x: 0.1, y: 0.3, w: 0.2, h: 0.2 } },
+      nearEquipment: { minOverlap: 0.3, validity: { enabled: true, ...o } } } },
+  });
+  const small = new SignalEngine(validCfg()).update(
+    opPerson(standKp, { bbox: [50, 150, 60, 160] }), 1000,
+  );
+  check('validity：过小人框 → near_equipment=false',
+    small.arm.near_equipment === false
+    && small.arm.near_equipment_validity.reasons.includes('too_small'),
+    small.arm.near_equipment_validity.reasons.join(','));
+
+  const large = new SignalEngine(validCfg()).update(
+    opPerson(standKp, { bbox: [0, 0, 500, 500] }), 1000,
+  );
+  check('validity：满屏人框 → near_equipment=false',
+    large.arm.near_equipment === false
+    && large.arm.near_equipment_validity.reasons.includes('too_large'));
+
+  const noHipKp = standKp.map((p, i) => (i === 7 || i === 8 ? [p[0], p[1], 0.05] : p));
+  const lowTorso = new SignalEngine(validCfg({ minTorsoVis: 0.3 })).update(
+    opPerson(noHipKp, { bbox: [50, 150, 150, 250] }), 1000,
+  );
+  check('validity：低躯干可见度 → near_equipment=false',
+    lowTorso.arm.near_equipment === false
+    && lowTorso.arm.near_equipment_validity.reasons.includes('low_torso'));
+
+  const okBox = new SignalEngine(validCfg()).update(
+    opPerson(standKp, { bbox: [50, 150, 150, 250] }), 1000,
+  );
+  check('validity：合法人框 → near_equipment=true',
+    okBox.arm.near_equipment === true && okBox.arm.near_equipment_validity.ok === true);
+
+  const offBox = new SignalEngine({
+    signals: { arm: { operating: { roi: { x: 0.1, y: 0.3, w: 0.2, h: 0.2 } } } },
+  }).update(opPerson(standKp, { bbox: [50, 150, 60, 160] }), 1000);
+  check('validity 默认关闭 → 旧行为（小框也 true）',
+    offBox.arm.near_equipment === true && offBox.arm.near_equipment_validity === null);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

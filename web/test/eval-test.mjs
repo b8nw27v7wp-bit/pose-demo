@@ -6,7 +6,7 @@
 // 它不验证真实场景精度——那需要实拍素材（PLAN §12.3 A）。
 
 import {
-  replay, evaluateClip, toTimeline, summarize, toMarkdown,
+  replay, personsFromFrame, evaluateClip, toTimeline, summarize, toMarkdown,
   autoLabelClip, loadFrames, parseSegment, pairsFromDir,
   wilson, postureConfusion, armCooccurrence, groupSummaries,
   evaluateGates, sweepVariants, diffSummary, compareSummaries, compareSegments,
@@ -18,7 +18,7 @@ import { DEFAULT_PARAMS, mergeParams, profileParams, profileName, paramsHash } f
 import { SignalEngine } from '../js/signals.js';
 import { ActionEngine } from '../js/actions.js';
 import { videoTimeMonotonic } from './frame-io.mjs';
-import { ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
+import { ARM_ACTIONS, REP_ACTIONS, POSTURE_IDS } from '../js/actions.js';
 import { writeFile, readFile, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -415,6 +415,32 @@ console.log('\n[11] 负例语法');
   check('noArm 的误报归到 armRaised', noArmBad.segments[0].fail.falseAlarms.includes('armRaised'));
   check('noArm 不把站立算成误报', !noArmBad.segments[0].fail.falseAlarms.includes('stand'));
 
+  // near_equipment 是上下文事件，不是手臂动作：它成立时 noArm 仍应通过，
+  // 也不该被记进 noArm 的误报来源（否则「站在设备旁不动」会被当成手臂误报）。
+  {
+    // ROI 只盖住人物框上部（不与腕/肘重叠）：near_equipment 成立，但 operating 的
+    // 手/肘判据不成立，才能单独验证「上下文事件不算手臂动作」。
+    const roi = { x: 0, y: 0, w: 1, h: 0.3 };
+    const params = {
+      signals: { arm: { operating: { roi }, nearEquipment: { minOverlap: 0.2 } } },
+      actions: { holds: { nearEquipment: 1000 } },
+    };
+    const recsNear = [];
+    for (let i = 0; i < 40; i++) {
+      recsNear.push({ ...frame(i * 100, STAND), frame_w: 400, frame_h: 400 });
+    }
+    const tlNear = replay(recsNear, params);
+    const last = tlNear[tlNear.length - 1];
+    check('合成帧：near_equipment 成立', last.act.flags.nearEquipment === true);
+    check('合成帧：除上下文外没有手臂动作',
+      !Object.entries(last.act.flags).some(([k, v]) => k !== 'nearEquipment' && v));
+    const noArmNear = evaluateClip(
+      recsNear, { segments: [{ action: 'noArm', start: 0, end: 3900 }] }, tlNear,
+    );
+    check('near_equipment 不算 noArm 误报', noArmNear.segments[0].pass === true,
+      JSON.stringify(noArmNear.segments[0].fail?.falseAlarms));
+  }
+
   // 单动作反例只把目标动作记成 FP，不牵连同时成立的 stand
   const hips = recs.map((f) => ({ ...f, persons: [{ ...f.persons[0], kp: ONHIPS }] }));
   const tlHips = replay(hips);
@@ -689,8 +715,13 @@ console.log('\n[19] 混淆矩阵');
   };
   const conf = postureConfusion(tl, labels, recs);
   const idx = (name) => conf.labels.indexOf(name);
-  check('矩阵是 3×3 且标签固定（stand/sit/none）', conf.labels.length === 3 && conf.matrix.length === 3
-    && conf.matrix.every((r) => r.length === 3), `labels=${conf.labels}`);
+  // 标签从注册表派生（站/坐/上半身直立/上半身前倾 + none），新增姿态时这里自动跟上
+  const confN = POSTURE_IDS.length + 1;
+  check(`矩阵是 ${confN}×${confN} 且标签覆盖注册表姿态 + none`,
+    conf.labels.length === confN && conf.matrix.length === confN
+    && conf.matrix.every((r) => r.length === confN)
+    && POSTURE_IDS.every((id) => conf.labels.includes(id))
+    && conf.labels.includes('none'), `labels=${conf.labels}`);
   check('统计到姿态帧', conf.frames > 0, `frames=${conf.frames}`);
   check('stand 行对角线最大', conf.matrix[idx('stand')][idx('stand')]
     >= Math.max(...conf.matrix[idx('stand')]),
@@ -1689,6 +1720,56 @@ console.log('\n[29] 多人评估口径');
   } finally {
     await rm(tmp, { recursive: true, force: true }).catch(() => {});
   }
+
+  // —— operating 的离线回放：导出必须带帧尺寸 ——
+  // ROI 是归一化坐标，回放时没有 frame_w/frame_h 就无法换算像素，operating 恒为 false。
+  const opFrame = (dims = true) => ({
+    ts: 1000, video_time: 1,
+    persons: [{
+      track_id: 0, bbox: [0, 0, 1, 1], kp: STAND, scale: 100, score: 0.9,
+      ...(dims ? { frame_w: 500, frame_h: 500 } : {}),
+    }],
+  });
+  const opParams = { signals: { arm: { operating: { roi: { x: 0.1, y: 0.3, w: 0.2, h: 0.2 } } } } };
+  check('personsFromFrame 保留帧尺寸', personsFromFrame(opFrame())[0].frame_w === 500);
+  const opTl = replay([opFrame()], opParams);
+  check('有帧尺寸 → operating 可离线回放', opTl[0].sig.arm.operating_any === true,
+    `any=${opTl[0].sig.arm.operating_any}`);
+  const noDimTl = replay([opFrame(false)], opParams);
+  check('缺帧尺寸 → 不猜（operating=false）', noDimTl[0].sig.arm.operating_any === false);
+
+  // 多边形 ROI 与旧矩形走同一套离线回放；rois 非空时旧 roi 不参与。
+  const polyParams = {
+    signals: { arm: { operating: {
+      rois: [{ id: 'panel', points: [[0.1, 0.3], [0.3, 0.3], [0.3, 0.5], [0.1, 0.5]] }],
+    } } },
+  };
+  const polyTl = replay([opFrame()], polyParams);
+  check('多边形 ROI 离线回放', polyTl[0].sig.arm.operating_any === true
+    && polyTl[0].sig.arm.operating_roi_zone === 'panel');
+  const polyNoDim = replay([opFrame(false)], polyParams);
+  check('多边形 ROI 缺帧尺寸 → false', polyNoDim[0].sig.arm.operating_any === false);
+
+  const headFrame = {
+    ...opFrame(),
+    persons: [{ ...opFrame().persons[0], kp_head: Array.from({ length: 9 }, () => [320, 220, 0.9]) }],
+  };
+  check('personsFromFrame 保留 kp_head',
+    personsFromFrame(headFrame)[0].kp_head?.length === 9);
+
+  // 离线回放也要把 frames[].objects 传给信号层，否则有设备检测框的 profile 在评估器里失效
+  const eqFrame = {
+    ...opFrame(),
+    objects: [{ label: 'valve', score: 0.9, box: [50, 150, 150, 250] }],
+  };
+  const eqParams = {
+    signals: { arm: { operating: {
+      roi: null, equipmentLabels: ['valve'], equipmentMinScore: 0.3,
+    } } },
+  };
+  const eqTl = replay([eqFrame], eqParams);
+  check('离线回放把 objects 传给信号层', eqTl[0].sig.arm.operating_any === true,
+    `any=${eqTl[0].sig.arm.operating_any}`);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

@@ -1,0 +1,32 @@
+{
+  "name": "refuel-strict",
+  "model": "full",
+  "note": "refuel 基线的实验变体：只额外开启 near_equipment 的人框有效性门（挡过小/满屏/大半出画/低躯干）。用于同一份导出上的 A/B；未验证前不要把它当成新的默认。",
+  "params": {
+    "signals": {
+      "arm": {
+        "operating": {
+          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 },
+          "minElbowVis": 0.21,
+          "minElbowReach": 0.315
+        },
+        "nearEquipment": {
+          "minOverlap": 0.5,
+          "validity": {
+            "enabled": true,
+            "minAreaRatio": 0.005,
+            "minHeightRatio": 0.2,
+            "minInFrame": 0.5,
+            "minTorsoVis": 0.3
+          }
+        }
+      }
+    },
+    "actions": {
+      "holds": {
+        "operating": 1500,
+        "operatingMaxGap": 600
+      }
+    }
+  }
+}

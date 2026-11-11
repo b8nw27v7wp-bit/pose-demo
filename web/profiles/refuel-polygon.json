@@ -1,0 +1,35 @@
+{
+  "name": "refuel-polygon",
+  "model": "full",
+  "note": "refuel 的多边形 ROI 示例：这里的单一 zone 与 refuel.json 的矩形完全等价，用来验证 rois 接线；实际换机位时按设备形状改 points（归一化 0~1，简单多边形，rois 非空时旧 roi 不参与）。",
+  "params": {
+    "signals": {
+      "arm": {
+        "operating": {
+          "rois": [
+            {
+              "id": "panel",
+              "points": [
+                [0.42, 0.08],
+                [0.98, 0.08],
+                [0.98, 0.94],
+                [0.42, 0.94]
+              ]
+            }
+          ],
+          "minElbowVis": 0.21,
+          "minElbowReach": 0.315
+        },
+        "nearEquipment": {
+          "minOverlap": 0.5
+        }
+      }
+    },
+    "actions": {
+      "holds": {
+        "operating": 1500,
+        "operatingMaxGap": 600
+      }
+    }
+  }
+}

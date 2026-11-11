@@ -21,9 +21,11 @@
       "bbox": [20.2, 333, 101.9, 737],   // 像素 [x1,y1,x2,y2]
       "kp_format": "mediapipe33",   // 声明式：见下方格式表
       "kp": [[65.1, 342.2, 1], ...],// 13 个点，顺序见 kpt.js 的 KPT，像素坐标 + 置信度
+      "kp_head": [[65.1, 300.2, 0.99], ...], // 可选：9 个头部点（鼻/眼/耳，顺序见 kpt.js 的 HEAD_KPT），像素 + 可见度；旧导出没有它时 PPE 退回鼻尖
       "kp_world": [[0.02, -0.48, 0.1], ...], // 可选：MediaPipe worldLandmarks，33 点米制 3D
       "scale": 127.22,              // 尺度锚点，像素：肩中点↔髋中点距离（躯干长）
-      "score": 0.94                 // 该人画面内关键点的平均置信度（出画的点不计入）
+      "score": 0.94,                // 该人画面内关键点的平均置信度（出画的点不计入）
+      "frame_w": 484, "frame_h": 272 // 可选：帧尺寸。operating 的归一化 ROI 离线回放需要它
     }
   ],
   "signals": {                      // 信号层输出（可重算，落盘便于回放与调试）
@@ -37,17 +39,35 @@
     "leg_vertical_2d": 1.29,
     "leg_vertical_3d": 1.91,        // 注意：3D 用 scale_world，量纲与 2D 不同
     "scale_world": 0.48,            // 世界躯干长（米）
+    "legs_visible": true,           // 膝角与腿竖直比是否都有值（false = 站/坐不可判）
+    "upper_body": false,            // 肩+髋可信、腿不足：动作层据此判上半身直立/前倾
     "knee_vel": -12.4,              // 角速度（度/秒）
     "angle_source": { "knee_L": "3d", "knee_R": "3d", "elbow_L": "2d", "...": "..." },
     "extrapolated": [],             // 本帧按最后速度外推的点
-    "bones_ok": { "foreArm_L": true, "thigh_R": false, "...": true }
+    "bones_ok": { "foreArm_L": true, "thigh_R": false, "...": true },
+    // 操作设备：ROI 是否配置 + 手/肘判据的逐侧原始布尔（动作层的 operating 还要过 800ms 保持窗）
+    "operating_roi": true,
+    "operating_L": false, "operating_R": true,
+    "operating_elbow_L": false, "operating_elbow_R": false,
+    "operating_any": true,
+    "operating_equipment": false,   // 本帧是否有设备检测框（false=operating 退回 ROI）
+    // 多边形/多区域 ROI 的诊断（rect/旧导出为 null/0）
+    "operating_roi_mode": "polygon",   // none|rect|polygon
+    "operating_roi_zones": 2,
+    "operating_roi_zone": "panel",     // 本帧腕/肘命中的 zone id；用设备框时为 null
+    // 在设备旁（上下文）：人体框落在「设备框或 ROI」里的比例（取较大值）/ 是否成立（≥minOverlap 且两肩可见）
+    "near_equipment": false,
+    "near_equipment_overlap": 0.42,
+    "near_equipment_zone": "panel",    // 多边形 ROI 重叠最大的 zone id
+    "near_equipment_source": "polygon",// equipment|rect|polygon|null
+    "near_equipment_validity": null    // 开启 validity 时为 {enabled,ok,area_ratio,...,reasons}
   },
   "actions": {                      // 规则层输出
-    "posture": "stand",             // stand|sit；证据不足时为 null（如只有上半身）。躺卧/下蹲已下线
+    "posture": "stand",             // stand|sit|upper_upright|upper_lean；连髋都不可见时为 null。躺卧/下蹲已下线
     "flags": {
       "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
       "onHips": false, "armsOpen": false, "handAtHead": false,
-      "reaching": false, "carrying": false, "pointing": false,
+      "reaching": false, "carrying": false, "operating": false, "pointing": false,
       "armFront": false, "armSide": false,
       // 逐侧粒度：单手动作额外给出是哪只手；聚合 flag 保持旧语义
       "armRaisedL": false, "armRaisedR": false,
@@ -55,7 +75,9 @@
       "reachingL": false, "reachingR": false,
       "pointingL": false, "pointingR": false,
       "handAtHeadL": false, "handAtHeadR": false,
-      "carryingL": false, "carryingR": false
+      "carryingL": false, "carryingR": false,
+      "operatingL": false, "operatingR": false,
+      "nearEquipment": false
     },
     "reps": { "clap": 0, "grasp": 0 },   // 深蹲/俯卧撑计数已下线
     // 判定不可靠的原因（不是动作）：低置信 / 外推 / 骨骼异常 / 角度坏点
@@ -96,9 +118,16 @@
                     "alert": "violation", // none|suspect|violation（missing 持续 ≥ minMs 才升级）
                     "streak_ms": 3200,    // 连续 missing 的累计时长；unknown 时暂停不清零
                     "reason": "未戴",      // 可选：人可读原因（旧版就有）
-                    "reason_code": "config_mismatch" }, // 可选：no_positive|config_mismatch|occluded
+                    "reason_code": "config_mismatch", // 可选：no_positive|config_mismatch|occluded
+                    "source": "face",      // 可选：face|nose|bbox（头部区域来源）
+                    "box": [200, 80, 280, 160] }, // 可选：头部区域像素框
         "glove":  { "state": "unknown", "alert": "none", "streak_ms": 0,
-                    "reason_code": "occluded" }
+                    "reason_code": "occluded",
+                    // 可选：逐侧几何诊断；没有手时 source=wrist
+                    "L": { "state": "worn", "alert": "none", "streak_ms": 0,
+                           "source": "hand", "side_from": "slot", "box": [90, 200, 130, 240] },
+                    "R": { "state": "unknown", "alert": "none", "streak_ms": 0,
+                           "source": "wrist", "side_from": "pose", "box": [150, 200, 190, 240] } }
       }
     }
   ],
@@ -141,6 +170,8 @@
 |---|---|---|
 | `kp[][0..1]` | 像素 | 相对原始视频分辨率（不是 CSS 尺寸），原点左上 |
 | `kp[][2]` | 0~1 | 置信度；< 0.3 的点不参与滤波与角度计算 |
+| `kp_head[][0..1]` | 像素 | 可选：9 个头部点（鼻/眼/耳），供 PPE 头部区域使用 |
+| `kp_head[][2]` | 0~1 | 头部点的 MediaPipe visibility |
 | `kp_world[][0..2]` | 米 | MediaPipe worldLandmarks：原点髋中心，**y 向下为正** |
 | `scale` | 像素 | 躯干长；2D 距离阈值的除数（保持像素以兼容既有数据） |
 | `scale_world` | 米 | 世界躯干长；3D 距离/比值的除数 |
@@ -239,8 +270,9 @@
 
 - `meta.export_mode = "multi"` 时 `persons[]` 是**全部判定人员**（不是只有主目标）；
   `signals` / `actions` 仍只描述主目标，逐人结果看 `verdicts[]`。
-- 几何（`kp` / `kp_world` / `scale` / `score`）**只在 `persons[]` 里存一份**；
-  `verdicts[]` 通过 `track_id` 关联，不重复存，避免导出体积翻倍。
+- 几何（`kp` / `kp_head` / `kp_world` / `scale` / `score`）**只在 `persons[]` 里存一份**；
+  `verdicts[]` 通过 `track_id` 关联，不重复存，避免导出体积翻倍。`kp_head` 可选
+  （9 点），旧导出没有它时 PPE 头部区域退回鼻尖。
 - `verdicts[].hands` 是该 track 被归属到的手（与帧级 `hands[]` 同结构）；
   帧级 `hands[]` 仍是整帧检出的全部手，供归属与手势评估重算。
 - `track_id` 在跟踪器丢失超过 1.5s 后会变化；`track_uid`（若存在）由跟踪器在轨迹创建时分配，

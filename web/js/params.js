@@ -48,6 +48,10 @@ export const DEFAULT_PARAMS = {
     velocity: { minCutoff: 3.0, beta: 0.05, minDtMs: 8, maxDtMs: 500 },
     // 短时遮挡外推：可见性掉下去但不超过这个时长时，按最后速度外推并标记 extrapolated
     occlusion: { maxExtrapMs: 300 },
+    // 上半身姿态的几何门：人体上半身框通常「高于宽」。横着的框多半是手臂/设备特写
+    // 被模型当成人（refuel 样例实测：手+油枪特写 bbox 220×147、scale 100，被凑成躯干）。
+    // minAspect = 高/宽 的下限；bbox 缺失时不设门。
+    upperBody: { minAspect: 0.9 },
     wave: {
       windowMs: 800,      // 挥手判定回看窗口
       deadzone: 0.10,     // 相邻帧水平位移小于此值（单位 scale）不计翻转
@@ -75,6 +79,60 @@ export const DEFAULT_PARAMS = {
       azimuth: { frontMax: 35, sideMin: 55, minElev: 60, maxElev: 120, minReach: 0.85 },
       // 持物：手闭合且臂未伸出
       carry: { maxReach: 1.2 },
+      // 操作设备（阀门/仪表）：手在设备区域内、肩以下、不是自然下垂。
+      // roi 是归一化画面坐标 {x,y,w,h}（0~1）；固定机位把它设成阀门/面板区域。
+      // **roi=null 时这个动作不判**：没有设备位置就只剩「伸手」这一条弱证据，
+      // 在普通视频里会把拿东西/扶栏杆误报成操作设备（宁可弃权）。
+      // minElev=90：0°=手在肩上方，90°=水平，180°=正下方；操作阀门多在 90~180。
+      // minShoulderVis 用两肩最低可见度挡住「只看到一只手臂」的误检。
+      operating: {
+        minReachRoi: 0.65,
+        minElev: 90,
+        maxElev: 179,
+        minShoulderVis: 0.4,
+        // 手被设备挡住时用肘兜底：肘在 ROI 内、离肩够远、不是垂在身侧。
+        // 肘比整个人框更接近「手臂在设备上」，误报比「人在 ROI 里」低得多。
+        minElbowVis: 0.3,
+        minElbowReach: 0.35,
+        minElbowElev: 60,
+        roi: null,
+        // 多边形/多区域 ROI：rois 非空时完全忽略上面的 roi（换机位按设备形状圈）。
+        // 每个 zone: { id, points: [[x,y],...] }，归一化 0~1；未配置时保持旧行为。
+        rois: [],
+        // 设备检测框（可选）：物体检测器输出这些类别时，优先用「腕/肘到框的距离」，
+        // ROI 只作检测不到时的兜底。空数组 = 只用 ROI（当前默认，因为还没有阀门模型）。
+        equipmentLabels: [],
+        equipmentMinScore: 0.35,
+        // 点到检测框边缘的距离 / scale；框内为 0。0.35 ≈ 躯干长的 35%。
+        equipmentMaxDist: 0.35,
+        // 配了 equipmentLabels 但本帧没检出设备框时，是否退回人工 ROI。
+        // true（默认）= 旧行为：检测器漏检时仍靠 ROI 判，召回稳，但**没有物体证据**
+        //   （硬负例里只要 ROI 里有人走过就会命中；实测见 docs/equipment-detector.md §6）。
+        // false = 失败即不判（fail-closed）：这一帧没有设备框就 both operating / near_equipment
+        //   都不成立。这是「物体证据」真正生效的开关，代价是检测器漏检直接变 FN。
+        equipmentFallbackRoi: true,
+      },
+      // 在设备旁（上下文事件）：只回答「人站在设备区域里」，**不要**把它并进 operating。
+      // 曾经把「人体框与 ROI 重叠」当 operating 的兜底，refuel 上 233/249 条判定都成立，太宽。
+      // 单独作为两级事件后，它可以补「手被设备挡住」时的上下文，但不代表在操作。
+      // minOverlap：人体框面积落在 ROI 内的比例；minShoulderVis：挡掉只检出手臂/设备的特写误检。
+      nearEquipment: {
+        minOverlap: 0.3,
+        minShoulderVis: 0.4,
+        // 人体框竖直门：挡掉横向的手臂/设备特写；但也会挡掉「只见手臂」的真作业镜头。
+        // refuel 演示片可关掉换取召回，代价是特写误报会变多（见 docs/signals.md）。
+        requireUprightBox: true,
+        // 人体框有效性门（默认关，保持旧行为）：挡掉过小/满屏/大半出画的「人框」。
+        // person.bbox 由全部 33 点取极值，含不可见/出画点，in_frame 天生偏低，
+        // 所以 minInFrame 默认只取 0.5；不要在没修 bbox 的前提下收紧。
+        validity: {
+          enabled: false,
+          minAreaRatio: 0.003, maxAreaRatio: 0.9,
+          minHeightRatio: 0.15, maxHeightRatio: 1.5,
+          minInFrame: 0.5,
+          minShoulderVis: 0.4, minTorsoVis: 0.3,
+        },
+      },
     },
     hand: {
       // 判定为「握住」的手势。ok/gun 是捏取，也算能拿东西
@@ -144,6 +202,26 @@ export const DEFAULT_PARAMS = {
       visMin: 0.3,
       headBoxScale: 0.55,   // 头部区域半边长 / 躯干长
       gloveBoxScale: 0.45,  // 腕部区域半边长 / 躯干长
+      // 头部区域优先用 9 个脸/耳关键点（kp_head）：鼻尖不可见但耳朵可见时仍能判。
+      // 旧导出/测试没有 kp_head 时自动退回鼻尖与旧几何。
+      headFace: {
+        enabled: true,
+        visMin: 0.3,
+        minPoints: 2,
+        minSpread: 0.12,     // × scale：太窄的两点不足以定中心
+        maxPointDist: 1.0,   // × scale：剔除漂移的耳朵
+        bothSides: true,     // 左右两侧都要有点；单侧容易把中心拉偏
+        shift: 0.25,         // × half：向上覆盖额头/帽檐
+        halfMul: 1.0,        // × headBoxScale
+      },
+      // 手套区域优先用手部 21 点 bbox；手没检出/没归属时退回腕点方框。
+      gloveHand: {
+        enabled: true,
+        pad: 0.15,           // × hand bbox 长边
+        minScore: 0,         // hand.score 是 handedness 置信度，不是检出置信度
+        maxWristDist: 0.8,   // × scale，与 assignHands 的 maxDist 一致
+        fallbackWrist: true,
+      },
       // 本场从未检出过该类正例 → 只报 unknown。模型类别名写错时防止满屏误报。
       requirePositive: true,
       // R13-5：物体框归属给人的方式（预留，物体线尚未接线，本轮只加键）。
@@ -177,6 +255,15 @@ export const DEFAULT_PARAMS = {
       // 'auto' 预留给「连续 N 帧检出 <1 人时启用平铺一段」的自适应逻辑（本轮只加键）。
       tileMode: 'off',
     },
+    // 单人道漏检补救：VIDEO 模式没检出人时，用 IMAGE 模式（detConf 0.3）在同一帧补检一次。
+    // VIDEO 模式的模型内跟踪在正常帧上更稳，所以只在漏检帧付这次推理，不替换主路径。
+    // 典型收益：半身/贴边/小目标（工人被设备挡住一半）从 0 人变成能判上半身动作。
+    // fallbackMinScore 用 toPersons 的平均可见度（画面内点）过滤「把设备当人」的误检。
+    single: {
+      fallback: true,
+      fallbackMinScore: 0.45,
+    },
+
     objects: {
       enabled: false,                 // 物体检测（PPE 需要它；默认关，省 GPU）
       // backend：'mediapipe' = Tasks .tflite（自带 label map）；'onnx' = 自训 YOLOv8
@@ -212,11 +299,24 @@ export const DEFAULT_PARAMS = {
       // 只保留站/坐：躺卧与下蹲需要膝、踝同时可见，桌面机位/上半身构图判不了。
       sit: { minMs: 450, streak: 5, kneeGt: 55, kneeLt: 135, uprightnessGt: 0.5, legVerticalLt: 1.05 },
       stand: { minMs: 350, streak: 4, uprightnessGt: 0.8, kneeGt: 150, legVerticalGt: 0.8 },
+      // 上半身构图（肩+髋可见、膝/踝不可见）：只判躯干朝向，不冒充站/坐。
+      // uprightGt 以上是「上半身直立」，之下到 leanGt 之间是「上半身前倾」；
+      // leanGt 以下（躯干接近水平或倒置）不判：可能是躺卧，也可能是髋点漂移。
+      // 这两个 id 是**推断**，界面会标「仅上半身可见 · 推断」。
+      upper: { minMs: 350, streak: 4, uprightGt: 0.75, leanGt: 0.0 },
     },
     holds: {
       arm: 300, wave: 150, crossed: 400, hips: 400, open: 400,
       handFace: 350, handChest: 350, bothHandsUp: 350,
       reach: 250, carry: 300, point: 250,
+      // 操作设备是「持续在做」的事件：800ms 才成立，单帧伸手不计。
+      // operatingMaxGap：允许 300ms 内的短暂掉帧/遮挡不重置计时（手腕常被面板挡住）。
+      operating: 800,
+      // 按实际采样间隔校准：两次有效观测间隔超过它会重置（引擎漏调用也算）。
+      // refuel 档用 600ms（回放中位帧间隔 138ms / p90 365ms），300ms 会把长正例段切碎。
+      operatingMaxGap: 300,
+      // 在设备旁是上下文事件：1s 才成立，避免走过/路过时闪一下
+      nearEquipment: 1000,
       // 前/侧平举原本是瞬时布尔：走路摆臂会被 3D 方位角的噪声凑成「前平举」，
       // 实测 45 帧里断续命中 41 帧、最长一段仅 250ms。加保持窗把瞬时误报滤掉。
       front: 300, side: 300,

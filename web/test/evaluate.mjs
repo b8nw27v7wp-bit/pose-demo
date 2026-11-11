@@ -248,10 +248,16 @@ export function personsFromFrame(frame) {
       track_uid: p.track_uid,
       bbox: p.bbox,
       kp: p.kp,
+      // 头部 9 点（可选）：PPE 审计/将来重算头部区域用；signal replay 本身不消费它。
+      kp_head: Array.isArray(p.kp_head) && p.kp_head.length >= 9 ? p.kp_head : null,
       kp_world: Array.isArray(p.kp_world) && p.kp_world.length >= 33 ? p.kp_world : null,
       scale: p.scale,
       score: p.score,
       kp_format: p.kp_format,
+      // 帧尺寸：operating 的归一化设备 ROI 靠它换算像素。旧导出没有该字段时为
+      // undefined，Signals 会按「有 ROI 但不知道帧尺寸」弃权（不猜）。
+      frame_w: p.frame_w ?? frame.frame_w,
+      frame_h: p.frame_h ?? frame.frame_h,
     });
   }
   return out;
@@ -323,7 +329,7 @@ function replaySingle(frames, params) {
       out.push(emptyRow(f.ts));
       continue;
     }
-    const sig = se.update(person, f.ts);
+    const sig = se.update(person, f.ts, Array.isArray(f.objects) ? f.objects : []);
     const act = ae.update(sig, f.ts, person.hands);
     // person 只用于 label.track 的校验与调试，不参与任何指标计算。
     out.push({ ts: f.ts, empty: false, sig, act, person });
@@ -359,7 +365,7 @@ function replayMulti(frames, personsByFrame, trackIds, params) {
         cls: h.cls || { shape: typeof h.shape === 'string' ? h.shape : null, raw: h.shape_raw ?? null },
       }));
     const handsByTrack = assignHands(persons, hands);
-    for (const r of pipes.update(persons, f.ts, handsByTrack)) {
+    for (const r of pipes.update(persons, f.ts, handsByTrack, Array.isArray(f.objects) ? f.objects : [])) {
       if (!perFrame.has(i)) perFrame.set(i, new Map());
       perFrame.get(i).set(r.track_id, {
         ts: f.ts, empty: false, sig: r.sig, act: r.act,
@@ -468,6 +474,12 @@ function activeRanges(series, mergeMs = 0) {
 // 动作清单全部来自 js/actions.js 的注册表，这里不再手抄。
 // 手抄过一次：新增 bothHandsUp/handAtHead 时漏了，标注它们会得到「未知动作名」。
 const FLAG_IDS = ARM_FLAG_IDS;
+// 上下文事件不是「手臂动作」：near_equipment 只回答「人在设备旁」。
+// noArm / none 的反例判定与 FP 归因都要把它排除，否则「站着不动但人在设备旁」
+// 会被当成手臂误报，还会把 FP 记到 near_equipment 的精确率上。
+const CONTEXT_FLAG_IDS = new Set(['nearEquipment']);
+const ARM_ONLY_FLAG_IDS = FLAG_IDS.filter((f) => !CONTEXT_FLAG_IDS.has(f));
+const anyArmFlag = (flags) => ARM_ONLY_FLAG_IDS.some((f) => !!flags?.[f]);
 
 // —— 段语义：正例 / 反例 -------------------------------------------------
 // PLAN §13 R1：没有反例语法，「站着没叉腰」就写不出来，手臂的 precision 永远测不了。
@@ -507,11 +519,11 @@ function seriesOf(timeline, action) {
   if (action === NO_ACTIVITY) {
     return timeline.map((r) => ({
       ts: r.ts,
-      on: !r.empty && (!!r.act.postureId || Object.values(r.act.flags).some(Boolean)),
+      on: !r.empty && (!!r.act.postureId || anyArmFlag(r.act.flags)),
     }));
   }
   if (action === NO_ARM) {
-    return timeline.map((r) => ({ ts: r.ts, on: !r.empty && Object.values(r.act.flags).some(Boolean) }));
+    return timeline.map((r) => ({ ts: r.ts, on: !r.empty && anyArmFlag(r.act.flags) }));
   }
   return null;
 }
@@ -761,12 +773,13 @@ function repDeltas(timeline, range) {
  * 反例段必须能回答这个问题，否则误报只能记在 none 头上，
  * 各动作的 precision 永远是 1，等于没测精度（docs/eval.md 承诺的是归到动作）。
  */
-function culprits(timeline, range, includePosture = true) {
+function culprits(timeline, range, includePosture = true, includeContext = true) {
   const tally = new Map();
   for (const r of timeline) {
     if (r.empty || r.ts < range[0] || r.ts > range[1]) continue;
     if (includePosture && r.act.postureId) tally.set(r.act.postureId, (tally.get(r.act.postureId) || 0) + 1);
     for (const f of FLAG_IDS) {
+      if (!includeContext && CONTEXT_FLAG_IDS.has(f)) continue;
       if (r.act.flags[f]) tally.set(f, (tally.get(f) || 0) + 1);
     }
   }
@@ -1016,11 +1029,12 @@ export function evaluateClip(frames, labels, timeline) {
         // 漏判：当时实际判成了什么，比「没出现」更有信息量（常见是串判到相邻姿态）
         r.fail.observed = culprits(tline, range, true);
       } else if (action === NO_ACTIVITY) {
-        // none 声称「什么都不该发生」：所有在跳的动作/姿态都算误报
-        r.fail.falseAlarms = culprits(tline, range, true);
+        // none 声称「什么都不该发生」：所有在跳的动作/姿态都算误报；
+        // 但 near_equipment 是上下文，不是「动作」。
+        r.fail.falseAlarms = culprits(tline, range, true, false);
       } else if (action === NO_ARM) {
-        // noArm 只追究手臂，站立不算它的错
-        r.fail.falseAlarms = culprits(tline, range, false);
+        // noArm 只追究手臂，站立与上下文事件都不算它的错
+        r.fail.falseAlarms = culprits(tline, range, false, false);
       } else {
         // 单动作反例（!onHips）：只有它自己算误报。
         // 把同时成立的 stand 也记成 FP，会把 stand 的 precision 一起拉低 —— 那并不是 stand 判错了。

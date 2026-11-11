@@ -11,6 +11,10 @@
 //
 // 纯逻辑，Node 可单测。
 
+import { headPointsFromRaw } from './geometry.js';
+
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+
 /**
  * 标签匹配：不区分大小写；配置项按"完全相等或包含"匹配（例如 'safety_helmet' 包含 'helmet'）。
  * positive=true（默认）时负类（no_helmet / no_gloves / not_helmet…）永远不算正类：
@@ -33,16 +37,87 @@ const inBox = (p, b) => p[0] >= b[0] && p[0] <= b[2] && p[1] >= b[1] && p[1] <= 
 const square = (cx, cy, half) => [cx - half, cy - half, cx + half, cy + half];
 
 /**
- * 头部区域：优先用鼻尖 + 躯干长定一个方框；鼻尖不可见时退回人框顶部（站姿/坐姿都成立）。
- * @returns {{box:number[], source:'nose'|'bbox', visible:boolean}}
+ * 头部区域：
+ * 1. 头面部关键点（眼/耳，鼻尖只作旧兜底）→ 方框；
+ * 2. 鼻尖可见 → 旧方框（几何逐位保持不变）；
+ * 3. 人框顶部 → visible=false。
+ *
+ * 背对/低头时鼻尖不可见但双耳通常可见，face 分支能把「看得见帽子」变成 worn/missing，
+ * 而不是直接 unknown。旧导出没有 kp_head/kp_raw 时自动走鼻尖路径。
+ *
+ * @returns {{box:number[], source:'face'|'nose'|'bbox', visible:boolean, points?:number}}
  */
 export function headBox(person, cfg = {}) {
-  const half = (cfg.headBoxScale ?? 0.55) * (person.scale || 0);
-  const nose = person.kp?.[0];
+  const scale = person.scale || 0;
   const visMin = cfg.visMin ?? 0.3;
-  if (nose && nose[2] >= visMin && half > 0) {
+  const halfBase = (cfg.headBoxScale ?? 0.55) * scale;
+  const face = cfg.headFace || {};
+  const faceOn = face.enabled !== false && halfBase > 0;
+
+  if (faceOn) {
+    // 只有完整的 9 点才用；短数组/坏数据不能挡住下面的 kp_raw 兜底。
+    let pts = Array.isArray(person.kp_head) && person.kp_head.length >= 9 ? person.kp_head : null;
+    // 兼容只带 33 点 raw 的调用方（测试/旧导出没有 kp_head 但有 kp_raw）。
+    if (!pts && Array.isArray(person.kp_raw) && person.kp_raw.length >= 33) {
+      pts = headPointsFromRaw(person.kp_raw, person.frame_w, person.frame_h);
+    }
+    if (pts && pts.length >= 9) {
+      const fw = Number(person.frame_w);
+      const fh = Number(person.frame_h);
+      const cand = [];
+      for (let i = 1; i < 9; i++) {
+        const p = pts[i];
+        if (!p || !isNum(p[0]) || !isNum(p[1])) continue;
+        if ((p[2] ?? 0) < (face.visMin ?? visMin)) continue;
+        if (fw > 0 && fh > 0) {
+          const mx = 0.02 * fw;
+          const my = 0.02 * fh;
+          if (p[0] < -mx || p[0] > fw + mx || p[1] < -my || p[1] > fh + my) continue;
+        }
+        cand.push({ x: p[0], y: p[1], side: (i <= 3 || i === 7) ? 'L' : 'R' });
+      }
+      const hasL = cand.some((p) => p.side === 'L');
+      const hasR = cand.some((p) => p.side === 'R');
+      const both = face.bothSides !== false;
+      if (cand.length >= (face.minPoints ?? 2) && (!both || (hasL && hasR))) {
+        // 单帧坏点（尤其耳朵）会把中心拉走：先按均值剔离群点，再重算。
+        const mx = cand.reduce((s, p) => s + p.x, 0) / cand.length;
+        const my = cand.reduce((s, p) => s + p.y, 0) / cand.length;
+        const maxD = (face.maxPointDist ?? 1.0) * scale;
+        const kept = cand.filter((p) => (maxD > 0
+          ? Math.hypot(p.x - mx, p.y - my) <= maxD : true));
+        const keptL = kept.some((p) => p.side === 'L');
+        const keptR = kept.some((p) => p.side === 'R');
+        if (kept.length >= (face.minPoints ?? 2) && (!both || (keptL && keptR))) {
+          const xs = kept.map((p) => p.x);
+          const ys = kept.map((p) => p.y);
+          const spread = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+          if (spread >= (face.minSpread ?? 0.12) * scale) {
+            const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+            const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+            const half = Math.max(
+              halfBase * (face.halfMul ?? 1),
+              Math.min(1.5 * halfBase, 0.6 * spread),
+            );
+            const shift = (face.shift ?? 0.25) * half;
+            if (half > 0) {
+              return {
+                box: [cx - half, cy - half - shift, cx + half, cy + half],
+                source: 'face',
+                visible: true,
+                points: kept.length,
+              };
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const nose = person.kp?.[0];
+  if (nose && nose[2] >= visMin && halfBase > 0) {
     // 鼻尖在头的中下部：往上抬 0.25 个半边长，让框覆盖额头与帽檐
-    return { box: square(nose[0], nose[1] - 0.25 * half, half), source: 'nose', visible: true };
+    return { box: square(nose[0], nose[1] - 0.25 * halfBase, halfBase), source: 'nose', visible: true };
   }
   const b = person.bbox;
   if (Array.isArray(b) && b.length === 4) {
@@ -66,8 +141,111 @@ export function wristBox(person, side, cfg = {}) {
   const idx = side === 'L' ? 5 : 6;
   const w = person.kp?.[idx];
   const visMin = cfg.visMin ?? 0.3;
-  if (!w || w[2] < visMin || half <= 0) return { box: [0, 0, 0, 0], visible: false };
-  return { box: square(w[0], w[1], half), visible: true };
+  if (!w || w[2] < visMin || half <= 0) return { box: [0, 0, 0, 0], visible: false, source: 'wrist' };
+  return { box: square(w[0], w[1], half), visible: true, source: 'wrist' };
+}
+
+const boxValid = (b) => Array.isArray(b) && b.length >= 4 && b.slice(0, 4).every(isNum)
+  && b[2] > b[0] && b[3] > b[1];
+
+function kpBBox(kp) {
+  if (!Array.isArray(kp) || kp.length < 21) return null;
+  let x1 = Infinity; let y1 = Infinity; let x2 = -Infinity; let y2 = -Infinity;
+  for (const p of kp) {
+    if (!Array.isArray(p) || !isNum(p[0]) || !isNum(p[1])) continue;
+    if (p[0] < x1) x1 = p[0];
+    if (p[1] < y1) y1 = p[1];
+    if (p[0] > x2) x2 = p[0];
+    if (p[1] > y2) y2 = p[1];
+  }
+  return x1 === Infinity ? null : [x1, y1, x2, y2];
+}
+
+/**
+ * 手部 21 点 → 手套区域。手 bbox 比腕点方框更贴合；四边再放宽一点，
+ * 覆盖手套/袖口超出关键点的部分。
+ * @returns {{box:number[], visible:boolean, source:'hand'|'none'}}
+ */
+export function handGloveBox(hand, cfg = {}) {
+  const h = cfg.gloveHand || {};
+  if (h.enabled === false || !hand) return { box: [0, 0, 0, 0], visible: false, source: 'none' };
+  if (Number.isFinite(h.minScore) && h.minScore > 0 && (hand.score ?? 0) < h.minScore) {
+    return { box: [0, 0, 0, 0], visible: false, source: 'none' };
+  }
+  const b = boxValid(hand.bbox) ? hand.bbox : kpBBox(hand.kp);
+  if (!boxValid(b)) return { box: [0, 0, 0, 0], visible: false, source: 'none' };
+  const pad = Math.max(0, Number(h.pad ?? 0.15)) * Math.max(b[2] - b[0], b[3] - b[1]);
+  return {
+    box: [b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad],
+    visible: true,
+    source: 'hand',
+  };
+}
+
+const handWrist = (hand) => (hand?.kp?.[0] && Array.isArray(hand.kp[0]) ? hand.kp[0] : null);
+const handList = (hands) => {
+  if (!hands) return [];
+  if (Array.isArray(hands)) return hands;
+  if (Array.isArray(hands.list) && hands.list.length) return hands.list;
+  return [hands.L, hands.R].filter(Boolean);
+};
+
+/**
+ * 每侧手套区域：优先已归属到该 track 的手（hands[side]），否则按最近姿态腕点
+ * 从手列表里挑；都不行才退回腕点方框。
+ *
+ * `used` 是跨左右侧共享的 Set：同一只手不能被两侧各用一次。
+ */
+export function gloveRegion(person, side, cfg = {}, hands = null, used = null) {
+  const h = cfg.gloveHand || {};
+  const fallback = () => ({ ...wristBox(person, side, cfg), side_from: 'pose' });
+  if (h.enabled === false) return fallback();
+
+  const taken = used || new Set();
+  let hand = null;
+  let sideFrom = null;
+
+  if (hands && !Array.isArray(hands) && hands[side] && !taken.has(hands[side])) {
+    hand = hands[side];
+    sideFrom = 'slot';
+  } else {
+    const list = handList(hands).filter((x) => x && !taken.has(x));
+    const target = person.kp?.[side === 'L' ? 5 : 6];
+    const visMin = cfg.visMin ?? 0.3;
+    const scale = person.scale || 0;
+    if (target && target[2] >= visMin && scale > 0) {
+      let best = null;
+      let bestD = Infinity;
+      for (const cand of list) {
+        const w = handWrist(cand);
+        if (!w) continue;
+        const d = Math.hypot(w[0] - target[0], w[1] - target[1]) / scale;
+        if (d < bestD) { bestD = d; best = cand; }
+      }
+      if (best && bestD <= (h.maxWristDist ?? 0.8)) {
+        hand = best;
+        sideFrom = 'nearest_wrist';
+      }
+    }
+    if (!hand) {
+      const want = side === 'L' ? 'Left' : 'Right';
+      const matching = list.filter((x) => x.handedness === want);
+      if (matching.length === 1) {
+        hand = matching[0];
+        sideFrom = 'handedness';
+      }
+    }
+  }
+
+  if (hand) {
+    const gb = handGloveBox(hand, cfg);
+    if (gb.visible) {
+      taken.add(hand);
+      if (used) used.add(hand);
+      return { ...gb, side_from: sideFrom };
+    }
+  }
+  return fallback();
 }
 
 /** 该区域里分最高的匹配框（中心点落区 + 分数门槛） */
@@ -96,55 +274,61 @@ export function assessPpe(person, objects, cfg = {}, ctx = {}) {
   const classes = cfg.classes || {};
   const requirePositive = cfg.requirePositive !== false;
   const saw = ctx.sawClasses || { helmet: false, glove: false };
+  const hands = ctx.hands || null;
+  const usedHands = new Set();
 
   const head = headBox(person, cfg);
   const helmetLabels = classes.helmet || [];
   const noHelmetLabels = classes.noHelmet || [];
   let helmet;
+  const hmeta = { box: head.box, source: head.source };
   if (!helmetLabels.length) {
     helmet = {
-      state: 'unknown', reason: '未配置安全帽类别', reason_code: 'config_mismatch', box: head.box,
+      state: 'unknown', reason: '未配置安全帽类别', reason_code: 'config_mismatch', ...hmeta,
     };
   } else if (!head.visible) {
     helmet = {
-      state: 'unknown', reason: '头部不可见（背影/低头/出画）', reason_code: 'occluded', box: head.box,
+      state: 'unknown', reason: '头部不可见（背影/低头/出画）', reason_code: 'occluded', ...hmeta,
     };
   } else {
     const hit = bestInRegion(objects, head.box, helmetLabels, minScore);
     // 负类框是直接证据：模型明确检出"未戴安全帽"，比"没检出正类"更强
     const neg = !hit && noHelmetLabels.length
       ? bestInRegion(objects, head.box, noHelmetLabels, minScore, { positive: false }) : null;
-    if (hit) helmet = { state: 'worn', reason: '检出安全帽', reason_code: null, box: head.box, obj: hit };
-    else if (neg) helmet = { state: 'missing', reason: '检出未戴安全帽', reason_code: null, box: head.box, obj: neg };
+    if (hit) helmet = { state: 'worn', reason: '检出安全帽', reason_code: null, ...hmeta, obj: hit };
+    else if (neg) helmet = { state: 'missing', reason: '检出未戴安全帽', reason_code: null, ...hmeta, obj: neg };
     else if (requirePositive && !saw.helmet) helmet = {
-      state: 'unknown', reason: '模型本场未检出过安全帽（先确认类别名/模型）', reason_code: 'no_positive', box: head.box,
+      state: 'unknown', reason: '模型本场未检出过安全帽（先确认类别名/模型）', reason_code: 'no_positive', ...hmeta,
     };
-    else helmet = { state: 'missing', reason: '头部可见但区域内无安全帽', reason_code: null, box: head.box };
+    else helmet = { state: 'missing', reason: '头部可见但区域内无安全帽', reason_code: null, ...hmeta };
   }
 
   const gloveLabels = classes.glove || [];
   const noGloveLabels = classes.noGlove || [];
   const glove = {};
   for (const side of ['L', 'R']) {
-    const wb = wristBox(person, side, cfg);
+    const wb = gloveRegion(person, side, cfg, hands, usedHands);
     if (!gloveLabels.length) {
       glove[side] = {
-        state: 'unknown', reason: '未配置手套类别', reason_code: 'config_mismatch', box: wb.box,
+        state: 'unknown', reason: '未配置手套类别', reason_code: 'config_mismatch',
+        box: wb.box, source: wb.source, side_from: wb.side_from,
       };
     } else if (!wb.visible) {
       glove[side] = {
-        state: 'unknown', reason: '该侧腕不可见', reason_code: 'occluded', box: wb.box,
+        state: 'unknown', reason: '该侧腕不可见', reason_code: 'occluded',
+        box: wb.box, source: wb.source, side_from: wb.side_from,
       };
     } else {
       const hit = bestInRegion(objects, wb.box, gloveLabels, minScore);
       const neg = !hit && noGloveLabels.length
         ? bestInRegion(objects, wb.box, noGloveLabels, minScore, { positive: false }) : null;
-      if (hit) glove[side] = { state: 'worn', reason: '检出手套', reason_code: null, box: wb.box, obj: hit };
-      else if (neg) glove[side] = { state: 'missing', reason: '检出未戴手套', reason_code: null, box: wb.box, obj: neg };
+      const meta = { box: wb.box, source: wb.source, side_from: wb.side_from };
+      if (hit) glove[side] = { state: 'worn', reason: '检出手套', reason_code: null, ...meta, obj: hit };
+      else if (neg) glove[side] = { state: 'missing', reason: '检出未戴手套', reason_code: null, ...meta, obj: neg };
       else if (requirePositive && !saw.glove) glove[side] = {
-        state: 'unknown', reason: '模型本场未检出过手套', reason_code: 'no_positive', box: wb.box,
+        state: 'unknown', reason: '模型本场未检出过手套', reason_code: 'no_positive', ...meta,
       };
-      else glove[side] = { state: 'missing', reason: '腕可见但区域内无手套', reason_code: null, box: wb.box };
+      else glove[side] = { state: 'missing', reason: '腕可见但区域内无手套', reason_code: null, ...meta };
     }
   }
   return { helmet, glove, head };
@@ -275,12 +459,12 @@ export class PpeMonitor {
   /**
    * @returns {{helmet:{state,streak_ms,alert,reason,reason_code}, glove:{state,alert,streak_ms,reason,reason_code,L:object,R:object}}}
    */
-  update(trackId, person, objects, ts) {
+  update(trackId, person, objects, ts, hands = null) {
     this.lastTs = ts;
     // 窗口模式先把过期正例清掉（没有新框的帧也要让护栏重新生效）
     this.refreshPositive(ts);
     this.noteObjects(objects, ts);
-    const a = assessPpe(person, objects, this.cfg, { sawClasses: this.saw });
+    const a = assessPpe(person, objects, this.cfg, { sawClasses: this.saw, hands });
     const e = this.entry(trackId, person);
 
     const hStreak = this.step(e.helmet, a.helmet.state, ts);
@@ -291,6 +475,7 @@ export class PpeMonitor {
       streak_ms: Math.round(hStreak),
       alert: a.helmet.state === 'missing' ? alertFor(hStreak, this.cfg.helmet) : 'none',
       box: a.helmet.box,
+      source: a.helmet.source,
     };
 
     const per = {};
@@ -304,6 +489,8 @@ export class PpeMonitor {
         streak_ms: Math.round(sStreak),
         alert: st.state === 'missing' ? alertFor(sStreak, this.cfg.glove) : 'none',
         box: st.box,
+        source: st.source,
+        side_from: st.side_from,
       };
     }
     // 两侧合并：任一侧 missing 就报该侧；都戴 = worn；否则 unknown。

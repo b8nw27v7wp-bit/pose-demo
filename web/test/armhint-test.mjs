@@ -82,6 +82,104 @@ const worldOff = explainArmActions(allReady({
 check('3D 被配置关闭 → 原因是配置',
   worldOff.byId.arm_front.why.includes('world.enabled=false'));
 
+// 操作设备必须先在 profile 里圈出设备 ROI；没有 ROI 时标「不可用」，不拿伸手去猜
+const noRoi = explainArmActions(allReady({
+  sig: sig({ armPose: { has_world: true, operating_roi: false } }),
+}));
+check('未配置设备 ROI → 操作设备不可用',
+  noRoi.byId.operating.na && noRoi.byId.operating.why.includes('ROI'), noRoi.byId.operating.why);
+check('未配置设备 ROI → 在设备旁也不可用',
+  noRoi.byId.near_equipment.na && noRoi.byId.near_equipment.why.includes('ROI'),
+  noRoi.byId.near_equipment.why);
+const hasRoi = explainArmActions(allReady({
+  sig: sig({ armPose: { has_world: true, operating_roi: true } }),
+}));
+check('配置 ROI 后操作设备可用', hasRoi.byId.operating.na === false);
+check('配置 ROI 后在设备旁可用', hasRoi.byId.near_equipment.na === false);
+
+// 没有画面时 sig 为 null：ROI 是否配置是 profile 的静态条件，不能等一帧跑完才标
+const noRoiNoSig = explainArmActions({ operatingRoi: false });
+check('无画面也按 profile 标 operating 不可用',
+  noRoiNoSig.byId.operating.na && noRoiNoSig.byId.operating.why.includes('ROI'),
+  noRoiNoSig.byId.operating.why);
+const hasRoiNoSig = explainArmActions({ operatingRoi: true });
+check('无画面但已配置 ROI → operating 可用', hasRoiNoSig.byId.operating.na === false);
+
+// detector-only profile：没有 ROI，但配了设备检测类别，同样算「有设备证据」
+const eqOnlyNoSig = explainArmActions({
+  operatingRoi: false,
+  operatingCfg: { equipmentLabels: ['panel', 'valve', 'gauge'] },
+});
+check('无 ROI 但配了设备检测框 → operating 可用',
+  eqOnlyNoSig.byId.operating.na === false, eqOnlyNoSig.byId.operating.why);
+check('无 ROI 但配了设备检测框 → 在设备旁可用',
+  eqOnlyNoSig.byId.near_equipment.na === false, eqOnlyNoSig.byId.near_equipment.why);
+
+// detector-only 还要求物体检测真的开着/加载好，否则设备证据永远不可能出现
+const eqOnlyOff = explainArmActions({
+  operatingRoi: false,
+  operatingCfg: { equipmentLabels: ['panel'] },
+  objectOn: false,
+  objectReady: true,
+});
+check('无 ROI 且物体检测关闭 → operating 不可用',
+  eqOnlyOff.byId.operating.na && eqOnlyOff.byId.operating.why.includes('物体检测已关闭'),
+  eqOnlyOff.byId.operating.why);
+const eqOnlyLoading = explainArmActions({
+  operatingRoi: false,
+  operatingCfg: { equipmentLabels: ['panel'] },
+  objectOn: true,
+  objectReady: false,
+});
+check('无 ROI 且物体检测未加载 → 在设备旁不可用',
+  eqOnlyLoading.byId.near_equipment.na && eqOnlyLoading.byId.near_equipment.why.includes('未加载'),
+  eqOnlyLoading.byId.near_equipment.why);
+const eqOnlyReady = explainArmActions({
+  operatingRoi: false,
+  operatingCfg: { equipmentLabels: ['panel'] },
+  objectOn: true,
+  objectReady: true,
+});
+check('无 ROI 且物体检测就绪 → operating 可用', eqOnlyReady.byId.operating.na === false);
+
+// tooltip 必须反映 profile 覆盖后的生效阈值，不能写死默认 800ms/0.35
+const opCfg = {
+  roi: { x: 0.1, y: 0.1, w: 0.2, h: 0.2 },
+  minReachRoi: 0.65, minElev: 90, maxElev: 179, minShoulderVis: 0.4,
+  minElbowVis: 0.21, minElbowReach: 0.315, minElbowElev: 60,
+};
+const opHolds = { operating: 1500, operatingMaxGap: 300 };
+const tuned = explainArmActions({ operatingRoi: true, operatingCfg: opCfg, operatingHolds: opHolds });
+check('tooltip 用生效的 operating 阈值（0.315/1500ms/300ms）',
+  tuned.byId.operating.title.includes('0.315')
+  && tuned.byId.operating.title.includes('1500ms')
+  && tuned.byId.operating.title.includes('300ms')
+  && tuned.byId.operating.title.includes('90°'),
+  tuned.byId.operating.title);
+const defaultNote = explainArmActions({ operatingRoi: true });
+check('未传生效配置时 tooltip 仍写默认 800ms', defaultNote.byId.operating.title.includes('800ms'));
+
+const nearCfg = { minOverlap: 0.5, minShoulderVis: 0.4, requireUprightBox: true };
+const nearHolds = { nearEquipment: 1000 };
+const nearTuned = explainArmActions({
+  operatingRoi: true, nearEquipmentCfg: nearCfg, nearEquipmentHolds: nearHolds,
+});
+check('在设备旁 tooltip 用生效阈值（50%/1000ms）',
+  nearTuned.byId.near_equipment.title.includes('≥50%')
+  && nearTuned.byId.near_equipment.title.includes('1000ms'),
+  nearTuned.byId.near_equipment.title);
+const nearValid = explainArmActions({
+  operatingRoi: true,
+  nearEquipmentCfg: {
+    ...nearCfg,
+    validity: { enabled: true, minHeightRatio: 0.2, maxHeightRatio: 1.5, minInFrame: 0.5 },
+  },
+  nearEquipmentHolds: nearHolds,
+});
+check('开启人框有效性时 tooltip 写明几何门',
+  nearValid.byId.near_equipment.title.includes('人框有效'),
+  nearValid.byId.near_equipment.title);
+
 const img = explainArmActions(allReady({ imageMode: true }));
 check('单帧 → 挥手不可用', img.byId.wave.na && img.byId.wave.why.includes('单帧'));
 check('单帧 → 提示写明', img.line.includes('单帧图片'), img.line);

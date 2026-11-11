@@ -6,7 +6,8 @@
   "license": "MIT",
   "description": "通用人体姿态识别：浏览器感知 Demo + 可配置动作识别引擎",
   "scripts": {
-    "test": "node web/test/logic-test.mjs && node web/test/armhint-test.mjs && node web/test/accuracy-test.mjs && node web/test/eval-test.mjs && node web/test/hardcase-test.mjs && node web/test/autolabel-test.mjs && node web/test/manifest-test.mjs && node web/test/multi-test.mjs && node web/test/onnx-test.mjs && node web/test/ppe-test.mjs && node web/test/ppe-eval.mjs --self-test",
+    "test": "node web/test/geometry-test.mjs && node web/test/logic-test.mjs && node web/test/armhint-test.mjs && node web/test/accuracy-test.mjs && node web/test/eval-test.mjs && node web/test/hardcase-test.mjs && node web/test/autolabel-test.mjs && node web/test/manifest-test.mjs && node web/test/multi-test.mjs && node web/test/onnx-test.mjs && node web/test/ppe-test.mjs && node web/test/ppe-eval.mjs --self-test",
+    "test:geometry": "node web/test/geometry-test.mjs",
     "test:logic": "node web/test/logic-test.mjs",
     "test:hint": "node web/test/armhint-test.mjs",
     "test:accuracy": "node web/test/accuracy-test.mjs",

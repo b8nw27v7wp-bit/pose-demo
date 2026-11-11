@@ -319,16 +319,18 @@ export class PersonPipelines {
    * @param {Array} persons 已带 track_id 的人（track.js 输出），按面积降序
    * @param {number} ts
    * @param {Map<number, {L:object|null, R:object|null}>} handsByTrack assignHands() 的结果
+   * @param {Array<{label:string, score:number, box:number[]}>} objects 本帧物体检测框
+   *   （operating 有 equipmentLabels 时用它判断手/肘是否在设备框附近）
    * @returns {Array<{track_id:number, bbox:number[], score:number, sig:object, act:object, hands:object, age_ms:number}>}
    */
-  update(persons, ts, handsByTrack = null) {
+  update(persons, ts, handsByTrack = null, objects = []) {
     const out = [];
     for (const p of persons || []) {
       if (!p || p.track_id == null) continue;
       const pipe = this.ensure(p.track_id, ts);
       const hands = handsByTrack?.get?.(p.track_id) || { L: null, R: null };
       pipe.hands = hands;
-      const sig = pipe.sig.update(p, ts);
+      const sig = pipe.sig.update(p, ts, objects);
       const handState = {
         L: hands.L?.cls?.shape ?? null,
         R: hands.R?.cls?.shape ?? null,

@@ -5,7 +5,9 @@
 // 旧行为（无 uid、positiveWindowMs=0）必须逐位不变：multi-test.mjs 仍在跑同一组断言。
 
 import { Tracker } from '../js/track.js';
-import { PpeMonitor, headBox, wristBox, assessPpe } from '../js/ppe.js';
+import {
+  PpeMonitor, headBox, wristBox, assessPpe, handGloveBox, gloveRegion,
+} from '../js/ppe.js';
 import { resolveParams } from '../js/params.js';
 
 let pass = 0;
@@ -204,6 +206,146 @@ console.log('\n[4] unknown 的 reason_code');
   const gw = wristBox(p, 'L', cfg);
   const worn = assessPpe(p, [label('glove', gw.box)], cfg, { sawClasses: { helmet: true, glove: true } });
   check('worn/missing 的 reason_code 为 null', worn.glove.L.reason_code === null);
+}
+
+// —— 5. 头部 face 区域（kp_head）——
+console.log('\n[5] 头部 face 区域');
+{
+  const cfg = resolveParams({}).signals.ppe;
+  const addHead = (p, { nose = 0.9, eyes = 0.9, ears = 0.9 } = {}) => {
+    const [cx, cy] = p.kp[0];
+    const s = p.scale;
+    p.frame_w = 640;
+    p.frame_h = 480;
+    p.kp_head = [
+      [cx, cy, nose],
+      [cx - 0.06 * s, cy - 0.10 * s, eyes], [cx - 0.05 * s, cy - 0.10 * s, eyes], [cx - 0.04 * s, cy - 0.10 * s, eyes],
+      [cx + 0.06 * s, cy - 0.10 * s, eyes], [cx + 0.05 * s, cy - 0.10 * s, eyes], [cx + 0.04 * s, cy - 0.10 * s, eyes],
+      [cx - 0.15 * s, cy - 0.05 * s, ears], [cx + 0.15 * s, cy - 0.05 * s, ears],
+    ];
+    return p;
+  };
+
+  const face = headBox(addHead(mkPerson()), cfg);
+  check('双眼/耳可见 → source=face', face.source === 'face' && face.visible === true,
+    `${face.source}/points=${face.points}`);
+
+  const back = headBox(addHead(mkPerson(), { nose: 0.05, eyes: 0.05, ears: 0.9 }), cfg);
+  check('背对、鼻眼不可见但双耳可见 → face', back.source === 'face' && back.visible === true,
+    `${back.source}/points=${back.points}`);
+
+  const onePerson = addHead(mkPerson(), { eyes: 0.9, ears: 0.9 });
+  // 右侧点全部压低：只有左侧点，bothSides=true 应退回鼻尖
+  onePerson.kp_head[4][2] = 0.05; onePerson.kp_head[5][2] = 0.05;
+  onePerson.kp_head[6][2] = 0.05; onePerson.kp_head[8][2] = 0.05;
+  const one = headBox(onePerson, cfg);
+  check('只有单侧脸点 → 退回鼻尖', one.source === 'nose', one.source);
+
+  const lowP = addHead(mkPerson(), { nose: 0.05, eyes: 0.05, ears: 0.05 });
+  lowP.kp[0][2] = 0.05;   // 姿态层鼻尖也要低可见，才会走人框兜底
+  const lowBox = headBox(lowP, cfg);
+  check('脸点全部低可见 → 人框兜底 visible=false',
+    lowBox.source === 'bbox' && lowBox.visible === false, lowBox.source);
+
+  const off = headBox(addHead(mkPerson()), { ...cfg, headFace: { ...cfg.headFace, enabled: false } });
+  check('headFace.enabled=false → 鼻尖路径', off.source === 'nose', off.source);
+
+  // kp_raw（归一化 33 点）+ 帧尺寸 与 kp_head 等价
+  const withHead = addHead(mkPerson());
+  const raw = Array.from({ length: 33 }, () => ({ x: 0.5, y: 0.5, visibility: 0.9 }));
+  withHead.kp_head.forEach(([x, y, v], i) => {
+    raw[i] = { x: x / withHead.frame_w, y: y / withHead.frame_h, visibility: v };
+  });
+  const fromRaw = headBox({ ...withHead, kp_head: null, kp_raw: raw }, cfg);
+  check('kp_raw + 帧尺寸 → 与 kp_head 同框',
+    fromRaw.source === 'face' && face.box.every((v, i) => Math.abs(v - fromRaw.box[i]) < 1e-6),
+    JSON.stringify(fromRaw.box));
+  const shortHead = headBox({ ...withHead, kp_head: [], kp_raw: raw }, cfg);
+  check('短 kp_head 不挡住 kp_raw 兜底', shortHead.source === 'face', shortHead.source);
+
+  // 离群耳：不应把中心拉走；剩余点仍够就继续 face
+  const outlier = addHead(mkPerson());
+  outlier.kp_head[8] = [outlier.kp_head[0][0] + 500, outlier.kp_head[0][1], 0.9];
+  const out = headBox(outlier, cfg);
+  check('离群耳被剔除、中心不被拉走',
+    out.source === 'face' && out.points === 7
+    && Math.abs((out.box[0] + out.box[2]) / 2 - outlier.kp_head[0][0]) < outlier.scale,
+    `${out.source}/points=${out.points}`);
+}
+
+// —— 6. 手套 hand 区域 ——
+console.log('\n[6] 手套 hand 区域');
+{
+  const cfg = resolveParams({}).signals.ppe;
+  const mkHand = (cx, cy, handedness = 'Left', score = 0.9, s = 20) => {
+    const kp = Array.from({ length: 21 }, (_, i) => [
+      cx + ((i % 5) - 2) * s * 0.2,
+      cy + (Math.floor(i / 5) - 2) * s * 0.2,
+      0,
+    ]);
+    kp[0] = [cx, cy, 0];
+    const xs = kp.map((p) => p[0]);
+    const ys = kp.map((p) => p[1]);
+    return {
+      handedness, score, kp, scale: s,
+      bbox: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
+    };
+  };
+  const p = mkPerson();
+  const hand = mkHand(p.kp[5][0], p.kp[5][1]);
+  const gb = handGloveBox(hand, cfg);
+  check('handGloveBox 用 21 点 bbox 并外扩',
+    gb.visible && gb.source === 'hand' && gb.box[0] < hand.bbox[0] && gb.box[2] > hand.bbox[2]);
+
+  const slot = gloveRegion(p, 'L', cfg, { L: hand, R: null, list: [hand] });
+  check('hands 槽位优先 → source=hand / side_from=slot',
+    slot.source === 'hand' && slot.side_from === 'slot');
+
+  const noHand = gloveRegion(p, 'L', cfg, null);
+  check('无手 → wrist 兜底', noHand.source === 'wrist' && noHand.visible === true);
+
+  const handR = mkHand(p.kp[6][0], p.kp[6][1], 'Right');
+  const flat = gloveRegion(p, 'L', cfg, [handR, hand]);
+  check('扁平列表按最近姿态腕点归属（不信任 handedness）',
+    flat.source === 'hand' && flat.side_from === 'nearest_wrist'
+    && Math.abs((flat.box[0] + flat.box[2]) / 2 - p.kp[5][0]) < 2 * hand.scale,
+    `${flat.side_from} box=${flat.box.map((v) => v.toFixed(0)).join(',')}`);
+
+  const lowScore = gloveRegion(p, 'L', cfg, { L: mkHand(p.kp[5][0], p.kp[5][1], 'Left', 0.01), R: null });
+  check('低于 minScore → wrist（默认 minScore=0 不拦）', lowScore.source === 'hand');
+  const strict = gloveRegion(p, 'L', { ...cfg, gloveHand: { ...cfg.gloveHand, minScore: 0.5 } },
+    { L: mkHand(p.kp[5][0], p.kp[5][1], 'Left', 0.01), R: null });
+  check('显式提高 minScore 后拒绝低分手', strict.source === 'wrist', strict.source);
+
+  const disabled = gloveRegion(p, 'L', { ...cfg, gloveHand: { ...cfg.gloveHand, enabled: false } },
+    { L: hand, R: null });
+  check('gloveHand.enabled=false → wrist', disabled.source === 'wrist');
+
+  // 手区域判 worn：glove 框中心落在 hand bbox 外、padding 内
+  const padObj = { label: 'glove', score: 0.9, box: [hand.bbox[2] + 1, hand.bbox[1] + 1, hand.bbox[2] + 3, hand.bbox[1] + 3] };
+  const worn = assessPpe(p, [padObj], cfg, { sawClasses: { helmet: true, glove: true }, hands: { L: hand, R: null } });
+  check('手套框落在 padded hand 区域 → worn L', worn.glove.L.state === 'worn'
+    && worn.glove.L.source === 'hand', `${worn.glove.L.state}/${worn.glove.L.source}`);
+}
+
+// —— 7. PpeMonitor hands 透传 ——
+console.log('\n[7] PpeMonitor hands 透传');
+{
+  const cfg = resolveParams({}).signals.ppe;
+  const p = mkPerson();
+  const hand = {
+    handedness: 'Left', score: 0.9, kp: [[p.kp[5][0], p.kp[5][1], 0]],
+    bbox: [p.kp[5][0] - 10, p.kp[5][1] - 10, p.kp[5][0] + 10, p.kp[5][1] + 10],
+    scale: 20,
+  };
+  const obj = { label: 'glove', score: 0.9, box: [p.kp[5][0] - 2, p.kp[5][1] - 2, p.kp[5][0] + 2, p.kp[5][1] + 2] };
+  const mon = new PpeMonitor(cfg);
+  const out = mon.update(1, p, [obj], 1000, { L: hand, R: null, list: [hand] });
+  check('update 第 5 参数把 hands 传给 assessPpe',
+    out.glove.L.state === 'worn' && out.glove.L.source === 'hand',
+    `${out.glove.L.state}/${out.glove.L.source}`);
+  const old = new PpeMonitor(cfg).update(1, p, [obj], 1000);
+  check('4 参数调用仍可用（退回 wrist 语义）', typeof old.glove.L.state === 'string');
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

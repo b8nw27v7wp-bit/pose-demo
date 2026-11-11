@@ -4,6 +4,7 @@
 
 import { FilesetResolver, PoseLandmarker } from '../vendor/vision_bundle.mjs';
 import { KPT, MP_INDEX, POSE_CONNECTIONS, IDX } from './kpt.js';
+import { headPointsFromRaw } from './geometry.js';
 import { tileRects, mergeTiledPoses } from './tiles.js';
 
 // 关键点格式定义在 kpt.js（纯数据，可被 Node 单测导入），这里只做转出
@@ -220,10 +221,17 @@ export function toPersons(result, w, h) {
       bbox,
       kp_format: 'mediapipe33',
       kp,
+      // 头部 9 点（鼻/眼/耳，像素）：PPE 的头部区域不只看鼻尖。
+      // 导出与离线审计走 persons[].kp_head；旧数据没有它时 headBox 退回鼻尖。
+      kp_head: headPointsFromRaw(raw, w, h),
       kp_raw: raw,
       kp_world: world,
       scale: torsoScalePx(kp),
       score: vis,
+      // 帧尺寸：信号层把归一化 ROI（如「操作设备」的设备区域）换算成像素要用。
+      // tracker.update 会 ...det 透传，单人/多人路径都保留。
+      frame_w: w,
+      frame_h: h,
     });
   }
   return out;

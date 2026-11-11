@@ -156,6 +156,83 @@
   3D 方位角也会像平举，但伸直度能分开。有 world 时用 3D（前伸在 2D 会透视缩短）。
 - **300ms 保持窗**（`actions.holds.front` / `side`）：走路摆臂的瞬时命中只持续约 250ms。
 
+### 操作设备（`operating`）
+
+「人正在操作阀门/仪表」不是瞬时手势，是一个**持续事件**。判据是姿态 + 设备区域
+（人工 ROI，或检测器给出的 panel/valve/gauge 框）：
+
+| 条件 | 阈值 | 说明 |
+|---|---|---|
+| 设备 ROI | profile `signals.arm.operating.roi = {x,y,w,h}`（旧矩形）或 `rois = [{id, points:[[x,y],...]}]`（多边形/多区域，归一化 0~1） | **未配置 ROI/检测框时不判**：只剩「伸手」，会拿东西/扶栏杆误报。`rois` 非空时完全忽略旧 `roi`；非空但全部 zone 非法 → fail-closed（不退回矩形） |
+| 设备检测框 | profile `operating.equipmentLabels` + 物体检测 | 有框时**优先**：腕/肘到框边 ≤ `equipmentMaxDist·scale`；ROI 只作检测不到时的兜底。默认 0.35，refuel 档实测 0.35/0.5 太紧（正例 1/6），调成 0.7 |
+| 腕在设备区域 | 有检测框：到框边 ≤ `equipmentMaxDist·scale`；无框：像素坐标落在 ROI 内 | 设备区域来自检测框或人工 ROI |
+| 腕-肩距离 | > 0.65 躯干长 | 手臂不是自然垂在身侧 |
+| 抬臂角 | 90°~179° | 0°=手在肩上方，90°=水平，180°=正下方；手不能举到肩上 |
+| 两肩可见 | min(肩 L/R 可见性) ≥ 0.4 | 挡住「只检出一只手臂」的误检 |
+| 肘兜底 | 肘在设备区域（检测框/ROI）内、可见性 ≥0.3、肘-肩 >0.35、抬臂角 60°~179° | 手被设备挡住、腕不可用时 |
+| 保持 | ≥ 800ms（`actions.holds.operating`） | 单帧伸手不算「在做」；profile 可覆盖 |
+| 掉帧容忍 | 默认 ≤ 300ms（`actions.holds.operatingMaxGap`）；refuel 档 600ms | 手腕被面板挡住几帧不重置计时；两次成立帧之间超过 maxGap（人短暂丢失、引擎漏调用）同样重置，不会把漏掉的间隔算成连续。maxGap 要按实际采样间隔校准：refuel CPU 回放中位 138ms / p90 365ms，300ms 会把长正例段切碎 |
+
+> 示例 profile `web/profiles/refuel.json` 覆盖为：`minElbowVis 0.21`、`minElbowReach 0.315`、
+> `holds.operating 1500ms`、`operatingMaxGap 600ms`。这是在 58s 演示片的 6 正/7 反复核标注上
+> **同集调参**的结果；Hold 修正为「真值帧间隔超过 maxGap 也重置」后重新校准了 maxGap。
+> 当前代码+参数在 563 帧复核导出上：operating TP5/FN1/FP3（段级 R 0.833 / P 0.625）。
+> 样本很少、没有留出集，换机位必须重标重校；不要把它当全局默认。
+
+设备检测器已经接进判据（`docs/equipment-detector.md`），但仓库**不附带**训练好的权重：
+`web/profiles/refuel-equipment.json` 是接入示例（panel/valve/gauge，ONNX 320），
+`web/profiles/refuel.json` 仍只用 ROI。有 `equipmentLabels` 的检测框时，信号层用
+「点到框边的距离」而不是「点在 ROI 内」，导出 `operating_equipment=true`；框没检出的帧退回 ROI。
+`equipmentFallbackRoi=false` 是 fail-closed：没有框就一律不判（硬负例/无 ROI 场景用）。
+
+refuel 冒烟实测（同一份 590 帧导出，`operatingMaxGap=600`）：ROI-only `operating` 3/3/3，
+ROI + 检测框 **3/3/2**（检测框把 9.2–12.9s 特写误报压掉，召回不变）；无 ROI 的 detector-only 也是 3/3/2。
+模型是用同一段视频的分镜框训练的，**同集，不是泛化准确率**；valve 在 val 集里没有实例，
+gauge 在 320/0.35 下基本检不到。换机位必须重标重训并重扫 `equipmentMaxDist`。
+
+**多边形/多区域 ROI**（`operating.rois`）：每个 zone 是归一化点集 `[[x,y],...]`，至少 3 点、
+简单（非自交）、0~1；`id` 可选。`rois` 非空时优先于旧 `roi`，多区域按「任一包含」判 operating，
+`near_equipment` 按「人体框与区域的最大重叠比例」判（不做面积求和）。缺 `frame_w/frame_h`
+时无法换算像素，多边形视为不可用（fail-closed）。诊断字段：`operating_roi_zone`（命中的 zone id）、
+`near_equipment_zone`、`near_equipment_source`（`equipment|rect|polygon`）、
+`armPose.operating_roi_mode/zones`。示例见 `web/profiles/refuel-polygon.json`（与 refuel 矩形等价）。
+
+离线评估（`evaluate.mjs`）回放这条判据时，导出的人必须带 `frame_w/frame_h`（已导出）；
+缺这两个字段时 ROI 无法换算像素，`operating` 会弃权为 false。
+
+### 在设备旁（`near_equipment`，上下文）
+
+它**不是**「在操作」：只回答「人站在设备区域里」，用来补 `operating` 在「手被设备挡住」时的上下文。
+不要把它并进 `operating`（曾经的 body-overlap 兜底在 refuel 上 233/249 条判定都成立，太宽）。
+
+| 条件 | 默认 | 说明 |
+|---|---|---|
+| 区域 | `operating.roi` / `operating.rois` 和/或 `operating.equipmentLabels` 的检测框 | 两者都没有时不判；多边形按「人体框 ∩ 多边形 / 人体框面积」精确计算，多 zone 取最大 |
+| 重叠 | 人体框面积 ≥ `nearEquipment.minOverlap`(0.3) 落在区域里 | refuel 档用 0.5 |
+| 有检测框时 | 取「与检测框重叠」和「与 ROI 重叠」的**较大值**（union） | 检测框只框设备本体，人站在面板前与框的重叠很小；只认框会把 refuel 从 3/6 压到 1/6 |
+| fail-closed | `operating.equipmentFallbackRoi=false` 时只认检测框 | 没有框 → 不判，ROI 完全不参与 |
+| 两肩可见 | ≥ `nearEquipment.minShoulderVis`(0.4) | 挡掉只检出手臂/设备的特写 |
+| 人体框竖直 | `requireUprightBox=true` 时 h ≥ 0.9·w | 挡横向特写；关掉会提高召回、也增加特写误报 |
+| 人框有效性（可选） | `nearEquipment.validity.enabled=true` 时：面积/高度比例、出画比例、肩/躯干可见度 | 默认**关闭**，逐位保持旧行为；挡过小/满屏/大半出画的特写。`person.bbox` 由全部 33 点取极值，`minInFrame` 默认只取 0.5 |
+| 保持 | ≥ `actions.holds.nearEquipment`(1000ms) | 上下文事件，不是单帧 |
+
+refuel 演示片（refuel 档）：自身 TP3/FN3/FP2（段级 R 0.5 / P 0.6），补上 `operating` 唯一漏掉的
+20.4–23.9s；两个动作并集覆盖 6/6 正例段。剩下的 FP 是 9.2–12.7s / 24.1–24.3s 的特写误检。
+接上检测框后（`refuel-equipment` 档）`near_equipment` 仍是 3/3/2——union 是特意保留的：
+只认检测框会掉到 1/5，而 `operating` 一侧已经由检测框压掉了一个 FP。
+
+`nearEquipment.validity` 是人框有效性门（默认关）：`minAreaRatio / maxAreaRatio / minHeightRatio /
+maxHeightRatio / minInFrame / minShoulderVis / minTorsoVis`。关闭时信号逐位不变；开启后
+`sig.arm.near_equipment_validity` 给出 `{enabled, ok, area_ratio, height_ratio, in_frame,
+shoulder_vis, torso_vis, reasons}`，`near_equipment` 额外要求 `ok`。示例见
+`web/profiles/refuel-strict.json`（只用于同输入 A/B，不是新默认）。
+
+2026-11-11 同一份 563 帧 refuel 导出上的 A/B：`refuel-polygon.json`（单区多边形＝旧矩形）
+与 `refuel.json` 的 operating/near_equipment TP/FN/FP **完全一致**（operating 5/1/3，
+near_equipment 3/3/2），证明多边形接线没有改变旧语义；`refuel-strict.json` 也一致——
+这段素材里的人框都通过了有效性门，所以门没有触发。它主要作为硬负例/特写护栏，
+需要更多特写素材才能量化收益。
+
 ## 三·七、持物与指向
 
 - **持物 `carrying`**：手被判为握拳/OK（`closedShapes`）且两臂都没伸出（`reach < carry.maxReach`）。
@@ -246,8 +323,10 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 为什么 `uprightness` 的退路不做 3D：鼻尖在 3D 里位于肩平面之前（脸向前突出约 0.1m），
 世界坐标的「鼻→肩」向量带一个大 z 分量，直立人被算成 0.62；2D 投影更接近「画面里是否竖着」。
 
-**姿态结果**：只有上半身时，站/坐/蹲/躺都缺少膝、踝证据，`posture` 保持 `null`。
-页面会显示「上半身 · 下半身不可见（出画/遮挡），站/坐无法判定」——这是信息不足，不是识别失败；
+**姿态结果**：只有上半身、但肩+髋仍可见时，站/坐仍缺少膝、踝证据，`posture` 不冒充站/坐，
+而是输出 **`upper_upright` 上半身直立**（`uprightness > 0.75`）或 **`upper_lean` 上半身前倾**
+（`0 < uprightness ≤ 0.75`）；页面标「仅上半身可见 · 推断」。髋也不可见时 `posture` 保持 `null`，
+页面显示「上半身 · 下半身不可见（出画/遮挡），站/坐无法判定」——这是信息不足，不是识别失败。
 手臂动作（举手/挥手/抱臂/张开/手在头部/前平举/侧平举/伸手/持物/指向）和鼓掌计数照常工作。
 
 ## 三·九、判定不可靠的原因（误差识别）
@@ -281,6 +360,9 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 | 肘角 伸直（已下线） | > 150° | | 信号仍导出，不再驱动判定 |
 | `uprightness` 站立 | > 0.8 | cos 值；0.8≈36° 以内 | `actions.posture.stand.uprightnessGt` |
 | `uprightness` 躺卧（已下线） | < 0.45 | 躯干近水平 | 上半身构图里仍用于判「站/坐都不可判」 |
+| `uprightness` 上半身直立 | > 0.75 | 躯干偏离竖直 < ≈41° | `actions.posture.upper.uprightGt` |
+| `uprightness` 上半身前倾 | 0 ~ 0.75 | 前倾；≤0（躯干水平/倒置）不判，可能是躺卧或髋点漂移 | `actions.posture.upper.leanGt` |
+| 上半身框高宽比 | ≥ 0.9 | 上半身框通常高于宽；横向大框多半是手臂/设备特写被凑成人（refuel 实测 220×147） | `signals.upperBody.minAspect` |
 | `leg_vertical` 站立 | > 0.8 | 踝明显在髋下方 | `actions.posture.stand.legVerticalGt` |
 | `leg_vertical` 下蹲姿态（已下线） | > 0.85 | 坐姿的腿不再竖直向下 | 仅用于区分坐/站 |
 | `leg_vertical` 躺卧（已下线） | < 0.8 且 `uprightness` < 0.45 | 两个条件必须同时满足 | — |
@@ -297,10 +379,11 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 
 ## 五、姿态互斥规则
 
-**当前只有站 / 坐两个姿态**（下蹲、躺卧已下线，见 README 能力清单的说明）。命中时按优先级取一个：
+**当前有站 / 坐 / 上半身直立 / 上半身前倾四个姿态**（下蹲、躺卧已下线，见 README 能力清单的说明）。
+命中时按优先级取一个；上半身姿态只在膝/踝不可用时参与竞争，所以不会盖掉站/坐：
 
 ```
-坐 (20) > 站立 (10)
+坐 (20) > 站立 (10) > 上半身直立 (6) > 上半身前倾 (5)
 ```
 
 优先级高的更「具体」也更「危险」，误判代价更小。
@@ -451,7 +534,9 @@ node web/test/signal-compare.mjs --a front.frames.json --b side.frames.json --ac
   `unknown`；ROI 结果的左右侧由姿态腕点决定，不采信 MediaPipe 在「自拍镜像输入」假设下的 handedness。
 - **单张图片没有时间窗**：页面把同一帧重复喂 12 次让 Hold/streak 收敛，姿态、手臂动作、手势可用；
   挥手与计数这类需要运动的动作在单帧上不成立（也不应假装成立）。
-- **只有上半身**时站/坐/蹲/躺都缺少膝、踝证据，`posture` 为 `null`，页面显示「上半身」而不是猜一个。
+- **只有上半身**时站/坐/蹲/躺都缺少膝、踝证据，`posture` 不猜站/坐；肩+髋可见时只输出
+  `upper_upright` / `upper_lean`（页面标「推断」），髋也不可见时为 `null`。坐姿但躯干挺直会命中
+  上半身直立——这是「躯干朝向」，不是「站立」。
 - **多人**：MediaPipe PoseLandmarker 在 **VIDEO 模式只返回 1 个人**（实测 `numPoses=2` 时
   30 帧的 `max_persons` 恒为 1；**IMAGE 模式能返回多人**，同一张双人图 `poses=2` 得到 2 个框）。
   所以多人判定走 IMAGE 模式逐帧推理 + 自研跟踪器（`track.js`），每人一套独立的信号/动作状态机

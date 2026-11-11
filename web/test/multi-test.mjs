@@ -10,8 +10,9 @@ import {
   TrackShapeStabilizers, classifyHandsByTrack, bindClassifiedHands, pickRoiPersons,
 } from '../js/multi.js';
 import { readFile } from 'node:fs/promises';
-import { matchLabel, headBox, wristBox, assessPpe, PpeMonitor } from '../js/ppe.js';
+import { matchLabel, headBox, wristBox, assessPpe, PpeMonitor, gloveRegion } from '../js/ppe.js';
 import { tileRects, mergeTiledPoses } from '../js/tiles.js';
+import { toObjects } from '../js/objects.js';
 import { resolveParams } from '../js/params.js';
 
 let pass = 0;
@@ -517,6 +518,27 @@ console.log('\n[7] PPE 几何');
   check('鼻尖不可见 → 退回人框顶部且标记 visible=false', h2.source === 'bbox' && h2.visible === false);
   const w = wristBox(p, 'L', cfg);
   check('腕部框以腕点为中心', Math.abs((w.box[0] + w.box[2]) / 2 - p.kp[5][0]) < 1e-6);
+
+  // 新几何默认开：有 kp_head / hand 时走 face / hand；旧 fixture 仍走 nose / wrist。
+  const pf = mkPerson({ cx: 320, cy: 240, s: 120 });
+  pf.frame_w = 640; pf.frame_h = 480;
+  const [nx, ny] = pf.kp[0];
+  const ss = pf.scale;
+  pf.kp_head = [
+    [nx, ny, 0.9],
+    [nx - 0.06 * ss, ny - 0.1 * ss, 0.9], [nx - 0.05 * ss, ny - 0.1 * ss, 0.9], [nx - 0.04 * ss, ny - 0.1 * ss, 0.9],
+    [nx + 0.06 * ss, ny - 0.1 * ss, 0.9], [nx + 0.05 * ss, ny - 0.1 * ss, 0.9], [nx + 0.04 * ss, ny - 0.1 * ss, 0.9],
+    [nx - 0.15 * ss, ny - 0.05 * ss, 0.9], [nx + 0.15 * ss, ny - 0.05 * ss, 0.9],
+  ];
+  check('有 kp_head → 头部框 source=face', headBox(pf, cfg).source === 'face');
+
+  const hand = {
+    handedness: 'Left', score: 0.9, scale: 20,
+    kp: [[p.kp[5][0], p.kp[5][1], 0]],
+    bbox: [p.kp[5][0] - 10, p.kp[5][1] - 10, p.kp[5][0] + 10, p.kp[5][1] + 10],
+  };
+  const gr = gloveRegion(p, 'L', cfg, { L: hand, R: null });
+  check('有手 → 手套框 source=hand', gr.source === 'hand' && gr.visible);
 }
 
 // —— 8. PPE 判定：看不见 ≠ 没戴 ——
@@ -651,6 +673,24 @@ console.log('\n[R12-2 接线]');
   check('手势稳定器随 track prune', /shapeStable\.prune\(live\)/.test(src));
   check('换 profile / 重置时清空逐 track 稳定器',
     /shapeStable = makeShapeStable\(activeParams\)/.test(src) && /shapeStable\.reset\(\)/.test(src));
+}
+
+// —— 物体框坐标：MediaPipe 返回像素，不能二次乘 w/h ——
+console.log('\n[物体框坐标]');
+{
+  const det = (bb, label = 'person', score = 0.9) => ({
+    boundingBox: bb, categories: [{ categoryName: label, score }],
+  });
+  const px = toObjects({ detections: [det({ originX: 181, originY: 48, width: 164, height: 72 })] }, 484, 272);
+  check('MediaPipe 像素框不再重复缩放',
+    JSON.stringify(px[0].box.map((v) => Math.round(v))) === JSON.stringify([181, 48, 345, 120]),
+    JSON.stringify(px[0].box));
+  const nz = toObjects({ detections: [det({ originX: 0.5, originY: 0.25, width: 0.25, height: 0.25 })] }, 400, 200);
+  check('归一化框按 w/h 换算',
+    JSON.stringify(nz[0].box.map((v) => Math.round(v))) === JSON.stringify([200, 50, 300, 100]),
+    JSON.stringify(nz[0].box));
+  const noLabel = toObjects({ detections: [det({ originX: 10, originY: 10, width: 5, height: 5 }, '')] }, 100, 100);
+  check('空类别名给 null（不猜类别）', noLabel[0].label === null, String(noLabel[0].label));
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

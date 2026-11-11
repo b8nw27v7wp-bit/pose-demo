@@ -63,7 +63,11 @@
 | 类别 | 动作 | 标注 action | 备注 |
 |---|---|---|---|
 | 姿态 | 站立 / 坐 | `stand` / `sit` | 每个姿态保持 2 s 以上。躺卧/下蹲已下线（需要膝踝可见+全身机位）|
+| 姿态（半身机位） | 上半身直立 / 上半身前倾 | `upper_upright` / `upper_lean` | 肩+胯入镜、膝/踝出画时，只凭躯干朝向判；坐着挺直也会命中，标注时按「躯干是否直立」标，不要当站/坐 |
 | 手臂 | 举手 / 挥手 / 抱臂 / 叉腰 / 张开双臂 / 双手高举 / 手在头部 / 前平举 / 侧平举 | `armRaised` / `waving` / `crossed` / `onHips` / `armsOpen` / `bothHandsUp` / `handAtHead` / `armFront` / `armSide` | 每个动作做 2~3 s；前/侧平举需要 world 坐标（3D 方位角） |
+| 手臂（设备 ROI/检测框） | 操作阀门 / 仪表 | `operating` | 先在 profile 里圈出设备 ROI（或用 `operating.equipmentLabels` 接设备检测器）；每段持续 ≥2 s，另录「站在设备旁但不操作」作为反例。标签按「手在设备上持续操作」标，不要用「伸手」代替 |
+| 上下文（设备 ROI/检测框） | 在设备旁 | `near_equipment` | 与 `operating` 分开标：只看「人在设备区域里」，不要求手在设备上；每段 ≥2 s；纯手/设备特写、无完整人算反例。它补 `operating` 手被挡住时的上下文，不能替代操作判定 |
+| 设备检测器 | panel / valve / gauge | — | 另建数据集：每帧只框设备本体（不要框整个机柜/画面），100–300 帧有框 + 50–100 帧空镜/特写负例。流程见 `docs/equipment-detector.md` |
 | 手臂（需手部模型） | 伸手 / 持物 / 指向 | `reaching` / `carrying` / `pointing` | 手型要对：伸手=`open`、指向=`pointing/gun`、持物=`fist/ok`；指向还需要 3D 方位角。手部关掉、未检出或侧对时恒为 false |
 | 计数 | 鼓掌 / 拿取 | `clap` / `grasp` | 一次一段，段内 `count` 写实际次数；拿取需要手部模型（伸手→合手）。深蹲/俯卧撑已下线 |
 | 手势（需手部模型） | 握拳 / 张开 / 剪刀手 / 指方向 / 竖拇指 / OK / 手枪 / 摇滚 | `gesture` + `hand` + `shape`（见下） | 每只手单独标；手掌侧对镜头（`orient.facing === "edge"`）的帧不要标，评估器会把它们算作弃权 |

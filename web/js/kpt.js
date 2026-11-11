@@ -24,6 +24,17 @@ export const MP_INDEX = {
   ankle_L: 27, ankle_R: 28,
 };
 
+// 头部 9 点：顺序固定，导出为 persons[].kp_head。
+// 0=nose，左眼 1~3，右眼 4~6，耳 7/8（MediaPipe Pose 33 点习惯顺序）。
+export const HEAD_KPT = [
+  'nose',
+  'eye_inner_L', 'eye_L', 'eye_outer_L',
+  'eye_inner_R', 'eye_R', 'eye_outer_R',
+  'ear_L', 'ear_R',
+];
+
+export const MP_HEAD_INDEX = Object.fromEntries(HEAD_KPT.map((n, i) => [n, i]));
+
 // 33 点之间的连线，用于绘制骨架
 export const POSE_CONNECTIONS = [
   [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],

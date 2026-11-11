@@ -10,6 +10,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { ARM_ACTIONS } from '../js/actions.js';
 
 const CHROME_CANDIDATES = [
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -322,7 +323,7 @@ async function main() {
       };
     })()`);
 
-    // 准确率明细：默认收起，点「准确率」展开 12 行；再点收起（布局断言要在收起后）
+    // 准确率明细：默认收起，点「准确率」展开每个手臂动作一行；再点收起（布局断言要在收起后）
     const accuracyUi = await cdp.eval(`(() => {
       const btn = document.getElementById('btnAccuracy');
       const box = document.getElementById('accList');
@@ -419,10 +420,11 @@ async function main() {
       && /帧/.test(frontend.logText) && /profile=/.test(frontend.logTitle)
       && panel.clearedFrames === 0
       && /fitness/.test(panel.profileTagFitness) && /默认/.test(panel.profileTagDefault)
-      && armHint.hasHint && armHint.count === 12 && armHint.titled === 12
+      && armHint.hasHint && armHint.count === ARM_ACTIONS.length && armHint.titled === ARM_ACTIONS.length
       && !!armHint.line && armHint.line !== '—'
       && accuracyUi.hasBtn && accuracyUi.open === true && accuracyUi.hiddenAfter === true
-      && accuracyUi.count === 12 && accuracyUi.filled === 12 && accuracyUi.titled === 12
+      && accuracyUi.count === ARM_ACTIONS.length
+      && accuracyUi.filled === ARM_ACTIONS.length && accuracyUi.titled === ARM_ACTIONS.length
       && !!accuracyUi.hint
       && (!handWiring.handReady || handWiring.withHands > 0)
       && hardcase.options >= 10 && hardcase.hasButton && hardcase.frames > 0

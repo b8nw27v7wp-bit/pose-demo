@@ -18,6 +18,8 @@ const EMPTY_FLAGS = {
   pointingL: false, pointingR: false,
   handAtHeadL: false, handAtHeadR: false,
   carryingL: false, carryingR: false,
+  operating: false, operatingL: false, operatingR: false,
+  nearEquipment: false,
 };
 
 /**
@@ -45,6 +47,23 @@ export function buildPostures(actions) {
       cond: (s) => s.uprightness > posture.stand.uprightnessGt
         && s.knee_pick > posture.stand.kneeGt
         && s.leg_vertical > posture.stand.legVerticalGt,
+    },
+    // —— 只有上半身时（桌面摄像头最常见的构图）——
+    // 膝/踝不可见时站/坐没有证据，但肩+髋仍然能给出躯干朝向。
+    // 这里输出的是**上半身**直立/前倾，不是站/坐：坐着但躯干挺直也会命中「上半身直立」。
+    // 优先级低于站/坐：腿一旦可用，这两个就不参与竞争。界面必须写明「推断」。
+    {
+      id: 'upper_upright', name: '上半身直立', prio: 6,
+      minMs: posture.upper.minMs, streak: posture.upper.streak,
+      cond: (s) => s.upper_body && Number.isFinite(s.uprightness)
+        && s.uprightness > posture.upper.uprightGt,
+    },
+    {
+      id: 'upper_lean', name: '上半身前倾', prio: 5,
+      minMs: posture.upper.minMs, streak: posture.upper.streak,
+      cond: (s) => s.upper_body && Number.isFinite(s.uprightness)
+        && s.uprightness <= posture.upper.uprightGt
+        && s.uprightness > posture.upper.leanGt,
     },
   ];
 }
@@ -75,6 +94,10 @@ export class ActionEngine {
     this.pointHold = new Hold(this.cfg.holds.point);
     this.frontHold = new Hold(this.cfg.holds.front);
     this.sideHold = new Hold(this.cfg.holds.side);
+    // 操作设备是持续事件：800ms 才成立，允许短暂遮挡（见 params.actions.holds.operating）
+    this.operatingHold = new Hold(this.cfg.holds.operating, this.cfg.holds.operatingMaxGap);
+    // 在设备旁是上下文事件：1s 才成立；和 operating 分开，不互相替代
+    this.nearEquipmentHold = new Hold(this.cfg.holds.nearEquipment);
     // 拿取 = 伸手 → 合手 → 收回/抬起。手部状态由调用方逐帧传入（见 update 的 hands 参数）
     this.graspSeq = new PhaseSequence(['reach', 'grasp'], {
       minPhaseMs: this.graspCfg.minPhaseMs,
@@ -105,6 +128,8 @@ export class ActionEngine {
     this.pointHold.reset();
     this.frontHold.reset();
     this.sideHold.reset();
+    this.operatingHold.reset();
+    this.nearEquipmentHold.reset();
     this.graspSeq.reset();
     this.graspCount = 0;
     this.graspPhase = 'idle';
@@ -250,6 +275,10 @@ export class ActionEngine {
     // 不加保持窗，界面会一直闪「前平举」。
     const armFront = this.frontHold.update(!!(ap.arm_front_L || ap.arm_front_R), ts);
     const armSide = this.sideHold.update(!!(ap.arm_side_L || ap.arm_side_R), ts);
+    // 操作设备（阀门/仪表）：手在设备区域/明显前伸，保持 800ms 才算「在做」
+    const operating = this.operatingHold.update(!!(s.arm?.operating_any), ts);
+    // 在设备旁：人体框与 ROI 重叠，保持 1s；它不要求手在设备上
+    const nearEquipment = this.nearEquipmentHold.update(!!(s.arm?.near_equipment), ts);
 
     // 拿取状态机：reach（伸手且手张开）→ grasp（手合上）。两次都成立才算一次拿取。
     // 仍按「伸出的那条臂」取手的状态，避免另一只手的开合推进阶段机。
@@ -290,6 +319,10 @@ export class ActionEngine {
         handAtHeadR: handAtHead && !!s.arm.head_near_R,
         carryingL: carrying && closedL,
         carryingR: carrying && closedR,
+        operating,
+        operatingL: operating && !!s.arm?.operating_L,
+        operatingR: operating && !!s.arm?.operating_R,
+        nearEquipment,
       },
       reps: { clap: clapCount, grasp: this.graspCount },
       gates: { clap: clapGate },
@@ -319,6 +352,9 @@ export class ActionEngine {
 export const ACTION_CATALOG = [
   { id: 'stand', name: '站立', kind: '姿态' },
   { id: 'sit', name: '坐', kind: '姿态' },
+  // 上半身构图专用：膝/踝不可见时只凭肩+髋判躯干朝向，不是站/坐的替代（见 buildPostures）
+  { id: 'upper_upright', name: '上半身直立', kind: '姿态' },
+  { id: 'upper_lean', name: '上半身前倾', kind: '姿态' },
 ];
 export const POSTURE_IDS = ACTION_CATALOG.map((a) => a.id);
 
@@ -333,6 +369,9 @@ export const ARM_ACTIONS = [
   { id: 'hand_head', name: '手在头部', flag: 'handAtHead' },
   { id: 'reach', name: '伸手', flag: 'reaching' },
   { id: 'carry', name: '持物', flag: 'carrying' },
+  { id: 'operating', name: '操作设备', flag: 'operating' },
+  // 上下文事件，不是手臂动作：说明「人在设备旁」，不说明手在设备上
+  { id: 'near_equipment', name: '在设备旁', flag: 'nearEquipment' },
   { id: 'point', name: '指向', flag: 'pointing' },
   { id: 'arm_front', name: '前平举', flag: 'armFront' },
   { id: 'arm_side', name: '侧平举', flag: 'armSide' },

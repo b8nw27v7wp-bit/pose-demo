@@ -5,6 +5,9 @@
 
 import { KPT, IDX, MP_INDEX } from './kpt.js';
 import { resolveParams } from './params.js';
+import {
+  resolveRegions, scaleZones, pointInAnyZone, maxZoneOverlap, personBoxValidity,
+} from './geometry.js';
 
 // MediaPipe worldLandmarks：米制、原点在髋中心、**y 向下为正**（docs/signals.md §一·五）。
 // 重力方向向量因此是 [0,1,0]；「竖直向上」是 [0,-1,0]。
@@ -101,22 +104,48 @@ export function angleDeg3(a, b, c) {
 
 /** 带最短持续时间的状态判定（信号层原语 state）。 */
 export class Hold {
-  constructor(minMs = 300) { this.minMs = minMs; this.since = null; this.active = false; this.lastTs = 0; }
+  /**
+   * @param {number} minMs 条件需连续成立的时长
+   * @param {number} maxGapMs 允许的掉帧/遮挡间隔（默认 0 = 任一帧不成立就重计时）。
+   *   只给「持续事件」用（如操作设备）：手腕被设备挡住一两帧不该让计时归零。
+   */
+  constructor(minMs = 300, maxGapMs = 0) {
+    this.minMs = minMs;
+    this.maxGapMs = maxGapMs;
+    this.since = null;
+    this.lastTrueTs = null;
+    this.active = false;
+    this.lastTs = 0;
+  }
 
   update(cond, ts) {
     this.lastTs = ts;
     if (cond) {
+      // maxGap 也要管「两次调用之间隔了多久」：人短暂丢失/引擎根本没被调用时，
+      // 中间没有任何 cond=false 的帧，只在 false 分支检查 maxGap 会白续计时。
+      // maxGapMs=0 时保持旧语义（不能每帧真值都重置）。
+      if (this.maxGapMs > 0 && this.lastTrueTs !== null
+        && ts - this.lastTrueTs > this.maxGapMs) {
+        this.since = null;
+        this.active = false;
+      }
+      this.lastTrueTs = ts;
       if (this.since === null) this.since = ts;
       this.active = ts - this.since >= this.minMs;
+    } else if (this.since !== null && this.maxGapMs > 0
+      && ts - this.lastTrueTs <= this.maxGapMs) {
+      // 短暂掉帧：保持计时与 active 状态，等条件恢复后继续累计。
+      // 间隔超过 maxGapMs 仍按中断处理，避免把两段独立动作粘成一段。
     } else {
       this.since = null;
+      this.lastTrueTs = null;
       this.active = false;
     }
     return this.active;
   }
 
   get duration() { return this.since === null ? 0 : this.lastTs - this.since; }
-  reset() { this.since = null; this.active = false; }
+  reset() { this.since = null; this.lastTrueTs = null; this.active = false; }
 }
 
 /**
@@ -403,6 +432,9 @@ export class SignalEngine {
   constructor(params = {}) {
     const p = resolveParams(params).signals;
     this.params = p;
+    // 设备区域是静态配置：构造时解析一次，逐帧只做归一化→像素换算。
+    // 多边形 rois 非空时优先；全部非法时 valid=false（fail-closed）。
+    this.regions = resolveRegions(p.arm.operating, 0, 0);
     this.kpFilter = new KpFilter(p.smoothing, p.visMin, p.occlusion.maxExtrapMs);
     this.angleOpts = { minCutoff: p.smoothing.angleCutoff, beta: p.smoothing.angleBeta };
     this.angleFilters = {};
@@ -495,7 +527,7 @@ export class SignalEngine {
    * @param {object} person toPersons() 产出的单人对象
    * @param {number} ts 毫秒时间戳
    */
-  update(person, ts) {
+  update(person, ts, objects = []) {
     const tSec = ts / 1000;
     this.angleRejected = [];   // 本帧的坏点清单（逐帧重置）
     const C = this.params;
@@ -850,6 +882,99 @@ export class SignalEngine {
     const raisedSelL = Number.isFinite(elevTorsoL) ? raised3dL : raisedL;
     const raisedSelR = Number.isFinite(elevTorsoR) ? raised3dR : raisedR;
 
+    // —— 操作设备（阀门/仪表）——
+    // 判据是「手在设备区域 + 肩以下 + 臂没有自然垂着」。设备区域优先用检测器给出的
+    // panel/valve/gauge 框（点到框边的距离），本帧没有框时退回 profile 里人工圈的
+    // 归一化 ROI。两者都没有就不判：只剩「伸手」会把拿东西/扶栏杆算成操作。
+    const opCfg = C.arm.operating;
+    const frameW = Number(person.frame_w);
+    const frameH = Number(person.frame_h);
+    const hasFrame = frameW > 0 && frameH > 0;
+    // 设备区域：构造时解析，逐帧只做归一化→像素。rois 非空时旧 roi 完全不参与。
+    const regionCfg = this.regions;
+    const pixelZones = (regionCfg.mode === 'polygon' && regionCfg.valid && hasFrame)
+      ? scaleZones(regionCfg.normalizedZones, frameW, frameH) : [];
+    const rectPx = (regionCfg.mode === 'rect' && regionCfg.valid && hasFrame)
+      ? [
+        regionCfg.rect.x * frameW, regionCfg.rect.y * frameH,
+        (regionCfg.rect.x + regionCfg.rect.w) * frameW,
+        (regionCfg.rect.y + regionCfg.rect.h) * frameH,
+      ] : null;
+    const roiUsable = regionCfg.mode === 'polygon' ? pixelZones.length > 0
+      : (regionCfg.mode === 'rect' && !!rectPx);
+    const inRect = (x, y) => !!rectPx && x >= rectPx[0] && x <= rectPx[2]
+      && y >= rectPx[1] && y <= rectPx[3];
+    // —— 设备检测框（可选）：有框时优先用「点到框的距离」，ROI 只作兜底 ——
+    // 没有阀门/仪表模型时 equipmentLabels 为空，行为与旧版完全一致。
+    const eqLabels = new Set((opCfg.equipmentLabels || [])
+      .map((s) => String(s).toLowerCase()));
+    const eqBoxes = (Array.isArray(objects) ? objects : [])
+      .filter((o) => o && Array.isArray(o.box) && o.box.length >= 4
+        && eqLabels.has(String(o.label ?? '').toLowerCase())
+        && (o.score ?? 0) >= (opCfg.equipmentMinScore ?? 0.35))
+      .map((o) => o.box);
+    const hasEquipmentBox = eqBoxes.length > 0;
+    // 配了设备类别但本帧没框时是否退回 ROI。false = 没有物体证据就不判（fail-closed）。
+    const eqFallback = opCfg.equipmentFallbackRoi !== false;
+    // 本帧到底有没有「设备证据」：检测框，或（允许时）可用的 ROI
+    const hasEquipEvidence = hasEquipmentBox || (eqFallback && roiUsable);
+    const eqMaxDist = (opCfg.equipmentMaxDist ?? 0.35) * scale;
+    const distToBox = (x, y, b) => {
+      const dx = x < b[0] ? b[0] - x : x > b[2] ? x - b[2] : 0;
+      const dy = y < b[1] ? b[1] - y : y > b[3] ? y - b[3] : 0;
+      return Math.hypot(dx, dy);
+    };
+    // 返回 {near, zone}：zone 只在多边形 ROI 命中时有值（矩形保持旧语义，不给假 id）。
+    const pointNearEquipment = (x, y) => {
+      if (hasEquipmentBox) return { near: eqBoxes.some((b) => distToBox(x, y, b) <= eqMaxDist), zone: null };
+      if (!eqFallback) return { near: false, zone: null };
+      if (regionCfg.mode === 'rect') return { near: inRect(x, y), zone: null };
+      if (regionCfg.mode === 'polygon') {
+        const z = pointInAnyZone(x, y, pixelZones);
+        return { near: !!z, zone: z ? z.id : null };
+      }
+      return { near: false, zone: null };
+    };
+    const opSide = (wr, reachVal, elevVal, headNear, usable) => {
+      const near = pointNearEquipment(wr[0], wr[1]);
+      const ok = usable
+        && visShoulder >= opCfg.minShoulderVis
+        && !headNear
+        && Number.isFinite(reachVal) && reachVal >= opCfg.minReachRoi
+        && Number.isFinite(elevVal) && elevVal >= opCfg.minElev && elevVal <= opCfg.maxElev
+        && near.near;
+      // zone 只在真正成立时上报：否则「手在 zone 里但抬臂角不满足」会把诊断带偏。
+      return { ok, zone: ok ? near.zone : null };
+    };
+    // 没有设备 ROI/检测框就不判：只剩「伸手」会把拿东西/扶栏杆误报成操作设备
+    const opL = hasEquipEvidence
+      ? opSide(wristL, reachL, elevL, headNearL, armUsableL) : { ok: false, zone: null };
+    const opR = hasEquipEvidence
+      ? opSide(wristR, reachR, elevR, headNearR, armUsableR) : { ok: false, zone: null };
+    const operatingL = opL.ok;
+    const operatingR = opR.ok;
+    // 手被设备挡住时的兜底：肘在 ROI/检测框内、离肩够远、不是垂在身侧。
+    // 肘比「整个人框在 ROI 里」更接近手臂在设备上，误报低得多。
+    const opElbowSide = (elbow, elbowVis, sh) => {
+      const near = pointNearEquipment(elbow[0], elbow[1]);
+      const ok = elbowVis >= opCfg.minElbowVis
+        && visShoulder >= opCfg.minShoulderVis
+        && Number.isFinite(d2(elbow, sh)) && d2(elbow, sh) / scale >= opCfg.minElbowReach
+        && Number.isFinite(elev(sh, elbow)) && elev(sh, elbow) >= opCfg.minElbowElev
+        && elev(sh, elbow) <= opCfg.maxElev
+        && near.near;
+      return { ok, zone: ok ? near.zone : null };
+    };
+    const opElbowL = hasEquipEvidence
+      ? opElbowSide(P('elbow_L'), V('elbow_L'), shL) : { ok: false, zone: null };
+    const opElbowR = hasEquipEvidence
+      ? opElbowSide(P('elbow_R'), V('elbow_R'), shR) : { ok: false, zone: null };
+    const operatingElbowL = opElbowL.ok;
+    const operatingElbowR = opElbowR.ok;
+    const operatingAny = operatingL || operatingR || operatingElbowL || operatingElbowR;
+    // 诊断：第一个命中的 zone；用设备框或矩形 ROI 时为 null。
+    const operatingRoiZone = opL.zone || opR.zone || opElbowL.zone || opElbowR.zone || null;
+
     // —— 伸手 / 指向 / 持物（拿取动作的基础信号）
     // 伸出 = 腕离肩足够远且不是自然下垂。用 reach（已按 scale 归一）而不是像素。
     const extendCfg = C.arm.extend;
@@ -960,7 +1085,86 @@ export class SignalEngine {
       && wristR[1] > shoulderMid[1] + ch.above * scale
       && wristR[1] < hipY + ch.below * scale;
 
+    // 下半身是否足以判站/坐：膝角与腿竖直比都要有值（两者都隐含膝/踝可见）。
+    const legsVisible = Number.isFinite(kneePick) && Number.isFinite(legVertical);
+    // 只有上半身可用：肩、髋都可信（躯干轴成立），但膝/踝不足。
+    // 这是「上半身直立/前倾」的唯一依据——没有髋就不猜躯干朝向（见 actions.buildPostures）。
+    // 几何门：上半身框通常高于宽；横着的框多半是手臂/设备特写被模型凑成了人。
+    // bbox 缺失（手搓信号/旧数据）时不设门，保持纯逻辑可测。
+    const bb = person.bbox;
+    const bh = Array.isArray(bb) && bb.length >= 4 ? bb[3] - bb[1] : NaN;
+    const bw = Array.isArray(bb) && bb.length >= 4 ? bb[2] - bb[0] : NaN;
+    const uprightBox = !(bw > 0 && bh > 0)
+      || bh >= bw * C.upperBody.minAspect;
+    const upperBody = Number.isFinite(uprightness)
+      && visShoulder >= this.minTorsoVis
+      && visHip >= VIS_MIN
+      && !legsVisible
+      && uprightBox;
+
     const score = person.score ?? 0;
+
+    // —— 在设备旁（上下文事件）——
+    // 人体框落在设备区域（检测框或 ROI，取重叠较大者）里的面积比例。只回答
+    // 「人在设备区域里」，不要求手在设备上；和 operating 分开，避免把「站在旁边」
+    // 直接算成「在操作」。
+    const nearCfg = C.arm.nearEquipment;
+    const nearValidity = personBoxValidity(
+      person.bbox, frameW, frameH, visShoulder, visTorso, nearCfg.validity || {},
+    );
+    let nearEquipmentZone = null;
+    let nearEquipmentSource = null;
+    const nearOverlap = (() => {
+      if (!Array.isArray(person.bbox) || person.bbox.length < 4) return NaN;
+      const [x1, y1, x2, y2] = person.bbox;
+      const area = Math.max(0, (x2 - x1) * (y2 - y1));
+      if (!(area > 0)) return 0;
+      const overlap = (b) => {
+        const iw = Math.max(0, Math.min(x2, b[2]) - Math.max(x1, b[0]));
+        const ih = Math.max(0, Math.min(y2, b[3]) - Math.max(y1, b[1]));
+        return (iw * ih) / area;
+      };
+      const boxOverlap = hasEquipmentBox ? Math.max(...eqBoxes.map(overlap)) : NaN;
+      // ROI 只在允许兜底、且知道帧尺寸时参与。fail-closed（equipmentFallbackRoi=false）
+      // 时 ROI 完全不参与——这正是硬负例里「人走过 ROI 但没有任何设备框」不判的开关。
+      let roiOverlap = NaN;
+      let roiZone = null;
+      let roiSource = null;
+      if (eqFallback && hasFrame) {
+        if (regionCfg.mode === 'rect' && rectPx) {
+          roiOverlap = overlap(rectPx);
+          roiSource = 'rect';
+        } else if (regionCfg.mode === 'polygon' && pixelZones.length) {
+          // 多边形用精确的「人体框 ∩ 多边形 / 人体框面积」，多 zone 取最大。
+          const m = maxZoneOverlap([x1, y1, x2, y2], pixelZones);
+          roiOverlap = m.ratio;
+          roiZone = m.zone_id;
+          roiSource = 'polygon';
+        }
+      }
+      // 取两者的较大值（union），而不是「有框就只看框」：检测框只框住设备本体，
+      // 人站在面板前时人体框与设备框的重叠常常远小于与 ROI 的重叠（refuel 实测
+      // 50% 阈值下从 3/6 掉到 1/6）。fail-closed 时只有 boxOverlap。
+      const cands = [boxOverlap, roiOverlap].filter((v) => Number.isFinite(v));
+      if (!cands.length) return NaN;
+      const best = Math.max(...cands);
+      // 并列时优先标 equipment（设备框是更强的物体证据）。
+      if (Number.isFinite(boxOverlap) && boxOverlap >= best - 1e-12) {
+        nearEquipmentSource = 'equipment';
+        nearEquipmentZone = null;
+      } else {
+        nearEquipmentSource = roiSource;
+        nearEquipmentZone = roiZone;
+      }
+      return best;
+    })();
+    const nearEquipmentOn = Number.isFinite(nearOverlap)
+      && nearOverlap >= nearCfg.minOverlap
+      && visShoulder >= nearCfg.minShoulderVis
+      && score >= this.minScore
+      && (!nearCfg.requireUprightBox || uprightBox)
+      && nearValidity.ok;
+
     // 有效锚点：肩必须在画面里；髋可见时也要求可信。
     // 上半身构图里髋在画面外，不能因为髋不可见就把整帧判成无效——那会让动作层一直冻结
     // （实测头~胸构图髋可见性≈0.15 → ok=false → 举手/挥手/抱臂全部不输出）。
@@ -994,6 +1198,10 @@ export class SignalEngine {
       uprightness,
       // 直立度用的是哪条轴：torso=躯干轴，head=鼻→肩（上半身构图），none=不可用
       uprightness_source: upSource,
+      // 下半身证据是否足够；false 时站/坐不可判（但上半身朝向仍可判）
+      legs_visible: legsVisible,
+      // 肩+髋可信、膝/踝不足：动作层据此输出「上半身直立/前倾」，不冒充站/坐
+      upper_body: upperBody,
       // 分组可见性：界面据此提示「下半身不在画面内」，不用再猜为什么没姿态
       vis: {
         shoulder: visShoulder, hip: visHip,
@@ -1037,6 +1245,26 @@ export class SignalEngine {
         any_raised_sel: raisedSelL || raisedSelR,
         head_near_L: headNearL,
         head_near_R: headNearR,
+        // 操作设备：手在设备 ROI 内，或肘在 ROI 内（手被设备挡住时的兜底）
+        operating_L: operatingL,
+        operating_R: operatingR,
+        operating_elbow_L: operatingElbowL,
+        operating_elbow_R: operatingElbowR,
+        operating_any: operatingAny,
+        // 在设备旁（上下文）：人体框与设备框/ROI 的重叠比例（取较大值） / 是否成立
+        near_equipment: nearEquipmentOn,
+        near_equipment_overlap: nearOverlap,
+        // 多边形 ROI 的诊断：命中的 zone / 重叠最大的 zone / 证据来源
+        operating_roi_zone_L: opL.zone,
+        operating_roi_zone_R: opR.zone,
+        operating_elbow_zone_L: opElbowL.zone,
+        operating_elbow_zone_R: opElbowR.zone,
+        operating_roi_zone: operatingRoiZone,
+        near_equipment_zone: nearEquipmentZone,
+        near_equipment_source: nearEquipmentSource,
+        near_equipment_validity: nearValidity && nearValidity.enabled ? nearValidity : null,
+        // 本帧的 operating 是否有设备检测框参与（诊断用；没有框时退回 ROI）
+        operating_equipment: hasEquipmentBox,
       },
       armPose: {
         elev_L: elevL,
@@ -1065,6 +1293,12 @@ export class SignalEngine {
         has_world: !!w3,
         extend_L: extendedL,
         extend_R: extendedR,
+        // 操作设备是否配置了可用设备 ROI（未配置时动作层不可用，界面据此标「不可用」）
+        // mode/zones 供诊断：polygon 的 rois 全部非法时为 none/0。
+        operating_roi: regionCfg.valid,
+        operating_roi_mode: regionCfg.mode,
+        operating_roi_zones: regionCfg.mode === 'polygon'
+          ? regionCfg.normalizedZones.length : (regionCfg.mode === 'rect' ? 1 : 0),
         azimuth_L: azimL,
         azimuth_R: azimR,
         arm_front_L: armFrontL,

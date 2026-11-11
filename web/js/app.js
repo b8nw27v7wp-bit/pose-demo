@@ -10,6 +10,7 @@ import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from './action
 import { explainArmActions, DEFAULT_HINT } from './armhint.js';
 import { loadAccuracyReport, accuracyFor, formatAccuracy, accuracyStale } from './accuracy.js';
 import { resolveParams, profileParams, profileName as profileNameOf, paramsHash } from './params.js';
+import { hasRegionConfig } from './geometry.js';
 import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS, HARDCASE_BEFORE_MS } from './hardcase.js';
 import { drawSkeleton, drawHand, drawBoxes, drawTrackLabel, clearCanvas } from './draw.js';
 import { Tracker, area } from './track.js';
@@ -86,6 +87,15 @@ let tracker = new Tracker(resolveParams(activeParams).signals.track);
 let ppeMonitor = new PpeMonitor(resolveParams(activeParams).signals.ppe);
 // 多人感知参数（平铺检测的块数等）；换 profile 时同步，逐帧直接读
 let multiCfg = resolveParams(activeParams).perception.multi;
+// 单人道漏检补救参数（见 params.js perception.single）
+let singleCfg = resolveParams(activeParams).perception.single;
+// operating 的 profile 配置：ROI 是静态配置，没有画面时也要能告诉用户不可用，
+// 阈值/保持窗也要进 tooltip，不能写死默认值（refuel 覆盖了 1500ms 与肘兜底阈值）。
+let operatingCfg = resolveParams(activeParams).signals.arm.operating;
+let operatingHolds = resolveParams(activeParams).actions.holds;
+let nearEquipmentCfg = resolveParams(activeParams).signals.arm.nearEquipment;
+let nearEquipmentHolds = resolveParams(activeParams).actions.holds;
+let operatingRoi = hasRegionConfig(operatingCfg);
 let objectCfg = resolveParams(activeParams).perception.objects;
 let lastObjectTs = 0;   // 物体检测的最小间隔门控（见 params.objects.intervalMs）
 let multiNumPoses = 3;
@@ -128,7 +138,15 @@ function applyParams(params, name = 'default') {
   tracker = new Tracker(resolved.signals.track);
   ppeMonitor = new PpeMonitor(resolved.signals.ppe);
   multiCfg = resolved.perception.multi;
+  singleCfg = resolved.perception.single;
+  operatingCfg = resolved.signals.arm.operating;
+  operatingHolds = resolved.actions.holds;
+  nearEquipmentCfg = resolved.signals.arm.nearEquipment;
+  nearEquipmentHolds = resolved.actions.holds;
+  operatingRoi = hasRegionConfig(operatingCfg);
   objectCfg = resolved.perception.objects;
+  // 换参数/模型后允许补救路径重新尝试建 IMAGE 估计器
+  fallbackPoseFailed = false;
   shapeStable = makeShapeStable(activeParams);
   activeParamsHash = paramsHash(activeParams);
   // 场景档可以声明"这个场景需要多人/物体检测"：profile 里写 perception.multi.enabled
@@ -523,6 +541,9 @@ async function doInitHands(delegate) {
 // 懒加载，理由同姿态模型：页面一打开就建 GPU 上下文，多开几个标签页很吃内存。
 
 let multiInitPromise = null;
+// 单人道漏检补救（perception.single.fallback）的失败记忆：
+// 建不起来就不要再每帧重试——和多人开关失败时一样的坑（每帧建一次模型会拖垮主循环）。
+let fallbackPoseFailed = false;
 /** 当前参数/工具栏下，多人估计器应有的配置指纹。profile 切换后与 multiCfgKey 比对。 */
 function desiredMultiKey() {
   const cfg = resolveParams(activeParams).perception.multi;
@@ -530,7 +551,7 @@ function desiredMultiKey() {
   return `${numPoses}|${cfg.detConf}|${cfg.presenceConf}`;
 }
 
-async function ensureMultiEstimator() {
+async function ensureMultiEstimator({ quiet = false } = {}) {
   if (multiReady) return true;
   if (multiInitPromise) return multiInitPromise;
   multiInitPromise = (async () => {
@@ -555,10 +576,40 @@ async function ensureMultiEstimator() {
         multiError = e.message;
       }
     }
-    setStatus(`多人模型加载失败：${multiError || 'unknown'}`, 'err');
+    // 补救路径是后台优化，失败不该覆盖用户正在看的输入状态（主路径仍可用）
+    if (!quiet) setStatus(`多人模型加载失败：${multiError || 'unknown'}`, 'err');
     return false;
   })().finally(() => { multiInitPromise = null; });
   return multiInitPromise;
+}
+
+/**
+ * 单人道漏检补救：VIDEO 模式整帧 0 人时，用 IMAGE 模式（detConf 0.3）再看一次。
+ *
+ * 为什么需要：VIDEO 模式的检测器阈值 0.5，半身/被设备挡住/贴边的人经常一个都回不来；
+ * 同一帧用 IMAGE 模式 + 0.3 往往能检出上半身。正常帧仍走 VIDEO 模式（模型内跟踪更稳），
+ * 所以只在这个补救路径上多付一次推理。
+ *
+ * 失败不打断主循环：建不起模型就记住失败，不每帧重试（与多人开关失败同一个坑）。
+ * @returns {Array} toPersons 结构；失败/未就绪时为空数组
+ */
+function fallbackPersons(v, w, h) {
+  if (!singleCfg.fallback || fallbackPoseFailed) return [];
+  if (!multiReady) {
+    if (!multiInitPromise) {
+      // quiet：用户没开多人，补救失败不该把状态栏改成「多人模型加载失败」
+      ensureMultiEstimator({ quiet: true }).then((ok) => {
+        if (!ok) fallbackPoseFailed = true;
+      }).catch(() => { fallbackPoseFailed = true; });
+    }
+    return [];
+  }
+  try {
+    const minScore = Number(singleCfg.fallbackMinScore) || 0.45;
+    return toPersons(detectMultiImage(v), w, h).filter((p) => (p.score ?? 0) >= minScore);
+  } catch {
+    return [];
+  }
 }
 
 let objectInitPromise = null;
@@ -613,6 +664,7 @@ function resetRuntime() {
   pipelines.reset();
   tracker.reset();
   ppeMonitor.reset();
+  fallbackPoseFailed = false;   // 新输入/新会话允许补救路径重试一次
   lastVerdicts = [];
   lastObjects = [];
   frameLog = [];
@@ -1202,14 +1254,14 @@ async function analyzeStill(img) {
       hands = cls.hands;
       // 单人也必须走一遍归属：ActionEngine 拿的是「每个人每只手」的 map，
       // 之前单人模式传 null，导致伸手/持物/指向/拿取在默认单人道里永远不成立。
-      verdicts = pipelines.update(judged, t, cls.handsByTrack);
+      verdicts = pipelines.update(judged, t, cls.handsByTrack, objects);
     }
     const primaryV = pipelines.primary(verdicts);
     sig = primaryV ? primaryV.sig : null;
     act = primaryV ? primaryV.act : null;
     const ppeById = new Map();
     if (objectOn && objectReady) {
-      for (const vd of verdicts) ppeById.set(vd.track_id, ppeMonitor.update(vd.track_id, vd.person, objects, ts));
+      for (const vd of verdicts) ppeById.set(vd.track_id, ppeMonitor.update(vd.track_id, vd.person, objects, ts, vd.hands));
     }
     lastVerdicts = verdicts.map((vd) => ({
       track_id: vd.track_id,
@@ -1477,7 +1529,7 @@ function loop() {
     stopLoop();
     return;
   }
-  const poseMs = performance.now() - tPose;
+  let poseMs = performance.now() - tPose;
 
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;
@@ -1489,7 +1541,15 @@ function loop() {
   }
 
   // 感知：姿态（1 人或多人的稳定 id）+ 物体（可选）
-  const personsRaw = toPersons(res, w, h);
+  let personsRaw = toPersons(res, w, h);
+  // 单人道整帧漏检（半身/贴边/小目标）时用 IMAGE 模式补检一次。
+  // 只补救「一个都没检出」的帧；正常帧仍走 VIDEO 模式，模型内跟踪更稳。
+  if (!multi && personsRaw.length === 0 && singleCfg.fallback) {
+    const tFallback = performance.now();
+    const alt = fallbackPersons(v, w, h);
+    if (alt.length) personsRaw = alt;
+    poseMs += performance.now() - tFallback;
+  }
   let persons;
   if (multi) {
     // 外观描述子要在 tracker.update 之前算（拿到本帧 bbox 才能裁图）
@@ -1596,7 +1656,7 @@ function loop() {
   const handsMs = performance.now() - tHands;
 
   // 判定：每人一条独立流水线
-  const verdicts = pipelines.update(judged, ts, handsByTrack);
+  const verdicts = pipelines.update(judged, ts, handsByTrack, lastObjects);
   if (multi) {
     // 跟踪器已经 prune 过超时轨迹：流水线/PPE 计时器不能继续留着（长会话里会无限增长，
     // 而且旧 id 的 PPE 计时会在新人拿到新 id 后仍然占着内存）
@@ -1614,7 +1674,7 @@ function loop() {
   // PPE：只看检测框与人的几何关系，看不见一律 unknown（见 ppe.js 头注释）
   const ppeById = new Map();
   if (objectOn && objectReady) {
-    for (const vd of verdicts) ppeById.set(vd.track_id, ppeMonitor.update(vd.track_id, vd.person, lastObjects, ts));
+    for (const vd of verdicts) ppeById.set(vd.track_id, ppeMonitor.update(vd.track_id, vd.person, lastObjects, ts, vd.hands));
   }
   lastVerdicts = verdicts.map((vd) => ({
     track_id: vd.track_id,
@@ -1739,12 +1799,20 @@ function exportPerson(p) {
     bbox: p.bbox.map(r1),
     kp_format: p.kp_format,
     kp: p.kp.map(([x, y, v]) => [r1(x), r1(y), r2(v)]),
+    // 头部 9 点（可选）：PPE 头部区域用眼睛/耳朵定框，旧数据没有时 ppe 退回鼻尖。
+    ...(Array.isArray(p.kp_head) && p.kp_head.length >= 9
+      ? { kp_head: p.kp_head.map(([x, y, v]) => [r1(x), r1(y), r2(v)]) }
+      : {}),
     // 世界坐标（米制）：3D 抬臂角/举手判定依赖它。不导出的话，离线评估永远只能走 2D 分支，
     // 评估结果就和页面实际执行的规则不是一回事（见 evaluate.mjs 文件头）。
     kp_world: p.kp_world && p.kp_world.length
       ? p.kp_world.map(([x, y, z]) => [r2(x), r2(y), r2(z)]) : null,
     scale: r2(p.scale),
     score: r2(p.score),
+    // 帧尺寸：operating 的设备 ROI 是归一化坐标，离线回放（evaluate.mjs）没有它
+    // 就没法把 ROI 换成像素，operating 会恒为 false。缺字段的老数据按「不知道」处理。
+    frame_w: p.frame_w,
+    frame_h: p.frame_h,
   };
 }
 
@@ -1771,6 +1839,9 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       elbow: r1(sig.elbow_pick),
       uprightness: r2(sig.uprightness),
       leg_vertical: r2(sig.leg_vertical),
+      // 上半身姿态的依据：腿证据是否完整 / 是否只判上半身（评估/难例复盘不用再猜）
+      legs_visible: !!sig.legs_visible,
+      upper_body: !!sig.upper_body,
       elev_L: r1(sig.armPose.elev_L),
       elev_R: r1(sig.armPose.elev_R),
       elev_torso_L: r1(sig.armPose.elev_torso_L),
@@ -1784,6 +1855,26 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       reach_R: r2(sig.armPose.reach_R),
       extend_L: !!sig.armPose.extend_L,
       extend_R: !!sig.armPose.extend_R,
+      // 操作设备：设备 ROI 是否配置 + 哪只手在设备区域（评估/调 ROI 用）
+      operating_roi: !!sig.armPose.operating_roi,
+      operating_L: !!sig.arm.operating_L,
+      operating_R: !!sig.arm.operating_R,
+      // 肘兜底与聚合：离线调 operating（ROI/阈值/保持窗）时不用再从 kp 反推
+      operating_elbow_L: !!sig.arm.operating_elbow_L,
+      operating_elbow_R: !!sig.arm.operating_elbow_R,
+      operating_any: !!sig.arm.operating_any,
+      // 本帧是否用了物体检测器给出的设备框（false = 退回人工 ROI / 无 ROI）
+      operating_equipment: !!sig.arm.operating_equipment,
+      // 多边形 ROI / 人框有效性的诊断（老字段不变，只增可选字段）
+      operating_roi_mode: sig.armPose.operating_roi_mode ?? null,
+      operating_roi_zones: sig.armPose.operating_roi_zones ?? 0,
+      operating_roi_zone: sig.arm.operating_roi_zone ?? null,
+      // 在设备旁（上下文）：人体框与 ROI 的重叠比例/结果
+      near_equipment: !!sig.arm.near_equipment,
+      near_equipment_overlap: r2(sig.arm.near_equipment_overlap),
+      near_equipment_zone: sig.arm.near_equipment_zone ?? null,
+      near_equipment_source: sig.arm.near_equipment_source ?? null,
+      near_equipment_validity: sig.arm.near_equipment_validity ?? null,
       azimuth_L: r1(sig.armPose.azimuth_L),
       azimuth_R: r1(sig.armPose.azimuth_R),
       // —— R3：2D/3D 双份信号。离线对比「哪套在正/侧面更可分」必须两边都有，
@@ -1832,10 +1923,29 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
           state: vd.ppe.helmet.state, alert: vd.ppe.helmet.alert, streak_ms: vd.ppe.helmet.streak_ms,
           ...(vd.ppe.helmet.reason ? { reason: vd.ppe.helmet.reason } : {}),
           ...(vd.ppe.helmet.reason_code ? { reason_code: vd.ppe.helmet.reason_code } : {}),
+          // 几何 region（可选）：离线审计「为什么判成 worn/missing」
+          ...(vd.ppe.helmet.source ? { source: vd.ppe.helmet.source } : {}),
+          ...(Array.isArray(vd.ppe.helmet.box) ? { box: vd.ppe.helmet.box.map(r1) } : {}),
         },
         glove: {
           state: vd.ppe.glove.state, alert: vd.ppe.glove.alert, streak_ms: vd.ppe.glove.streak_ms,
           ...(vd.ppe.glove.reason_code ? { reason_code: vd.ppe.glove.reason_code } : {}),
+          ...(vd.ppe.glove.L ? {
+            L: {
+              state: vd.ppe.glove.L.state, alert: vd.ppe.glove.L.alert, streak_ms: vd.ppe.glove.L.streak_ms,
+              ...(vd.ppe.glove.L.source ? { source: vd.ppe.glove.L.source } : {}),
+              ...(vd.ppe.glove.L.side_from ? { side_from: vd.ppe.glove.L.side_from } : {}),
+              ...(Array.isArray(vd.ppe.glove.L.box) ? { box: vd.ppe.glove.L.box.map(r1) } : {}),
+            },
+          } : {}),
+          ...(vd.ppe.glove.R ? {
+            R: {
+              state: vd.ppe.glove.R.state, alert: vd.ppe.glove.R.alert, streak_ms: vd.ppe.glove.R.streak_ms,
+              ...(vd.ppe.glove.R.source ? { source: vd.ppe.glove.R.source } : {}),
+              ...(vd.ppe.glove.R.side_from ? { side_from: vd.ppe.glove.R.side_from } : {}),
+              ...(Array.isArray(vd.ppe.glove.R.box) ? { box: vd.ppe.glove.R.box.map(r1) } : {}),
+            },
+          } : {}),
         },
       } : null,
     })),
@@ -2225,11 +2335,14 @@ function renderAccuracy(items) {
   const sourceNote = !accuracyReport
     ? '没有准确率报告：运行 npm run accuracy 生成 web/accuracy.json（读取 eval-data 的标注素材）。'
     : `${src?.dir || 'eval-data'} · ${src?.totalFrames ?? 0} 帧 · ${src?.note || ''}`
+      + (accuracyReport?.profile ? ` · profile：${accuracyReport.profile}` : '')
       + (stale ? ` · 注意：报告参数 ${accuracyReport.paramsHash} 与当前 ${activeParamsHash} 不一致，改阈值后要重跑 npm run accuracy` : '');
   box.innerHTML = rows
     + `<div class="acc-note">${esc(sourceNote)}</div>`
-    + '<div class="acc-note">口径：逐帧召回 / 精确；每个方向样本 ≥20 才报百分比，'
-    + '「未评估」= 没有标注数据。手部「未检出」时伸手/持物/指向不判，也不计入准确率。</div>';
+    + '<div class="acc-note">口径：手臂动作为段级（每个标注段是否命中，TP/FN/FP 按段计）；'
+    + '手势为帧级。每个方向样本 ≥20 段才报百分比，「未评估」= 没有标注数据。</div>'
+    + '<div class="acc-note">手势未检出/侧对/未归属时弃权，不计入手势指标；'
+    + '伸手/持物/指向在手未检出时判为 false，仍按段计入召回。</div>';
 }
 
 function updateUI() {
@@ -2245,7 +2358,11 @@ function updateUI() {
 
   if (act?.posture) {
     const secs = (act.postureMs / 1000).toFixed(1);
-    $('postureMeta').textContent = act.frozen ? `保持 ${secs}s · 置信不足` : `持续 ${secs}s`;
+    // 上半身姿态是「推断」：膝/踝不可见，只能看躯干朝向，不等于站/坐
+    const inferred = act.postureId === 'upper_upright' || act.postureId === 'upper_lean';
+    $('postureMeta').textContent = act.frozen
+      ? `保持 ${secs}s · 置信不足`
+      : `${inferred ? '仅上半身可见 · 推断 · ' : ''}持续 ${secs}s`;
   } else if (sig && !sig.ok) {
     $('postureMeta').textContent = `画面内置信 ${r2(sig.score)} · 人体太小/光线不足/被遮挡`;
   } else if (upperOnly) {
@@ -2268,6 +2385,13 @@ function updateUI() {
     handReady,
     imageMode: mode === 'image',
     accuracyById,
+    operatingRoi,
+    operatingCfg,
+    operatingHolds,
+    nearEquipmentCfg,
+    nearEquipmentHolds,
+    objectOn,
+    objectReady,
   });
 
   for (const a of ARM_ACTIONS) {
@@ -2503,6 +2627,7 @@ $('modelSel').addEventListener('change', () => {
   // 换档后其它实例也是旧档位的：一起放掉，下次用到时按新档重建
   closeMultiEstimator();
   multiReady = false;
+  fallbackPoseFailed = false;
   if (mode !== 'idle') {
     initEstimator();
     if (multiOn) ensureMultiEstimator();
@@ -2513,6 +2638,7 @@ $('delegateSel').addEventListener('change', () => {
   closeMultiEstimator();
   invalidateObjectDetector();
   multiReady = false;
+  fallbackPoseFailed = false;
   if (mode !== 'idle') {
     initEstimator();
     if (multiOn) ensureMultiEstimator();
