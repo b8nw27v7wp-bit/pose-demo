@@ -323,6 +323,10 @@ let lastTs = 0;          // MediaPipe 要求时间戳严格递增
 let handFails = 0;       // 手部推理连续失败计数
 let lastLogVideoTime = -1; // 上一次写进 frameLog 的 video_time（秒）
 let videoWrapDetected = false; // 文件模式下检测到 currentTime 回退（循环回绕 / 手动拖回）
+// 当前挂在 <video> 上的 blob URL。**只在换源/停止时释放**：
+// 媒体元素是边播边按 range 读的，大文件播到缓冲边界要重新读一次，
+// 提前 revoke 会让视频直接停住（见 useVideoSource 里的注释）。
+let videoBlobUrl = null;
 // —— 输入/设置状态 ——
 let cameraFacing = 'user';      // 'user' | 'environment'
 let cameraDeviceId = null;      // enumerateDevices 的 deviceId
@@ -767,6 +771,7 @@ async function startCamera(opts = {}) {
     // 摘掉上一次文件源的 src（可能是已 revoke 的 blob），否则 srcObject 结束后
     // 元素可能又去加载那个失效地址。
     videoEl.removeAttribute('src');
+    releaseVideoBlob();
     videoEl.srcObject = stream;
     assigned = true;
     videoEl.loop = false;
@@ -856,20 +861,31 @@ async function useVideoSource(src, { loop = false, revoke = null } = {}) {
   // 显式输入优先于 ?src= 的自动加载：手动选了视频后，别再让自动素材在模型就绪时顶掉它。
   autoLoaded = true;
   const stale = () => token !== inputSeq;
+  // 本轮 blob 不再需要（还没挂上元素 / 已被更新的输入顶掉）。
+  // 若元素此刻正挂着自己这个地址，必须先摘 src 再释放，否则会触发一次对失效 blob 的加载。
+  const dropBlob = () => {
+    if (!revoke) return;
+    if (videoBlobUrl === revoke) {
+      videoEl.removeAttribute('src');
+      releaseVideoBlob();
+    } else {
+      URL.revokeObjectURL(revoke);
+    }
+  };
   await profileReady;
   if (stale()) {
-    if (revoke) URL.revokeObjectURL(revoke);   // 还没挂到 video 上，直接释放
+    dropBlob();                            // 还没挂到 video 上，直接释放
     return false;
   }
   stopStream();
   if (!(await ensureEstimator())) {
     if (stale()) {
-      if (revoke) URL.revokeObjectURL(revoke);
+      dropBlob();
       return false;
     }
     // 模型起不来时，正在播的原文件 / 正在看的图片别跟着一起清掉
     if ((mode === 'file' && videoEl.getAttribute('src')) || (mode === 'image' && !photoEl.hidden)) {
-      if (revoke) URL.revokeObjectURL(revoke);   // 新 blob 从没挂到 video 上，直接释放
+      dropBlob();                          // 新 blob 从没挂到 video 上，直接释放
       syncPlayer();
       return false;
     }
@@ -877,33 +893,41 @@ async function useVideoSource(src, { loop = false, revoke = null } = {}) {
     videoEl.srcObject = null;
     mode = 'idle';
     setActiveInput(null);
-    if (revoke) URL.revokeObjectURL(revoke);
+    dropBlob();
     syncPlayer();
     return false;
   }
   if (stale()) {
-    if (revoke) URL.revokeObjectURL(revoke);
+    dropBlob();
     return false;
   }
   videoEl.srcObject = null;
-  if (revoke) {
-    videoEl.addEventListener('loadstart', () => setTimeout(() => URL.revokeObjectURL(revoke), 5000), { once: true });
-  }
+  // 换源：把旧 blob 记下来，等新源真正接管后再释放（见下面的 finally）。
+  // **不能**「loadstart 后 N 秒 revoke」：媒体元素只按需读 range，
+  // 43MB/232s 的 720p 素材实测在 18.6s 处要重新读一次，URL 已失效就直接
+  // waiting → readyState 2 → MEDIA_ERR_NETWORK（code 2），画面停在那一帧、
+  // 识别帧数不再增长——用户看到的就是「导入后播二十秒左右卡住」。
+  const prevBlob = videoBlobUrl;
+  videoBlobUrl = revoke || null;
   videoEl.src = src;
   videoEl.loop = loop;
   // 出错回调也绑定到这一代输入：旧源的 error 不能清掉用户刚选中的新源。
   videoEl.onerror = () => {
-    if (!stale()) failInput(`视频无法解码（code ${videoEl.error?.code ?? '?'}）`);
+    if (!stale()) failInput(`视频读取失败（${mediaErrorText(videoEl.error)}）`);
   };
 
   // 必须先等元数据/首帧就绪再 play()，否则部分环境下 play() 会被 abort
   try {
     await waitForVideoReady(videoEl);
   } catch (e) {
-    if (!stale()) failInput(`视频加载失败：${e.message}`);
+    if (stale()) dropBlob();
+    else failInput(`视频加载失败：${e.message}`);
     return false;
+  } finally {
+    // 到这里元素已经在读新源（或已失败），旧 blob 才脱离引用，释放是安全的。
+    if (prevBlob && prevBlob !== revoke) URL.revokeObjectURL(prevBlob);
   }
-  if (stale()) { if (revoke) URL.revokeObjectURL(revoke); return false; }
+  if (stale()) { dropBlob(); return false; }
   try {
     await videoEl.play();
   } catch (e) {
@@ -1369,6 +1393,7 @@ async function useImageSource(src, { revoke = null } = {}) {
   videoEl.pause();
   videoEl.srcObject = null;
   videoEl.removeAttribute('src');
+  releaseVideoBlob();
   videoEl.hidden = true;
   mode = 'image';
   placeholder.hidden = true;
@@ -1400,14 +1425,9 @@ function stopAll() {
   stopLoop();
   clearPhoto();
   // 先摘掉 src 再 revoke，否则会触发一次对已失效 blob 的加载
-  if (videoEl.src && videoEl.src.startsWith('blob:')) {
-    const old = videoEl.src;
-    videoEl.removeAttribute('src');
-    URL.revokeObjectURL(old);
-  } else {
-    videoEl.removeAttribute('src');
-  }
+  videoEl.removeAttribute('src');
   videoEl.srcObject = null;
+  releaseVideoBlob();
   mode = 'idle';
   resetPlaceholder();
   placeholder.hidden = false;
@@ -2268,6 +2288,32 @@ function resetPlaceholder() {
   if (hint) hint.textContent = '点「摄像头」开始，或「上传视频」/拖入视频文件';
 }
 
+/**
+ * MediaError.code → 人话。原来是直接写 code 数字，「视频无法解码（code 2）」
+ * 其实 code 2 是网络/读取中断，和编解码无关，排障时最容易看错方向。
+ */
+function mediaErrorText(err) {
+  const code = err?.code ?? 0;
+  const map = {
+    1: 'MEDIA_ERR_ABORTED · 读取被中断',
+    2: 'MEDIA_ERR_NETWORK · 读不到数据（文件源被提前释放/权限丢失）',
+    3: 'MEDIA_ERR_DECODE · 解码失败（编码或文件损坏）',
+    4: 'MEDIA_ERR_SRC_NOT_SUPPORTED · 格式不支持或文件缺失',
+  };
+  return map[code] || `code ${code || '?'}${err?.message ? ` · ${err.message}` : ''}`;
+}
+
+/**
+ * 释放当前视频源占用的 blob URL。**必须先摘掉 src 再调用**：
+ * 元素还挂着这个地址时 revoke 会触发一次对失效 blob 的加载（error 事件）。
+ * 只在换源/停止/失败时用，播放过程中绝不能释放（大文件要续读 range）。
+ */
+function releaseVideoBlob() {
+  const url = videoBlobUrl;
+  videoBlobUrl = null;
+  if (url) URL.revokeObjectURL(url);
+}
+
 /** 输入失败：停循环、摘掉源、清空本次记录，回到空闲（状态栏保留具体错误） */
 function failInput(message) {
   setStatus(message, 'err');
@@ -2276,6 +2322,7 @@ function failInput(message) {
   clearPhoto();
   videoEl.removeAttribute('src');
   videoEl.srcObject = null;
+  releaseVideoBlob();
   mode = 'idle';
   lastResult = null;
   setActiveInput(null);
