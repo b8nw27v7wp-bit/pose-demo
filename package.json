@@ -16,6 +16,7 @@
     "test:ppe": "node web/test/ppe-test.mjs",
     "test:ppe-eval": "node web/test/ppe-eval.mjs --self-test",
     "check:multi": "node web/test/headless-multi.mjs",
+    "shots": "node scripts/pose-screenshots.mjs",
     "check:open": "node web/test/headless-open-data.mjs",
     "check:ppe": "node web/test/headless-ppe-onnx.mjs",
     "probe:throughput": "node web/test/throughput-probe.mjs",

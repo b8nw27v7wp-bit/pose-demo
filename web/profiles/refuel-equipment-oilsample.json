@@ -1,0 +1,42 @@
+{
+  "name": "refuel-equipment-oilsample",
+  "model": "full",
+  "note": "油样取样片（58s，runs/oil-sample-2026-11-11）单独训练的两类设备检测器 panel/valve，用于和 refuel-equipment（panel/valve/gauge，含 RF100）做同集 A/B。gauge 在这段素材里只出现在一个分镜，留作 val 后训练集没有 gauge 实例，所以这一版不训 gauge（由 equipment.onnx 那版负责）。训练/验证按分镜留出（37.0-41.4 panel、44.56-46.6 与 48.88-51.04 valve、46.6-48.88 panel+gauge 作 val），属于同集验证，**不是泛化准确率**。换机位必须重新标注与校准 equipmentMaxDist。",
+  "params": {
+    "perception": {
+      "objects": {
+        "enabled": true,
+        "backend": "onnx",
+        "model": "equipment-oilsample.onnx",
+        "inputSize": 320,
+        "maxResults": 8,
+        "scoreThreshold": 0.35,
+        "iouThreshold": 0.45,
+        "intervalMs": 150,
+        "labels": ["panel", "valve"]
+      }
+    },
+    "signals": {
+      "arm": {
+        "operating": {
+          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 },
+          "minElbowVis": 0.21,
+          "minElbowReach": 0.315,
+          "equipmentLabels": ["panel", "valve"],
+          "equipmentMinScore": 0.35,
+          "equipmentMaxDist": 0.7,
+          "equipmentFallbackRoi": true
+        },
+        "nearEquipment": {
+          "minOverlap": 0.5
+        }
+      }
+    },
+    "actions": {
+      "holds": {
+        "operating": 1500,
+        "operatingMaxGap": 600
+      }
+    }
+  }
+}
