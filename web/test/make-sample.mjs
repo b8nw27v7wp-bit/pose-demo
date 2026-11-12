@@ -68,7 +68,6 @@ hold(STAND, 2000);
 const standEnd = t;
 
 // 2–4s  一次完整鼓掌（张开 0.8s → 停 0.3s → 合拢 0.8s → 停 0.3s）
-const clapStart = t;
 for (let i = 1; i <= 8; i++) { t += 100; push(clapKp(lerp(0, 1, i / 8))); }
 hold(clapKp(1), 300);
 for (let i = 7; i >= 0; i--) { t += 100; push(clapKp(lerp(0, 1, i / 8))); }
@@ -91,10 +90,10 @@ hold(STAND, 1000);
 const labels = {
   name: 'sample（合成数据，非实拍）',
   source: 'web/test/make-sample.mjs',
-  note: '合成姿态，仅用于验证评估链路。真实阈值必须用实拍素材拟合。',
+  note: '合成姿态，仅用于验证评估链路。真实阈值必须用实拍素材拟合。鼓掌计数已下线，不再标注。',
+  // 鼓掌计数已下线：中间这段合掌动作保留（合成信号仍可用于回归），但不再标注
   segments: [
     { action: 'stand', start: 500, end: standEnd - 100 },
-    { action: 'clap', start: clapStart, end: clapEnd, count: 1, tol: 0 },
     { action: 'stand', start: clapEnd + 200, end: armStart - 100 },
     { action: 'armRaised', start: armStart + 400, end: armEnd },
   ],

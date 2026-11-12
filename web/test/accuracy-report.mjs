@@ -16,7 +16,8 @@ import { execFile } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { ARM_ACTIONS } from '../js/actions.js';
+// 只为还在用的动作出准确率；retired 动作不写进 web/accuracy.json
+import { ARM_LABEL_ACTIONS } from '../js/actions.js';
 import { wilson } from './evaluate.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -68,7 +69,7 @@ export function buildAccuracyReport(evalReport, { dir = 'eval-data', minSamples 
   // 评估器的 summary 用 flag 名（armRaised），页面用动作 id（arm_raised）。
   // 在这里映射一次，页面就不需要知道两套命名。
   const actions = {};
-  for (const a of ARM_ACTIONS) {
+  for (const a of ARM_LABEL_ACTIONS) {
     const row = byFlag.get(a.flag);
     actions[a.id] = row ? {
       tp: row.tp ?? 0,

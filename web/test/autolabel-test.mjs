@@ -62,6 +62,16 @@ console.log('\n[2] repSessions');
     JSON.stringify(merged));
   const noReps = repSessions([{ ts: 0, act: null }], 'clap');
   check('没有计数 → 空', Array.isArray(noReps) && noReps.length === 0);
+  // 拿取用 PhaseSequence：reach（伸手）起步，grasp（合手）计数，没有 clap 的 down/up
+  const gtl = [
+    { ts: 0, act: { repPhase: { grasp: 'idle' }, reps: { grasp: 0 } } },
+    { ts: 500, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 1000, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 1500, act: { repPhase: { grasp: 'grasp' }, reps: { grasp: 1 } } },
+  ];
+  const gs = repSessions(gtl, 'grasp', { mergeMs: 500, minMs: 300 });
+  check('拿取按 reach→grasp 切出周期', gs.length === 1 && gs[0].count === 1
+    && gs[0].start === 500 && gs[0].end === 1500, JSON.stringify(gs));
 }
 
 // —— 3. 合成样例上的草稿 ——

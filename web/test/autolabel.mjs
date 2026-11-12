@@ -8,7 +8,7 @@
 // 用法：
 //   node web/test/autolabel.mjs --input eval-data/a.jsonl
 //   node web/test/autolabel.mjs --input a.frames.json --out a.labels.draft.json --merge-ms 500 --min-ms 300
-//   node web/test/autolabel.mjs --input a.jsonl --profile web/profiles/fitness.json
+//   node web/test/autolabel.mjs --input a.jsonl --profile web/profiles/refuel.json
 //
 // 与 R1 的 `evaluate.mjs --autolabel` 口径一致：合并 500ms 内的同动作命中，丢弃 <300ms 的碎片。
 // 动作清单从 js/actions.js 的注册表派生，不在这里手抄（§12.7 新增动作曾在这里漏掉）。
@@ -58,6 +58,8 @@ export function rangesFrom(series, { mergeMs = 500, minMs = 300 } = {}) {
  * 段的 count 是这几次之和（evaluate.mjs 的计数口径就是「段内期望次数」）。
  */
 export function repSessions(timeline, action, { mergeMs = 500, minMs = 300 } = {}) {
+  // 计数器的起步相位不统一：鼓掌是 down（合掌），拿取是 reach（伸手）。
+  const startPhase = action === 'grasp' ? 'reach' : 'down';
   const cycles = [];
   let downTs = null;
   let prevCount = 0;
@@ -66,13 +68,13 @@ export function repSessions(timeline, action, { mergeMs = 500, minMs = 300 } = {
     const act = r.act;
     const phase = act && act.repPhase ? act.repPhase[action] : null;
     const count = act && act.reps ? act.reps[action] : 0;
-    if (phase === 'down' && downTs === null) downTs = r.ts;
+    if (phase === startPhase && downTs === null) downTs = r.ts;
     if (count > prevCount) {
       cycles.push([downTs ?? prevTs ?? r.ts, r.ts]);
       prevCount = count;
       downTs = null;
     }
-    if (phase !== 'down') downTs = null;
+    if (phase !== startPhase) downTs = null;
     prevTs = r.ts;
   }
   const sessions = [];

@@ -44,7 +44,8 @@ const CUSTOM_PROFILE = '__custom__';
 // profile 下拉的固定项；自定义 URL 通过 ?profile= 或上次选择恢复
 const PROFILES = [
   { id: 'default', label: '默认阈值', url: null },
-  { id: 'fitness', label: '健身', url: '/web/profiles/fitness.json' },
+  // 当前项目场景：设备 ROI/检测框 + operating/near_equipment 保持窗按实测调过
+  { id: 'refuel', label: '加油作业', url: '/web/profiles/refuel.json' },
   // 工业/安全场景：多人 + 物体检测 + PPE。开关本身也写在 profile 里，
   // 所以换到这个档不用再手动勾「多人」「物体」。
   { id: 'safety', label: '安全合规', url: '/web/profiles/safety.json' },
@@ -70,7 +71,7 @@ const logTrim = () => Math.round(logLimit() * 0.1);
 // 弱机达不到上限时会自然回落到推理速度，不需要手动降档。
 const inferInterval = () => 1000 / (Number($('fpsCapSel').value) || 30);
 
-// profile：URL 参数 ?profile=/profiles/fitness.json，用于切场景时只换阈值不改代码
+// profile：URL 参数 ?profile=/web/profiles/refuel.json，用于切场景时只换阈值不改代码
 const profileUrl = new URLSearchParams(location.search).get('profile');
 let activeParams = {};
 let profileName = 'default';

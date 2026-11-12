@@ -8,7 +8,7 @@ import {
   accuracyFor, formatAccuracy, accuracyTier, accuracyStale, loadAccuracyReport, MIN_SAMPLES,
 } from '../js/accuracy.js';
 import { buildAccuracyReport } from './accuracy-report.mjs';
-import { ARM_ACTIONS } from '../js/actions.js';
+import { ARM_LABEL_ACTIONS } from '../js/actions.js';
 
 let pass = 0;
 let fail = 0;
@@ -48,9 +48,10 @@ const rep = buildAccuracyReport(evalReport, {
 check('flag → 动作 id', rep.actions.arm_raised?.recall === 0.89 && rep.actions.arm_raised?.nRecall === 45);
 check('n 与 CI 原样保留',
   rep.actions.arm_raised?.recallCI?.[0] === 0.77 && rep.actions.arm_raised?.nPrecision === 48);
-check('未出现的动作是 null', rep.actions.wave === null && rep.actions.point === null);
-check('注册表里每个手臂动作都列出', Object.keys(rep.actions).length === ARM_ACTIONS.length,
-  `${Object.keys(rep.actions).length}/${ARM_ACTIONS.length}`);
+check('未出现的动作是 null', rep.actions.carry === null && rep.actions.point === null);
+check('已下线动作不进准确率报告', !('wave' in rep.actions) && !('arm_front' in rep.actions));
+check('注册表里每个可标注手臂动作都列出', Object.keys(rep.actions).length === ARM_LABEL_ACTIONS.length,
+  `${Object.keys(rep.actions).length}/${ARM_LABEL_ACTIONS.length}`);
 check('实拍素材不标合成', rep.source.synthetic === false && !/不代表实拍/.test(rep.source.note));
 check('minSamples / 参数指纹带入', rep.minSamples === 20 && rep.paramsHash === 'fnv1a:test');
 check('profile 与数据源目录带入', rep.profile === '默认阈值' && rep.source.dir === 'eval-data');

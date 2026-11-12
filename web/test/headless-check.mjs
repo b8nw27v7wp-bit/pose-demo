@@ -366,13 +366,13 @@ async function main() {
       const clearedFrames = window.__pose.state.frames;
 
       const profile = $('profileSel');
-      profile.value = 'fitness';
+      profile.value = 'refuel';
       profile.dispatchEvent(new Event('change', { bubbles: true }));
       for (let i = 0; i < 40; i++) {
-        if (/fitness/.test(tag.textContent || '')) break;
+        if (/refuel/.test(tag.textContent || '')) break;
         await new Promise((r) => setTimeout(r, 100));
       }
-      const profileTagFitness = tag.textContent;
+      const profileTagRefuel = tag.textContent;
 
       profile.value = 'default';
       profile.dispatchEvent(new Event('change', { bubbles: true }));
@@ -382,7 +382,7 @@ async function main() {
       }
       return {
         clearedFrames,
-        profileTagFitness,
+        profileTagRefuel,
         profileTagDefault: tag.textContent,
       };
     })()`);
@@ -419,7 +419,7 @@ async function main() {
       && frontend.profileOptions >= 2
       && /帧/.test(frontend.logText) && /profile=/.test(frontend.logTitle)
       && panel.clearedFrames === 0
-      && /fitness/.test(panel.profileTagFitness) && /默认/.test(panel.profileTagDefault)
+      && /refuel/.test(panel.profileTagRefuel) && /默认/.test(panel.profileTagDefault)
       && armHint.hasHint && armHint.count === ARM_UI_ACTIONS.length && armHint.titled === ARM_UI_ACTIONS.length
       && !!armHint.line && armHint.line !== '—'
       && accuracyUi.hasBtn && accuracyUi.open === true && accuracyUi.hiddenAfter === true
