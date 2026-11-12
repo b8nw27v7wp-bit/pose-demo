@@ -23,7 +23,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPage, sleep } from './cdp.mjs';
-import { ARM_ACTIONS } from '../js/actions.js';
+import { ARM_LABEL_ACTIONS } from '../js/actions.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const DIR = path.join(ROOT, 'eval-data', 'open', 'mot17');
@@ -414,7 +414,7 @@ async function main() {
     actionTotal.frozen += act.frozen;
     for (const [k, n] of act.counts) actionTotal.counts.set(k, (actionTotal.counts.get(k) || 0) + n);
     if (act.verdicts) {
-      const tops = ARM_ACTIONS
+      const tops = ARM_LABEL_ACTIONS
         .map((a) => ({ name: a.name, n: act.counts.get(a.flag) || 0 }))
         .filter((x) => x.n > 0)
         .sort((x, y) => y.n - x.n)
@@ -451,7 +451,7 @@ async function main() {
   if (actionTotal.verdicts) {
     const rate = (n) => `${(n / actionTotal.verdicts * 100).toFixed(1)}%`;
     console.log('\n动作触发率（MOT17 没有动作标注；分母 = 人-帧，只用于发现明显误报）：');
-    console.log('  ' + ARM_ACTIONS
+    console.log('  ' + ARM_LABEL_ACTIONS
       .map((a) => `${a.name} ${rate(actionTotal.counts.get(a.flag) || 0)}`).join(' · '));
     console.log(`  判定冻结（低置信）${rate(actionTotal.frozen)}`);
   }

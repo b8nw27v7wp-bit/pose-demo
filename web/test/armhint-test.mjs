@@ -72,15 +72,15 @@ check('未检出 ≠ 手是空的', none.hands.state === 'none' && none.hands.ti
 // —— 4. 3D / 单帧 / 髋可见性 ——
 console.log('\n[4] 运行条件');
 const noWorld = explainArmActions(allReady({ sig: sig({ armPose: { has_world: false } }) }));
-check('无 3D → 前/侧平举与指向不可用', noWorld.byId.arm_front.na && noWorld.byId.arm_side.na && noWorld.byId.point.na);
+check('无 3D → 指向不可用', noWorld.byId.point.na, '前/侧平举已下线，不再参与提示');
 check('无 3D → 举手仍可判（降级 2D）', noWorld.byId.arm_raised.na === false);
-check('无 3D → 提示写明', noWorld.line.includes('前/侧平举、指向不可用'), noWorld.line);
+check('无 3D → 提示写明', noWorld.line.includes('指向不可用'), noWorld.line);
 
 const worldOff = explainArmActions(allReady({
   sig: sig({ armPose: { has_world: false }, world: { enabled: false } }),
 }));
 check('3D 被配置关闭 → 原因是配置',
-  worldOff.byId.arm_front.why.includes('world.enabled=false'));
+  worldOff.byId.point.why.includes('world.enabled=false'));
 
 // 操作设备必须先在 profile 里圈出设备 ROI；没有 ROI 时标「不可用」，不拿伸手去猜
 const noRoi = explainArmActions(allReady({
@@ -181,18 +181,18 @@ check('开启人框有效性时 tooltip 写明几何门',
   nearValid.byId.near_equipment.title);
 
 const img = explainArmActions(allReady({ imageMode: true }));
-check('单帧 → 挥手不可用', img.byId.wave.na && img.byId.wave.why.includes('单帧'));
-check('单帧 → 提示写明', img.line.includes('单帧图片'), img.line);
+check('单帧不再产生额外不可用提示', img.line === DEFAULT_HINT, img.line);
 
 const lowHip = explainArmActions(allReady({ sig: sig({ vis: { hip: 0.1 } }) }));
-check('髋不可见 → 提示叉腰不判', lowHip.line.includes('叉腰不判'), lowHip.line);
-check('髋不可见不把叉腰标成结构不可用', lowHip.byId.hips.na === false);
+check('髋不可见不再产生叉腰提示', lowHip.line === DEFAULT_HINT, lowHip.line);
 
 // —— 5. 同时亮多个动作：讲可信度最低的那个 ——
 console.log('\n[5] 当前动作优先级');
-const wav = explainArmActions(allReady({ act: act({ armRaised: true, waving: true }) }));
-check('举手 + 挥手 → 讲挥手', wav.line.startsWith('挥手：'), wav.line);
-check('挥手提示讲翻转/幅度', wav.line.includes('慢挥') || wav.line.includes('方向反转'));
+const retiredOnly = explainArmActions(allReady({ act: act({ waving: true }) }));
+check('已下线动作亮了也不进提示行', retiredOnly.line === DEFAULT_HINT, retiredOnly.line);
+
+const carryPoint = explainArmActions(allReady({ act: act({ carrying: true, pointing: true }) }));
+check('持物 + 指向 → 讲指向', carryPoint.line.startsWith('指向：'), carryPoint.line);
 
 const pt = explainArmActions(allReady({ act: act({ reaching: true, pointing: true }) }));
 check('伸手 + 指向 → 讲指向', pt.line.startsWith('指向：'), pt.line);

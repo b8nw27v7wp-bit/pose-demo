@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { rangesFrom, repSessions, autolabelFrames, ARM_FLAGS, REPS } from './autolabel.mjs';
-import { ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
+import { ARM_LABEL_ACTIONS, REP_UI_ACTIONS } from '../js/actions.js';
 import { replay, evaluateClip } from './evaluate.mjs';
 import { loadFrames } from './frame-io.mjs';
 
@@ -62,6 +62,16 @@ console.log('\n[2] repSessions');
     JSON.stringify(merged));
   const noReps = repSessions([{ ts: 0, act: null }], 'clap');
   check('没有计数 → 空', Array.isArray(noReps) && noReps.length === 0);
+  // 拿取用 PhaseSequence：reach（伸手）起步，grasp（合手）计数，没有 clap 的 down/up
+  const gtl = [
+    { ts: 0, act: { repPhase: { grasp: 'idle' }, reps: { grasp: 0 } } },
+    { ts: 500, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 1000, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 1500, act: { repPhase: { grasp: 'grasp' }, reps: { grasp: 1 } } },
+  ];
+  const gs = repSessions(gtl, 'grasp', { mergeMs: 500, minMs: 300 });
+  check('拿取按 reach→grasp 切出周期', gs.length === 1 && gs[0].count === 1
+    && gs[0].start === 500 && gs[0].end === 1500, JSON.stringify(gs));
 }
 
 // —— 3. 合成样例上的草稿 ——
@@ -72,7 +82,7 @@ console.log('\n[3] sample.frames.json');
   const by = (a) => segments.filter((s) => s.action === a);
   check('产出正例段', segments.length > 0, `n=${segments.length}`);
   check('含 stand', by('stand').length >= 1);
-  check('含 clap 且 count ≥1', by('clap').length === 1 && by('clap')[0].count === 1);
+  check('鼓掌计数已下线：草稿不再生成 clap 段', by('clap').length === 0);
   check('含 armRaised', by('armRaised').length >= 1);
   check('绝不生成 none', by('none').length === 0);
   check('时间基为 ts 毫秒（样例无 video_time）',
@@ -87,11 +97,11 @@ console.log('\n[3] sample.frames.json');
   // 动作清单必须从注册表派生：§12.7 新增的 5 个手臂动作与 grasp 曾在这里漏掉，
   // 导致 `npm run autolabel` 的草稿和 `evaluate --autolabel` 不是同一套动作。
   check('自动标注覆盖注册表里的每个手臂动作',
-    ARM_ACTIONS.every((a) => ARM_FLAGS.includes(a.flag)),
-    `missing=${ARM_ACTIONS.map((a) => a.flag).filter((f) => !ARM_FLAGS.includes(f))}`);
+    ARM_LABEL_ACTIONS.every((a) => ARM_FLAGS.includes(a.flag)),
+    `missing=${ARM_LABEL_ACTIONS.map((a) => a.flag).filter((f) => !ARM_FLAGS.includes(f))}`);
   check('自动标注覆盖注册表里的每个计数动作',
-    REP_ACTIONS.every((r) => REPS.includes(r.id)),
-    `missing=${REP_ACTIONS.map((r) => r.id).filter((id) => !REPS.includes(id))}`);
+    REP_UI_ACTIONS.every((r) => REPS.includes(r.id)),
+    `missing=${REP_UI_ACTIONS.map((r) => r.id).filter((id) => !REPS.includes(id))}`);
 
   // 裸数组可能是多行格式化的；按行解析会一行都认不出来，静默得到 0 帧。
   const tmp = await mkdtemp(path.join(os.tmpdir(), 'pose-frames-'));

@@ -209,23 +209,19 @@
   .mod-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
   .mod-head h2 { margin: 0; font-size: 12.5px; font-weight: 600; color: var(--sub); }
   .meta { font-size: 11.5px; color: var(--mute); text-align: right; font-variant-numeric: tabular-nums; }
+  /* 调试区折叠：原始信号只在调参时需要 */
+  .dbg summary { font-size: 11.5px; color: var(--mute); cursor: pointer; padding: 2px 0; list-style-position: inside; }
+  .dbg summary:hover { color: var(--ink); }
+  .dbg .kv { margin-top: 6px; }
 
   .posture-row { display: flex; align-items: baseline; gap: 10px; }
   .posture { font-size: 36px; font-weight: 600; line-height: 1.08; letter-spacing: -.02em; }
   .posture.dim { font-size: 23px; color: var(--mute); font-weight: 500; }
 
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-  .chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 3px 9px; border-radius: 6px;
-    font-size: 12.5px; color: var(--mute);
-  }
-  .chip::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: #c9cec4; flex: 0 0 auto; }
-  .chip.on { color: var(--ink); background: var(--ok-wash); box-shadow: inset 0 0 0 1px var(--ok-edge); }
-  .chip.on::before { background: var(--ok); }
-
-  /* 12 个手臂动作用 4 列：3 列会多出一整行 */
+  /* 动作网格：当前产品动作 5 个，4 列一行放得下；上下文事件单独一行 */
   .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px 4px; }
+  .ctx-row { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; margin-top: 2px; }
+  .ctx-tag { font-size: 10.5px; color: var(--mute); margin-right: 2px; }
   .act {
     display: flex; align-items: center; gap: 6px;
     padding: 3px 6px; border-radius: 6px;
@@ -291,7 +287,7 @@
   table.kv td:last-child { text-align: right; font-family: var(--font-num); font-size: 14px; color: var(--ink); }
   table.kv tr + tr td { border-top: 1px solid rgba(27, 30, 25, .06); }
 
-  .reps { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .reps { display: grid; grid-template-columns: 1fr; gap: 8px; }
   .rep .num { font-family: var(--font-num); font-size: 26px; font-weight: 600; line-height: 1.1; letter-spacing: -.01em; }
   .rep .cap { font-size: 11px; color: var(--mute); margin-top: 1px; }
 
@@ -383,7 +379,7 @@
     </select>
     <select id="profileSel" title="阈值 profile（切换会清空已记录的帧）">
       <option value="default">默认阈值</option>
-      <option value="fitness">健身</option>
+      <option value="refuel">加油作业</option>
       <option value="safety">安全合规</option>
     </select>
     <span id="profileTag" class="badge-profile" hidden></span>
@@ -436,12 +432,12 @@
     <section class="mod">
       <div class="mod-head"><h2>当前姿态</h2><span class="meta" id="postureMeta">—</span></div>
       <div class="posture-row"><div class="posture dim" id="posture">—</div></div>
-      <div class="chips" id="postureChips"></div>
     </section>
 
     <section class="mod">
       <div class="mod-head"><h2>动作与手势</h2><span class="meta" id="handMeta">—</span></div>
       <div class="actions" id="armGrid"></div>
+      <div class="ctx-row" id="ctxActions"></div>
       <div class="act-hint-row">
         <div class="act-hint" id="armHint">悬停动作名：查看判定条件与已知误判</div>
         <button class="link" id="btnAccuracy" aria-expanded="false"
@@ -456,13 +452,16 @@
 
     <section class="mod">
       <div class="mod-head"><h2>信号</h2><span class="meta" id="signalMeta">—</span></div>
-      <table class="kv" id="angles"></table>
+      <!-- 原始角度默认收起：日常看判定结论，调阈值时才展开 -->
+      <details class="dbg">
+        <summary>调试信号</summary>
+        <table class="kv" id="angles"></table>
+      </details>
     </section>
 
     <section class="mod">
       <div class="mod-head"><h2>计数与记录</h2><span class="meta" id="repMeta">—</span></div>
       <div class="reps">
-        <div class="rep"><div class="num" id="repClap">0</div><div class="cap">鼓掌</div></div>
         <div class="rep"><div class="num" id="repGrasp">0</div><div class="cap">拿取</div></div>
       </div>
       <div class="row">

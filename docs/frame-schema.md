@@ -198,7 +198,7 @@
 ```
 第一行：{"exported_at":"...","schema":"frame.jsonl v0","kp_format":"mediapipe33",
         "model":"full","delegate":"GPU","hand_model":"hand_landmarker","infer_fps":15,
-        "profile":"fitness","profile_model":"lite","params_hash":"fnv1a:1a2b3c4d",
+        "profile":"refuel","profile_model":"full","params_hash":"fnv1a:1a2b3c4d",
         "params":{...},"fps":14.4,"frame_count":562,
         "log_limit":20000,"export_mode":"single",
         "objects":{"backend":"onnx","model":"ppe_smoke.onnx","inputSize":320,
@@ -213,13 +213,13 @@
   "click_ts": 123456.7,       // performance.now，与帧 ts 同基准
   "before_ms": 3000,          // 窗口 = 点击前 3s + 之后 2s
   "after_ms": 2000,
-  "action": "clap",           // 用户选的动作：正例动作 id/flag、none、noArm、或 !动作（反例）
+  "action": "grasp",          // 用户选的动作：正例动作 id/flag、none、noArm、或 !动作（反例）
   "detected": { "posture": "stand", "flags": {...}, "reps": {...} }  // 点击时的判定快照
 }
 ```
 
 > `action` 原样写进草稿 label 的 `segments[].action`。`none` = 整帧空镜（姿态和手臂都不许有）；
-> `!onHips` = 只是不应出现叉腰（站着是允许的）；`noArm` = 姿态不限但不能有手臂动作。
+> `!armRaised` = 只是不应出现举手（站着是允许的）；`noArm` = 姿态不限但不能有手臂动作。
 > 三种反例的差别见 `docs/eval.md`。
 
 配套的 `hardcase-*.labels.json` 与普通 labels 相同（`startSec/endSec` 或 `start/end`），

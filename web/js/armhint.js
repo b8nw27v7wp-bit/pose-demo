@@ -96,23 +96,19 @@ const HAND_ACTIONS = new Set(['reach', 'carry', 'point']);
 
 // 没有 3D world 就完全无法判定（方位角是 NaN）。和「降级」区分开：
 // 举手降级成 2D 仍然能判，只是更容易错。
-const WORLD_ACTIONS = new Set(['arm_front', 'arm_side', 'point']);
+const WORLD_ACTIONS = new Set(['point']);
 
 // 同时亮多个动作时，提示优先给「可信度最低」的那个：
-// 指向/持物只有弱证据，挥手比静态动作更容易漏，静态动作放最后。
-const ACTIVE_PRIORITY = [
-  'point', 'carry', 'operating', 'near_equipment', 'wave', 'reach', 'hand_head', 'hips',
-  'crossed', 'arms_open', 'both_up', 'arm_raised', 'arm_front', 'arm_side',
-];
+// 指向/持物只有弱证据，静态动作放最后。只列面板上看得见的动作——
+// 已下线/隐藏的动作即使引擎判出，也不该在提示行里出现。
+const ACTIVE_PRIORITY = ['point', 'carry', 'operating', 'near_equipment', 'reach', 'arm_raised'];
 
 // 单手动作的逐侧 flag。提示行用它把「举手」说成「左手举手」，
 // 而不是只给一个左右不分的聚合标签。双侧同时成立时不加前缀。
 const SIDE_FLAGS = {
   arm_raised: ['armRaisedL', 'armRaisedR'],
-  wave: ['wavingL', 'wavingR'],
   reach: ['reachingL', 'reachingR'],
   point: ['pointingL', 'pointingR'],
-  hand_head: ['handAtHeadL', 'handAtHeadR'],
   carry: ['carryingL', 'carryingR'],
   operating: ['operatingL', 'operatingR'],
 };
@@ -188,8 +184,6 @@ export function explainArmActions({
   const handCount = Array.isArray(hands) ? hands.length : 0;
   const hasWorld = !!sig?.armPose?.has_world;
   const worldConfigured = sig?.world?.enabled !== false;
-  const hipVis = sig?.vis?.hip;
-  const hipHidden = Number.isFinite(hipVis) && hipVis < 0.3;
   const lowConfidence = !!sig && !sig.ok;
 
   // —— 每种动作「当前是否根本判不了」以及原因（只放稳定条件，避免逐帧闪烁）
@@ -204,7 +198,6 @@ export function explainArmActions({
     if (WORLD_ACTIONS.has(id) && sig && !hasWorld) {
       reasons.push(worldConfigured ? '本帧没有 3D world 坐标' : '配置已关闭 3D（world.enabled=false）');
     }
-    if (id === 'wave' && imageMode) reasons.push('单帧图片没有时间窗');
     // 操作设备必须有设备证据：人工 ROI 或设备检测框，两者都没有时才标「不可用」。
     // 只认 ROI 会把 detector-only profile（无 ROI、equipmentLabels 有值）误标成不可用。
     if (id === 'operating' || id === 'near_equipment') {
@@ -270,10 +263,8 @@ export function explainArmActions({
       else if (!handReady) missing.push('手部模型未加载：伸手/持物/指向/拿取不判');
       else if (handCount === 0) missing.push('手未检出：伸手/持物/指向/拿取不判（≠手是空的）');
       if (!hasWorld) missing.push(worldConfigured
-        ? '无 3D：前/侧平举、指向不可用，举手降级为 2D'
-        : '3D 已关闭：前/侧平举、指向不可用，举手按 2D 判');
-      if (hipHidden) missing.push('髋不可见：叉腰不判');
-      if (imageMode) missing.push('单帧图片：挥手不适用');
+        ? '无 3D：指向不可用，举手降级为 2D'
+        : '3D 已关闭：指向不可用，举手按 2D 判');
       line = missing.length ? missing.join(' · ') : DEFAULT_HINT;
     }
   }

@@ -4,7 +4,7 @@
 // 为什么导出帧而不是视频：离线可复现、体积极小、不保存人像（PLAN §13.3 R6）。
 // 导出的帧保留原始 ts / video_time，所以草稿 label 可以直接被 evaluate.mjs 读取。
 
-import { ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from './actions.js';
+import { ACTION_CATALOG, ARM_ACTIONS, ARM_LABEL_ACTIONS, REP_ACTIONS, REP_UI_ACTIONS } from './actions.js';
 
 export const HARDCASE_BEFORE_MS = 3000;
 export const HARDCASE_AFTER_MS = 2000;
@@ -28,15 +28,17 @@ export const HARDCASE_ACTIONS = [
   ...ACTION_CATALOG.map((a) => ({
     group: '反例 · 动作', value: `!${a.id}`, label: `不应出现：${a.name}`,
   })),
-  ...ARM_ACTIONS.map((a) => ({
+  // 已下线（retired）的动作不再出现在新增标注里：旧数据仍可被评估器读取，
+  // 但难例下拉只列产品还在用的动作，避免下拉项越积越多。
+  ...ARM_LABEL_ACTIONS.map((a) => ({
     group: '反例 · 动作', value: `!${a.flag}`, label: `不应出现：${a.name}`,
   })),
-  ...REP_ACTIONS.map((r) => ({
+  ...REP_UI_ACTIONS.map((r) => ({
     group: '反例 · 动作', value: `!${r.id}`, label: `不应出现：${r.name}`,
   })),
   ...ACTION_CATALOG.map((a) => ({ group: '姿态', value: a.id, label: a.name })),
-  ...ARM_ACTIONS.map((a) => ({ group: '手臂', value: a.flag, label: a.name })),
-  ...REP_ACTIONS.map((r) => ({ group: '计数', value: r.id, label: r.name })),
+  ...ARM_LABEL_ACTIONS.map((a) => ({ group: '手臂', value: a.flag, label: a.name })),
+  ...REP_UI_ACTIONS.map((r) => ({ group: '计数', value: r.id, label: r.name })),
 ];
 
 // 可加 `!` 前缀的「已注册动作」：姿态 id、手臂 flag、计数 id。
@@ -131,7 +133,7 @@ export function buildHardcase(frames, clickTs, {
       : `${ended ? '视频已结束，' : ''}窗口锚到最后记录帧（实际点击 ${Math.round(anchoredFrom)}ms）`,
     `窗口 ${win.length} 帧`,
     detected
-      ? `当时判定 ${detected.posture ?? '—'}，计数 掌${detected.reps?.clap ?? 0}/拿${detected.reps?.grasp ?? 0}`
+      ? `当时判定 ${detected.posture ?? '—'}，计数 拿取 ${detected.reps?.grasp ?? 0}`
       : '无判定',
   ].filter((s) => s !== null).join('；');
   const labels = {

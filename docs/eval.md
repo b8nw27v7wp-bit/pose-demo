@@ -197,10 +197,10 @@ recall/precision，下一步给段加 `"side":"L"` 并让 `evaluate.mjs` 读逐�
 
 | 想声明 | 写法 | 说明 |
 |---|---|---|
-| 站着但没叉腰 | `{"action":"!onHips", "startSec":..,"endSec":..}` | 只否定叉腰；站立本身不算错误 |
+| 站着但没举手 | `{"action":"!armRaised", "startSec":..,"endSec":..}` | 只否定举手；站立本身不算错误 |
 | 站着手臂自然下垂 | `{"action":"noArm", ...}` | 姿态任意，但不能有任何手臂动作 |
 | 这段时间什么都没做（人不在场/静止） | `{"action":"none", ...}` | **注意**：站着会被判成 `stand`，`none` 段必然失败。它适合空镜/无人 |
-| 挥手时不许计鼓掌 | `{"action":"!clap", ...}` | 计数反例：期望 0 次，多计一次就是 1 个 FP |
+| 没拿东西时不许计拿取 | `{"action":"!grasp", ...}` | 计数反例：期望 0 次，多计一次就是 1 个 FP |
 | 站立时乱计数也要算 | 标 `none` 段 | `none` 窗口内的计数增量会让该段失败，并归到对应动作的 FP |
 
 `none` 与 `noArm` 的差别：`noArm` 不把站立/坐下当成错误，也不追究计数；`none` 什么都不允许，并把窗口内的计数误报算进去。
@@ -235,7 +235,7 @@ recall/precision，下一步给段加 `"side":"L"` 并让 `evaluate.mjs` 读逐�
 
 1. 工具条左侧选“应该是什么”，或从「反例」里选一种“不应该出现”：
    - 正例（姿态/手臂/计数）：导出的是**正例段**；
-   - `!动作`（例如「不应出现：叉腰」）：只否定这一个动作，站立/其他动作不受影响；
+   - `!动作`（例如「不应出现：举手」）：只否定这一个动作，站立/其他动作不受影响；
    - `none`：整帧空镜，**姿态和手臂都不许出现**（人站着时必然失败，别用它表达单动作误报）；
    - `noArm`：姿态不限，但任何手臂动作都不应出现。
 2. 点 **判错了**，等采样窗口结束（点击前 3 秒 + 之后 2 秒）；
@@ -290,7 +290,7 @@ node web/test/manifest-check.mjs --init --dir eval-data   # 扫帧文件生成�
 - **姿态**是互斥的，报告里给出**帧级混淆矩阵**：行是标注，列是判定，对角线是判对，最后一列是行召回。
 - 真值来源：正例姿态段 → 该姿态；`none` 段 → `none`；`!姿态` 段**不参与**（它只否认一个姿态，
   其余姿态是什么并不知道）。同一帧被两个不同姿态段覆盖 → 标为**冲突**并跳过，这是标注错误，不算模型错。
-- **手臂**是多标签（可以同时成立，例如挥手必然同时是举手），做不了混淆矩阵，
+- **手臂**是多标签（例如举手可以与操作设备同时成立），做不了混淆矩阵，
   因此给出**共现矩阵**：`matrix[i][j]` = 第 i、j 个动作同时为真的帧数。它回答"哪些动作总是一起报"。
 - 手势是**帧级指标**，单独成节（见上文「手势（帧级）」），不进入姿态混淆矩阵与手臂共现矩阵。
 
@@ -315,7 +315,7 @@ labels 里写 `camera` / `subject`，报告会分别给出：
 | 误报的 `falseAlarms` | `!动作` 只记该动作（不牵连同时成立的 stand）；`noArm` 记抢占的手臂 flag；`none` 记所有在跳的姿态/flag。汇总时 FP 记到它们头上 |
 
 关键信号按动作选：姿态看 `uprightness / knee / leg_vertical`，抬臂看 `elev_* / elev_torso_*`，
-抱臂/鼓掌看 `hands_close`，叉腰看 `reach_*`。完整映射见 `evaluate.mjs` 的 `SIGNALS_FOR`。
+举手看 `elev_*`，操作设备/伸手/持物/指向看 `reach_*`。完整映射见 `evaluate.mjs` 的 `SIGNALS_FOR`。
 
 > 导出帧的 `actions.unreliable` 记录逐帧弃权原因（低置信 / 外推 / 骨骼异常 / 角度坏点，
 > 见 `docs/signals.md` §三·九）。**报告不按它筛选**——报告比的是「规则最终判定 vs 标注」。
@@ -326,7 +326,7 @@ labels 里写 `camera` / `subject`，报告会分别给出：
 报告里的 `## 事件时延与抖动` 回答两个问题：
 
 - **时延**：正例段的标签起点 → 该动作第一次判定为真，单位 ms。段开始时已经成立记 0。
-  姿态类大多为 0（标注起点时动作往往已经成立），真正有含义的是事件类（倒地、举手、挥手）。
+  姿态类大多为 0（标注起点时动作往往已经成立），真正有含义的是事件类（操作设备、举手）。
   只统计**通过**的正例段：漏判没有「首次为真」，反例也没有起点。
 - **抖动**：该动作从 off 变 on 的次数 ÷ 已标注素材总分钟数。
   翻转次数与标注无关，所以没标注的动作也能看出抖不抖；一次误报也会计入翻转。
@@ -346,11 +346,10 @@ node web/test/evaluate.mjs --dir eval-data --fit --report eval-data/report.md
 
 报告最后一节是**按标注动作段分组**的信号分位。举例：
 
-- 鼓掌下阈 `down`：看 `clap_baseline/hands_close` 的 **P5**（两手合拢时的腕距/躯干长；
-  `down` 是「低于它才算合手」）
-- 鼓掌上阈 `up`：看 `clap_baseline/hands_close` 的 **P95**（张开时的腕距比；
-  `up` 是「高于它才算张开」）
-- 两个阈值不要贴着分位写，按比例留 10% 余量，否则滤波器稍慢一点就漏计
+- 按动作查 `evaluate.mjs` 的 `SIGNALS_FOR`：例如举手看 `elev_torso_*` 的分位，
+  操作设备看 `reach_*` 与设备 ROI/检测框的命中率。
+- 阈值不要贴着分位写，按比例留 10% 余量，否则滤波器稍慢一点就漏。
+- 已下线动作（鼓掌/前平举/侧平举/叉腰/抱臂/挥手）的分位示例不再维护。
 - 深蹲/俯卧撑的阈值拟合已随动作下线（`actions.reps.squat|pushup` 不再存在）
 
 拟合出来的值写进 profile（`web/profiles/*.json` 的 `params` 段），不要改源码。
@@ -411,10 +410,10 @@ node web/test/evaluate.mjs --dir eval-data --resample 15
 
 ```bash
 # 评估时套用 profile
-node web/test/evaluate.mjs --dir eval-data --profile web/profiles/fitness.json
+node web/test/evaluate.mjs --dir eval-data --profile web/profiles/refuel.json
 
 # 页面上套用
-http://127.0.0.1:8765/web/?profile=/web/profiles/fitness.json
+http://127.0.0.1:8765/web/?profile=/web/profiles/refuel.json
 ```
 
 profile 只写**与默认值的差异**，其余走 `web/js/params.js` 的 `DEFAULT_PARAMS`。
@@ -425,7 +424,7 @@ profile 只写**与默认值的差异**，其余走 `web/js/params.js` 的 `DEFA
 profile 可以声明这套阈值是在哪个姿态模型档位下校准的：
 
 ```json
-{ "name": "fitness", "model": "lite", "params": { ... } }
+{ "name": "refuel", "model": "full", "params": { ... } }
 ```
 
 - 各档（`full` / `heavy` / `lite`）的关键点噪声不同，**用一个档位拟合的阈值拿到另一个档位可能漏计**。
@@ -505,11 +504,9 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.posture.stand.kneeGt 
 
 这几条是跑合成数据时暴露出来的，直接影响你怎么录、怎么标：
 
-1. **叉腰要同时满足「腕贴髋」和「肘外张」**。`on_hips` 判据是「腕到同侧髋 < 0.65·scale」
-   **且肘到肩-髋连线的横向偏移 > 0.22·scale**（肘不可见时只看腕）。只凭腕距会把自然下垂的手算成叉腰
-   （合成站姿的腕距髋只有 0.19·scale），所以加了第二道门。
-   标注时把「站着没叉腰」标成反例段 `{"action":"!onHips"}`（或整段 `noArm`），
-   否则这个动作的 precision 永远算不准。**不要**用 `none`：站着一定会被判成 `stand`，`none` 段必然失败。
+1. **反例必须成对**。正例动作（举手/伸手/持物/指向/操作设备/拿取）都要配
+   「没做这个动作」的反例段，否则 precision 永远是 1。已下线动作（叉腰/抱臂/挥手/
+   前平举/侧平举/鼓掌）的判定与信号仍保留在引擎里供历史数据评估，但不是新标注的采集目标。
 2. **`--timeline` 是你标注时的主工具**，不是评估工具。录完先跑：
    ```bash
    node web/test/evaluate.mjs --input eval-data/a.jsonl --timeline --every 5
@@ -522,4 +519,4 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.posture.stand.kneeGt 
    `ts` 是 `performance.now`，只适合同一进程内复算，不适合人对时间。
 4. **一次录一个动作，中间留 1~2 秒纯站姿**。动作之间有干净的「无动作」间隔，
    才能区分「漏判」和「判定粘住没复位」——这两者的修法完全不同。
-5. **反例比正例重要**。只录「抱臂」不录「站着没抱臂」，precision 永远是 1，等于没测。
+5. **反例比正例重要**。只录「举手」不录「站着没举手」，precision 永远是 1，等于没测。

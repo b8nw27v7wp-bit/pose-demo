@@ -10,7 +10,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { ARM_ACTIONS } from '../js/actions.js';
+import { ARM_UI_ACTIONS, ARM_VISIBLE_ACTIONS } from '../js/actions.js';
 
 const CHROME_CANDIDATES = [
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -275,7 +275,7 @@ async function main() {
       const sel = document.getElementById('hardcaseSel');
       const btn = document.getElementById('btnHardcase');
       const info = window.__pose && window.__pose.hardcaseInfo
-        ? window.__pose.hardcaseInfo('clap') : null;
+        ? window.__pose.hardcaseInfo('grasp') : null;
       return {
         hasSelect: !!sel, options: sel ? sel.options.length : 0, value: sel ? sel.value : null,
         hasButton: !!btn, frames: info && info.frames,
@@ -295,7 +295,7 @@ async function main() {
     const clickStart = await cdp.eval(`(() => {
       const sel = document.getElementById('hardcaseSel');
       const btn = document.getElementById('btnHardcase');
-      sel.value = 'clap';
+      sel.value = 'grasp';
       btn.click();
       return { disabled: btn.disabled, text: btn.textContent };
     })()`);
@@ -366,13 +366,13 @@ async function main() {
       const clearedFrames = window.__pose.state.frames;
 
       const profile = $('profileSel');
-      profile.value = 'fitness';
+      profile.value = 'refuel';
       profile.dispatchEvent(new Event('change', { bubbles: true }));
       for (let i = 0; i < 40; i++) {
-        if (/fitness/.test(tag.textContent || '')) break;
+        if (/refuel/.test(tag.textContent || '')) break;
         await new Promise((r) => setTimeout(r, 100));
       }
-      const profileTagFitness = tag.textContent;
+      const profileTagRefuel = tag.textContent;
 
       profile.value = 'default';
       profile.dispatchEvent(new Event('change', { bubbles: true }));
@@ -382,7 +382,7 @@ async function main() {
       }
       return {
         clearedFrames,
-        profileTagFitness,
+        profileTagRefuel,
         profileTagDefault: tag.textContent,
       };
     })()`);
@@ -419,16 +419,16 @@ async function main() {
       && frontend.profileOptions >= 2
       && /帧/.test(frontend.logText) && /profile=/.test(frontend.logTitle)
       && panel.clearedFrames === 0
-      && /fitness/.test(panel.profileTagFitness) && /默认/.test(panel.profileTagDefault)
-      && armHint.hasHint && armHint.count === ARM_ACTIONS.length && armHint.titled === ARM_ACTIONS.length
+      && /refuel/.test(panel.profileTagRefuel) && /默认/.test(panel.profileTagDefault)
+      && armHint.hasHint && armHint.count === ARM_UI_ACTIONS.length && armHint.titled === ARM_UI_ACTIONS.length
       && !!armHint.line && armHint.line !== '—'
       && accuracyUi.hasBtn && accuracyUi.open === true && accuracyUi.hiddenAfter === true
-      && accuracyUi.count === ARM_ACTIONS.length
-      && accuracyUi.filled === ARM_ACTIONS.length && accuracyUi.titled === ARM_ACTIONS.length
+      && accuracyUi.count === ARM_VISIBLE_ACTIONS.length
+      && accuracyUi.filled === ARM_VISIBLE_ACTIONS.length && accuracyUi.titled === ARM_VISIBLE_ACTIONS.length
       && !!accuracyUi.hint
       && (!handWiring.handReady || handWiring.withHands > 0)
       && hardcase.options >= 10 && hardcase.hasButton && hardcase.frames > 0
-      && hardcase.segment && hardcase.action === 'clap'
+      && hardcase.segment && hardcase.action === 'grasp'
       && clickStart.disabled === true && clickEnd.disabled === false
       && clickEnd.text === '判错了' && /已导出难例/.test(clickEnd.status)
       && layout.scrollHeight <= layout.viewport + 1;

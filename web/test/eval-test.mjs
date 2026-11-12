@@ -512,8 +512,8 @@ console.log('\n[14] 自动标注');
 
   check('草稿有名字与说明', draft.name === 'auto' && draft.note.includes('反例'));
   check('草稿含姿态段', draft.segments.some((s) => s.action === 'stand'));
-  check('草稿含计数段且次数对', draft.segments.some((s) => s.action === 'clap' && s.count === 1),
-    `seg=${JSON.stringify(draft.segments.filter((s) => s.action === 'clap'))}`);
+  check('鼓掌计数已下线：草稿不再写 clap 段', !draft.segments.some((s) => s.action === 'clap'),
+    `seg=${JSON.stringify(draft.segments.map((s) => s.action))}`);
   check('草稿只写正例（无反例段）', draft.segments.every((s) => !String(s.action).startsWith('!')
     && s.action !== 'none' && s.action !== 'noArm'));
 
@@ -534,7 +534,7 @@ console.log('\n[15] 元数据与报告');
     const jsonl = path.join(dir, 'm.jsonl');
     const meta = {
       schema: 'frame.jsonl v0', model: 'full', delegate: 'GPU',
-      profile: 'fitness', profile_model: 'lite', params_hash: 'fnv1a:deadbeef', frame_count: 5,
+      profile: 'refuel', profile_model: 'full', params_hash: 'fnv1a:deadbeef', frame_count: 5,
     };
     await writeFile(jsonl,
       `${JSON.stringify(meta)}\n${recs.map((r) => JSON.stringify(r)).join('\n')}\n`, 'utf8');
@@ -580,6 +580,8 @@ console.log('\n[15] 元数据与报告');
 console.log('\n[16] --dir 与 JSONL');
 {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'evaldir-'));
+  // profile 必须放在 --dir 扫描目录之外，否则会被当成帧文件读进 models。
+  const liteProfile = `${dir}-profile.json`;
   const recs = [];
   for (let i = 0; i < 30; i++) recs.push(frame(i * 100, STAND));
   try {
@@ -589,10 +591,12 @@ console.log('\n[16] --dir 与 JSONL');
     await writeFile(path.join(dir, 'a.labels.json'),
       JSON.stringify({ name: 'a', segments: [{ action: 'stand', start: 500, end: 2500 }] }), 'utf8');
 
+    // 用临时 profile 测「数据模型 ≠ profile 模型」的警告，不依赖仓库里某个示例档。
+    await writeFile(liteProfile, JSON.stringify({ name: 'lite-profile', model: 'lite', params: {} }), 'utf8');
     const { execFileSync } = await import('node:child_process');
     const out = execFileSync(process.execPath,
       [path.join(process.cwd(), 'web/test/evaluate.mjs'), '--dir', dir,
-        '--profile', path.join(process.cwd(), 'web/profiles/fitness.json'), '--json', '--quiet'],
+        '--profile', liteProfile, '--json', '--quiet'],
       { encoding: 'utf8' });
     const report = JSON.parse(out);
     check('--dir 能评估 .jsonl 素材', report.clips.length === 1 && report.clips[0].clip === 'a',
@@ -602,6 +606,7 @@ console.log('\n[16] --dir 与 JSONL');
       && report.modelWarning.includes('model=lite'), `warn=${report.modelWarning}`);
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(liteProfile, { force: true }).catch(() => {});
   }
 }
 
@@ -995,6 +1000,10 @@ console.log('\n[24] 手部 replay');
   check('导出带 hands(open→fist) → replay 计 1 次拿取',
     graspTl[graspTl.length - 1].act.reps.grasp === 1,
     `grasp=${graspTl[graspTl.length - 1].act.reps.grasp}`);
+  const gdraft = autoLabelClip(seq, graspTl, { name: 'grasp' });
+  check('autolabel 能为拿取产出计数段',
+    gdraft.segments.some((s) => s.action === 'grasp' && s.count >= 1),
+    JSON.stringify(gdraft.segments.filter((s) => s.action === 'grasp')));
 
   // 自动标注也要能产出这些动作（此前 FLAG_IDS 有名字但永远不成立）
   const draft = autoLabelClip(recs.map((f) => ({

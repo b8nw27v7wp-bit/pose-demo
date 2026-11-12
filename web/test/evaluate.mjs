@@ -12,7 +12,7 @@
 //   node web/test/evaluate.mjs --dir eval-data --fit --fit-out web/profiles/fitness-fit.json
 //   node web/test/evaluate.mjs --dir eval-data --loso --max-loso-drop 0.1   # 留一人验证（需 subject）
 //   node web/test/evaluate.mjs --dir eval-data --resample 15                 # 帧率敏感性
-//   node web/test/evaluate.mjs --dir eval-data --profile web/profiles/fitness.json
+//   node web/test/evaluate.mjs --dir eval-data --profile web/profiles/refuel.json
 //   node web/test/evaluate.mjs --input a.jsonl --autolabel --out a.labels.json   # 生成标注草稿
 //
 // 输入是 Demo 导出的 JSON（{ frames: [...] }）。labels 文件见 docs/eval.md。
@@ -22,7 +22,10 @@ import { readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { SignalEngine } from '../js/signals.js';
-import { ActionEngine, ARM_FLAG_IDS, ARM_ID_TO_FLAG, POSTURE_IDS, REP_IDS } from '../js/actions.js';
+import {
+  ActionEngine, ARM_FLAG_IDS, ARM_ID_TO_FLAG, ARM_LABEL_ACTIONS, POSTURE_IDS,
+  REP_IDS, REP_UI_ACTIONS,
+} from '../js/actions.js';
 import { SHAPE_IDS } from '../js/handshape.js';
 import { resolveParams, mergeParams, profileParams, profileName, paramsHash } from '../js/params.js';
 import { assignHands, PersonPipelines } from '../js/multi.js';
@@ -474,6 +477,10 @@ function activeRanges(series, mergeMs = 0) {
 // 动作清单全部来自 js/actions.js 的注册表，这里不再手抄。
 // 手抄过一次：新增 bothHandsUp/handAtHead 时漏了，标注它们会得到「未知动作名」。
 const FLAG_IDS = ARM_FLAG_IDS;
+// 自动标注只写还在用的动作：评估仍接受 retired（历史 label），但草稿不该再生产它们。
+// 与 web/test/autolabel.mjs 的口径保持一致。
+const LABEL_FLAG_IDS = ARM_LABEL_ACTIONS.map((a) => a.flag);
+const LABEL_REP_IDS = REP_UI_ACTIONS.map((r) => r.id);
 // 上下文事件不是「手臂动作」：near_equipment 只回答「人在设备旁」。
 // noArm / none 的反例判定与 FP 归因都要把它排除，否则「站着不动但人在设备旁」
 // 会被当成手臂误报，还会把 FP 记到 near_equipment 的精确率上。
@@ -2479,25 +2486,28 @@ export function autoLabelClip(frames, timeline, { name = null, mergeMs = 500, mi
       if (b - a >= minMs) add(id, a, b);
     }
   }
-  for (const id of FLAG_IDS) {
+  for (const id of LABEL_FLAG_IDS) {
     for (const [a, b] of activeRanges(seriesOf(timeline, id), mergeMs)) {
       if (b - a >= minMs) add(id, a, b);
     }
   }
-  for (const id of REP_IDS) {
+  for (const id of LABEL_REP_IDS) {
     let prev = null;
     for (let i = 0; i < timeline.length; i++) {
       const r = timeline[i];
       if (r.empty) { prev = null; continue; }
       const n = r.act.reps[id];
       if (prev !== null && n > prev) {
-        // 周期起点 = 最近一次进入 down 相位的那帧；终点 = 计数的这一帧
+        // 周期起点 = 最近一次进入「计数起步」相位的那帧；终点 = 计数的这一帧。
+        // 计数器的相位名不统一：鼓掌是 down→up，拿取是 reach→grasp（PhaseSequence）。
+        const startPhase = id === 'grasp' ? 'reach' : 'down';
+        const endPhase = id === 'grasp' ? 'grasp' : 'up';
         let start = i;
         for (let j = i; j >= 0; j--) {
           if (timeline[j].empty) break;
           const phase = timeline[j].act.repPhase?.[id];
-          if (phase === 'down') start = j;
-          else if (phase === 'up' && j < i) break;
+          if (phase === startPhase) start = j;
+          else if (phase === endPhase && j < i) break;
         }
         add(id, timeline[start].ts, r.ts, { count: n - prev });
       }

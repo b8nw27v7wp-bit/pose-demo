@@ -8,7 +8,7 @@ import {
   extractWindow, buildHardcase, segmentFor, isValidHardcaseAction, HARDCASE_ACTIONS,
   HARDCASE_BEFORE_MS, HARDCASE_AFTER_MS,
 } from '../js/hardcase.js';
-import { ARM_ACTIONS, REP_ACTIONS, ACTION_CATALOG } from '../js/actions.js';
+import { ARM_LABEL_ACTIONS, REP_UI_ACTIONS, ACTION_CATALOG } from '../js/actions.js';
 
 let pass = 0;
 let fail = 0;
@@ -39,18 +39,18 @@ console.log('\n[1] extractWindow');
     ACTION_CATALOG.every((a) => values.has(a.id)),
     `missing=${ACTION_CATALOG.map((a) => a.id).filter((id) => !values.has(id))}`);
   check('难例下拉包含每个手臂动作',
-    ARM_ACTIONS.every((a) => values.has(a.flag)),
-    `missing=${ARM_ACTIONS.map((a) => a.flag).filter((f) => !values.has(f))}`);
+    ARM_LABEL_ACTIONS.every((a) => values.has(a.flag)),
+    `missing=${ARM_LABEL_ACTIONS.map((a) => a.flag).filter((f) => !values.has(f))}`);
   check('难例下拉包含每个计数动作',
-    REP_ACTIONS.every((r) => values.has(r.id)),
-    `missing=${REP_ACTIONS.map((r) => r.id).filter((id) => !values.has(id))}`);
+    REP_UI_ACTIONS.every((r) => values.has(r.id)),
+    `missing=${REP_UI_ACTIONS.map((r) => r.id).filter((id) => !values.has(id))}`);
 
   // P1-4：反例必须覆盖全部动作，否则「模型误判 X、其实没有 X」仍然写不出来。
   // 同一个动作的正例和反例都要在列表里，两者缺一都不算覆盖。
   const missingNeg = [
     ...ACTION_CATALOG.map((a) => a.id),
-    ...ARM_ACTIONS.map((a) => a.flag),
-    ...REP_ACTIONS.map((r) => r.id),
+    ...ARM_LABEL_ACTIONS.map((a) => a.flag),
+    ...REP_UI_ACTIONS.map((r) => r.id),
   ].filter((v) => !values.has(`!${v}`));
   check('每个姿态/手臂/计数动作都有 ! 反例', missingNeg.length === 0,
     `missing=${missingNeg}`);
