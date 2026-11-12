@@ -203,6 +203,7 @@ node web/test/ppe-eval.mjs --self-test  # 19 项：PPE 事件评估骨架（多 
 node web/test/headless-check.mjs    # 无头 Chrome 真加载页面：模型就绪、跑到帧、13 关键点、动作提示、准确率明细、零 JS 错误
 node web/test/headless-check.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-vp8.webm"   # worktree/多开：显式换端口
 node web/test/headless-multi.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-two.webm"  # 多人 + 物体检测（19 项）
+node scripts/pose-screenshots.mjs   # 用 data/ 现有素材跑姿态识别并截图：多人/单人图片与视频 + refuel 演示片，结果写到 runs/pose-test-<日期>/（截图含人脸，runs/ 不进 git）
 node web/test/headless-ppe-onnx.mjs # 自训 PPE 冒烟模型：ONNX 后端加载、labels 对齐、no_helmet 不被当正类（需 web/models/ppe_smoke.onnx）
 node web/test/throughput-probe.mjs  # 吞吐探针：应用自报 fps、实测帧/s、pose/hands/objects/draw 各阶段毫秒
 node web/test/mot17-eval.mjs        # MOT17 gt 帧级评测：TopK 召回 / ID 切换 / 动作触发率（需先 npm run fetch:data）
@@ -212,6 +213,27 @@ node web/test/mot17-eval.mjs --rate 0.4   # 慢放逐帧：A/B 对比用（实�
 > 端口冲突：`serve.py` 默认 8765，Windows 允许第二个进程静默绑定同一端口，
 > 后起的那个收不到请求——页面测试会打到**别的 checkout 的旧代码**。多开时务必用 `py serve.py 8799`
 > 并把 URL 传给 headless-check。
+
+素材切片 / 抽帧（可选）：
+
+```bash
+.venv-ppe/Scripts/python.exe scripts/slice-video.py <video> <outDir> [--step 0.5]
+# → clips/（按镜头切段）、frames/（每 0.5s）、keyframes/、sheets/（接触表）、manifest.json
+# 同一个 outDir 换素材重跑会先删掉上一轮的 frames/clips/keyframes/sheets，不会新旧混集。
+# 有 ffmpeg（PATH 或 pip install imageio-ffmpeg）时切片写 H.264+AAC，浏览器可直接 ?src= 回放、
+# 讲解音保留；没有时用 OpenCV mp4v 兜底：无音轨，Chrome 不能播（OpenCV/VLC 可复核）。
+
+node scripts/clip-recognition.mjs --clip /eval-data/refuel/oil-sample-demo.mp4 \
+  --profile /web/profiles/refuel.json --out runs/clip-test --name refuel-roi --export
+# → 整段播完并记录识别状态：动作/设备框变化时截图 + shots/ + <name>.md，
+#   --export 收下 Demo 的 JSONL，可直接接 node web/test/evaluate.mjs 做离线评估
+#   播放上限默认按素材时长 1.5×+30s；到上限没播完会在报告顶部标注截断并以非 0 退出，
+#   明确只想要前段数据时加 --allow-truncate（或 --max-seconds N 指定上限）。
+#   --export 下载失败同样非 0 退出，报告写明「后续 evaluate 没有输入」。
+```
+
+> Git Bash（MSYS）会把 `/eval-data/...` 这类参数改写成 `D:\git\...`；传页面同源路径时加
+> `MSYS_NO_PATHCONV=1`，否则页面会报「视频加载失败：decode error」。
 
 浏览器自检（参数见 `web/test/verify.html`）：
 

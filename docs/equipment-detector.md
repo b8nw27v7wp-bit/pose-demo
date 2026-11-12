@@ -223,7 +223,37 @@ node web/test/headless-check.mjs
 node web/test/headless-multi.mjs
 ```
 
-## 7. 局限与下一步
+## 7. 单段素材重训记录（2026-11-12，油样取样片）
+
+按「只拿这一段素材重训」跑了一遍完整链路（切片 → 抽帧 → 分镜留出 → 训练 → 导出 → 整段识别测试）。
+素材就是上面这段 58s 演示片的另一个文件副本（md5 相同），标签沿用 `labels_refuel.json` 的分镜框。
+
+- 类别：`panel` / `valve`；**不含 gauge**——本片 gauge 只在 46.6–48.88 一个分镜出现，
+  留作 val 后训练集 0 个实例，训了也学不会。
+- 数据：train 94 / val 22（panel 60/13，valve 19/9）。val 分镜覆盖三类设备：
+  37.0–41.4（panel）、44.56–46.6 与 48.88–51.04（valve）、46.6–48.88（panel+gauge）。
+- 训练：YOLOv8n / 416 / 50 epoch / batch 16 / CPU，7.4 min。
+- 验证：P 0.956 / R 0.5 / mAP50 0.497；**panel** P0.912 R1.0 mAP50 0.995；
+  **valve** P1.0 **R0** mAP50 0——valve 在这段素材上没学到可迁移特征（19 个训练实例、
+  分镜框偏粗，把软管排一起圈进去了）。
+- 导出：`web/models/equipment-oilsample.onnx`（320，opset 12）+ sidecar；
+  接入档 [`web/profiles/refuel-equipment-oilsample.json`](../web/profiles/refuel-equipment-oilsample.json)。
+
+同一段素材整段播放 + 导出评估（`scripts/clip-recognition.mjs` → `evaluate.mjs`）：
+
+| 档位 | 设备框命中采样 | operating TP/FN/FP | R / P |
+|---|---|---|---|
+| `refuel.json`（ROI） | — | 4/2/5 | 0.667 / 0.444 |
+| `refuel-equipment.json`（旧三类模型） | 93/126（panel 82、valve 15） | 5/1/6 | 0.833 / 0.455 |
+| `refuel-equipment-oilsample.json`（本片两类） | 90/124（panel 86、valve 4） | 5/1/4 | 0.833 / 0.556 |
+
+三轮是三次独立播放（1549/1511/1428 帧），直接比会混入丢帧差异；另做了同集配对复核
+（同一份导出分别用 ROI/设备档重放）：两份导出上设备框都把 operating 从 4/2/5 提到 5/1/6
+（旧模型）或 5/1/4（新模型），即召回 +1 段、FP 持平或 −1。n=6 段，差异不显著。
+完整报告、切片与截图在本机 `runs/oil-sample-2026-11-11/`（运行产物，不进 git）。
+切片/识别测试工具：`scripts/slice-video.py`、`scripts/clip-recognition.mjs`。
+
+## 8. 局限与下一步
 
 - **同集验证**：训练框来自同一段 58s 演示片的分镜，val 也来自同一段视频；换机位/换人
   必须重标重训。当前数字只能说明链路通了。
