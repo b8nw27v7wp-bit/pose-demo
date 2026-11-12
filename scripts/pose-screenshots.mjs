@@ -131,7 +131,7 @@ const SNAPSHOT_EXPR = `(() => {
     armHint: ui.armHint,
     repMeta: ui.repMeta,
     logInfo: ui.logInfo,
-    postureChipsOn: ui.postureChips.filter((c) => c.on).map((c) => c.id),
+    contextActionsOn: (ui.contextActions || []).filter((c) => c.on).map((c) => c.id),
     armsOn: ui.armActions.filter((a) => a.on).map((a) => a.id),
     armsNa: ui.armActions.filter((a) => a.na).map((a) => a.id),
     last: src ? {

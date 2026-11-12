@@ -6,7 +6,10 @@ import {
 import { createHandEstimator, detectHandsVideo, detectHandsNearWrists, toHands, handsReady, closeHandEstimator } from './hands.js';
 import { wristsToRetry } from './handroi.js';
 import { SignalEngine } from './signals.js';
-import { ActionEngine, ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from './actions.js';
+import {
+  ActionEngine, ACTION_CATALOG, ARM_ACTIONS, ARM_UI_ACTIONS, ARM_CONTEXT_ACTIONS,
+  ARM_VISIBLE_ACTIONS, REP_ACTIONS,
+} from './actions.js';
 import { explainArmActions, DEFAULT_HINT } from './armhint.js';
 import { loadAccuracyReport, accuracyFor, formatAccuracy, accuracyStale } from './accuracy.js';
 import { resolveParams, profileParams, profileName as profileNameOf, paramsHash } from './params.js';
@@ -688,7 +691,7 @@ function resetRuntime() {
   // 引擎和计数都重置了，上一帧的判定结果就不再属于这套参数/输入：
   // 不清掉的话，暂停中的视频或切换 profile 后面板会继续显示旧结论。
   lastResult = null;
-  renderReps({ clap: 0, grasp: 0 });
+  renderReps({ grasp: 0 });
   updateUI();
 }
 
@@ -993,7 +996,7 @@ async function useVideoFile(file) {
 // 单张图片没有时间窗，而姿态/手臂判定里的 Hold、streak 都要求「持续了多久」。
 // 只判一帧会全部输出 false（看起来像「识别不出来」）。这里把同一帧在信号层/动作层
 // 重复喂 12 次（合成 100ms 步长）让它们收敛，再显示结果。
-// 需要运动的动作（挥手、鼓掌/拿取计数）在单张图上本来就不适用，不会凭空出现。
+// 需要运动的动作（拿取计数）在单张图上本来就不适用，不会凭空出现。
 const STILL_SETTLE_FRAMES = 12;
 let photoUrl = null;
 
@@ -2341,18 +2344,20 @@ function updateModelInfo() {
 
 // —— UI -----------------------------------------------------------------
 
+// 计数只剩「拿取」（鼓掌计数已下线，引擎仍算但界面不再显示）
 function renderReps(reps) {
-  $('repClap').textContent = reps.clap ?? 0;
-  $('repGrasp').textContent = reps.grasp ?? 0;
+  $('repGrasp').textContent = reps?.grasp ?? 0;
 }
 
 function buildGrids() {
-  $('postureChips').innerHTML = ACTION_CATALOG
-    .map((a) => `<span class="chip" data-id="${a.id}">${a.name}</span>`)
-    .join('');
-  $('armGrid').innerHTML = ARM_ACTIONS
+  // 动作网格只放当前产品动作；上下文事件（在设备旁）单独一行，不和手臂动作混排。
+  $('armGrid').innerHTML = ARM_UI_ACTIONS
     .map((a) => `<div class="act" data-id="${a.id}"><span>${a.name}</span></div>`)
     .join('');
+  $('ctxActions').innerHTML = '<span class="ctx-tag">上下文</span>'
+    + ARM_CONTEXT_ACTIONS
+      .map((a) => `<div class="act" data-id="${a.id}"><span>${a.name}</span></div>`)
+      .join('');
 }
 
 // 准确率只显示评估报告里的实测值：没有报告/样本不足都明确写出来。
@@ -2362,7 +2367,7 @@ function refreshAccuracy() {
     minSamples: accuracyReport?.minSamples,
     synthetic: !!accuracyReport?.source?.synthetic,
   };
-  const items = ARM_ACTIONS.map((a) => {
+  const items = ARM_VISIBLE_ACTIONS.map((a) => {
     const f = formatAccuracy(accuracyFor(accuracyReport, a.id), opts);
     accuracyById[a.id] = f;   // {short,long,level}：提示行用 short，tooltip 用 long
     return { a, f };
@@ -2419,12 +2424,7 @@ function updateUI() {
       : (mode === 'idle' ? '无画面' : mode === 'image' ? '—' : '等待下一帧');
   }
 
-  for (const a of ACTION_CATALOG) {
-    const el = document.querySelector(`#postureChips .chip[data-id="${a.id}"]`);
-    if (el) el.classList.toggle('on', act?.postureId === a.id);
-  }
-
-  // 动作判不判得出来取决于运行条件（手部模型 / 3D / 髋是否入镜 / 单帧），
+  // 动作判不判得出来取决于运行条件（手部模型 / 3D / 设备 ROI/检测框是否配置），
   // 把这些条件和已知误判写进面板，避免用户把「判不了」当成「没做」。
   const armHints = explainArmActions({
     sig, act, hands,
@@ -2441,8 +2441,9 @@ function updateUI() {
     objectReady,
   });
 
-  for (const a of ARM_ACTIONS) {
-    const el = document.querySelector(`#armGrid .act[data-id="${a.id}"]`);
+  for (const a of [...ARM_UI_ACTIONS, ...ARM_CONTEXT_ACTIONS]) {
+    const sel = a.context ? '#ctxActions' : '#armGrid';
+    const el = document.querySelector(`${sel} .act[data-id="${a.id}"]`);
     if (!el) continue;
     const hint = armHints.byId[a.id];
     const on = !!act?.flags?.[a.flag];
@@ -2510,8 +2511,9 @@ function updateUI() {
     : '—';
 
   if (act?.reps) renderReps(act.reps);
+  // 拿取是「伸手 → 合手」两段，把当前阶段写出来，便于判断计数为什么没加
   $('repMeta').textContent = act
-    ? `门控 鼓掌${act.gates?.clap ? '✓' : '—'}`
+    ? `当前阶段 ${act.repPhase?.grasp || 'idle'}`
     : '—';
 
   // —— 人员列表（多人 / PPE）——
@@ -2774,7 +2776,7 @@ $('chkObjects').addEventListener('change', async (e) => {
 });
 $('btnReset').addEventListener('click', () => {
   for (const p of pipelines.map.values()) p.act.reset();
-  renderReps({ clap: 0, grasp: 0 });
+  renderReps({ grasp: 0 });
 });
 $('btnAccuracy').addEventListener('click', () => {
   const box = $('accList');
@@ -2854,7 +2856,7 @@ window.__pose = {
       signalMeta: $('signalMeta').textContent,
       repMeta: $('repMeta').textContent,
       logInfo: $('logInfo').textContent,
-      postureChips: [...document.querySelectorAll('#postureChips .chip')].map((el) => ({ id: el.dataset.id, on: el.classList.contains('on') })),
+      contextActions: [...document.querySelectorAll('#ctxActions .act')].map((el) => ({ id: el.dataset.id, on: el.classList.contains('on') })),
       armActions: [...document.querySelectorAll('#armGrid .act')].map((el) => ({ id: el.dataset.id, on: el.classList.contains('on') })),
     };
   },

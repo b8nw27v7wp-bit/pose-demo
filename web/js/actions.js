@@ -359,29 +359,44 @@ export const ACTION_CATALOG = [
 export const POSTURE_IDS = ACTION_CATALOG.map((a) => a.id);
 
 // flag = ActionEngine.update() 输出里的布尔字段名；labels/评估器用这个键。
+// hidden：引擎仍判定、导出/历史评估仍可用，但动作面板不显示（演示动作）。
+// retired：已下线——界面与新标注都不再出现，只保留给历史数据评估（删掉会让旧 label
+//          变成 unknown）。不要把 retired 条目放进任何「新增标注」的下拉里。
+// context：不是手臂动作，是上下文事件；面板单独一行显示，不混进动作网格。
 export const ARM_ACTIONS = [
-  { id: 'arm_raised', name: '举手', flag: 'armRaised' },
-  { id: 'both_up', name: '双手高举', flag: 'bothHandsUp' },
-  { id: 'wave', name: '挥手', flag: 'waving' },
-  { id: 'crossed', name: '抱臂', flag: 'crossed' },
-  { id: 'hips', name: '叉腰', flag: 'onHips' },
-  { id: 'arms_open', name: '张开双臂', flag: 'armsOpen' },
-  { id: 'hand_head', name: '手在头部', flag: 'handAtHead' },
+  { id: 'operating', name: '操作设备', flag: 'operating' },
   { id: 'reach', name: '伸手', flag: 'reaching' },
   { id: 'carry', name: '持物', flag: 'carrying' },
-  { id: 'operating', name: '操作设备', flag: 'operating' },
-  // 上下文事件，不是手臂动作：说明「人在设备旁」，不说明手在设备上
-  { id: 'near_equipment', name: '在设备旁', flag: 'nearEquipment' },
   { id: 'point', name: '指向', flag: 'pointing' },
-  { id: 'arm_front', name: '前平举', flag: 'armFront' },
-  { id: 'arm_side', name: '侧平举', flag: 'armSide' },
+  { id: 'arm_raised', name: '举手', flag: 'armRaised' },
+  // 上下文事件：说明「人在设备旁」，不说明手在设备上
+  { id: 'near_equipment', name: '在设备旁', flag: 'nearEquipment', context: true },
+  // 不在面板显示，但仍可评估/标注
+  { id: 'arms_open', name: '张开双臂', flag: 'armsOpen', hidden: true },
+  { id: 'both_up', name: '双手高举', flag: 'bothHandsUp', hidden: true },
+  { id: 'hand_head', name: '手在头部', flag: 'handAtHead', hidden: true },
+  // 已下线：仅保留给历史数据
+  { id: 'wave', name: '挥手', flag: 'waving', retired: true },
+  { id: 'crossed', name: '抱臂', flag: 'crossed', retired: true },
+  { id: 'hips', name: '叉腰', flag: 'onHips', retired: true },
+  { id: 'arm_front', name: '前平举', flag: 'armFront', retired: true },
+  { id: 'arm_side', name: '侧平举', flag: 'armSide', retired: true },
 ];
+// 动作面板网格显示哪些；准确率列表比网格多一个「在设备旁」（上下文事件也要看准确率）
+export const ARM_UI_ACTIONS = ARM_ACTIONS
+  .filter((a) => !a.context && !a.hidden && !a.retired);
+export const ARM_CONTEXT_ACTIONS = ARM_ACTIONS.filter((a) => a.context);
+export const ARM_VISIBLE_ACTIONS = ARM_ACTIONS.filter((a) => !a.hidden && !a.retired);
+// 新增标注（难例下拉、自动标注草稿）可选的集合：不含 retired
+export const ARM_LABEL_ACTIONS = ARM_ACTIONS.filter((a) => !a.retired);
 export const ARM_FLAG_IDS = ARM_ACTIONS.map((a) => a.flag);
 export const ARM_ID_TO_FLAG = Object.fromEntries(ARM_ACTIONS.map((a) => [a.id, a.flag]));
 
 // 计数类：RepCounter（或 PhaseSequence）维护计数，labels 用 id + count。
 export const REP_ACTIONS = [
-  { id: 'clap', name: '鼓掌' },
   { id: 'grasp', name: '拿取' },
+  // 鼓掌计数已下线：界面不再显示，历史 label 仍可评估
+  { id: 'clap', name: '鼓掌', retired: true },
 ];
+export const REP_UI_ACTIONS = REP_ACTIONS.filter((r) => !r.retired);
 export const REP_IDS = REP_ACTIONS.map((r) => r.id);

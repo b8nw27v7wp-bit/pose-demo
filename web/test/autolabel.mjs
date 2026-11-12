@@ -18,12 +18,13 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { replay } from './evaluate.mjs';
 import { profileParams } from '../js/params.js';
-import { ACTION_CATALOG, ARM_ACTIONS, REP_ACTIONS } from '../js/actions.js';
+import { ACTION_CATALOG, ARM_LABEL_ACTIONS, REP_UI_ACTIONS } from '../js/actions.js';
 import { loadFrames, stripBom, videoTimeMonotonic } from './frame-io.mjs';
 
 export const POSTURES = ACTION_CATALOG.map((a) => a.id);
-export const ARM_FLAGS = ARM_ACTIONS.map((a) => a.flag);
-export const REPS = REP_ACTIONS.map((r) => r.id);
+// 自动标注草稿只覆盖还在用的动作；retired 动作仅保留给历史数据评估
+export const ARM_FLAGS = ARM_LABEL_ACTIONS.map((a) => a.flag);
+export const REPS = REP_UI_ACTIONS.map((r) => r.id);
 
 const round3 = (v) => Math.round(v * 1000) / 1000;
 
