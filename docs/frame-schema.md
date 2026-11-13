@@ -12,6 +12,8 @@
 {
   "ts": 1585,                       // 毫秒，单调递增（当前实现用 performance.now；服务端将来用单调时钟）
   "video_time": 0.93,               // 媒体播放秒数；摄像头为 null。单次播放内单调，用于写 labels 的 startSec/endSec
+  "objects_ts": 900,                // 可选：本帧 objects 是哪次检测产生的（毫秒）。设备框的时序确认靠它
+                                    // 区分「新检测」与「两次检测之间沿用的上一帧结果」；旧导出没有 → 不过滤
   // 多人模式导出**全部判定人员**（每人一条）；单人模式仍是 1 个元素，字段不变。
   // 每条记录里的 signals/actions 仍是主目标（面积最大者）的判定。
   "persons": [
@@ -51,6 +53,13 @@
     "operating_elbow_L": false, "operating_elbow_R": false,
     "operating_any": true,
     "operating_equipment": false,   // 本帧是否有设备检测框（false=operating 退回 ROI）
+    // 设备框的三段计数：raw=检测器本帧检出 → confirmed=通过时序确认 → used=过 ROI 后参与判定
+    "operating_boxes_raw": 1, "operating_boxes_confirmed": 1, "operating_boxes_used": 1,
+    // 为什么没判成 operating：ok/no_equipment/no_arm/no_elbow/low_shoulder/head_near/
+    // person_invalid/person_not_upright/reach_low/elev_low/elev_high/not_near/no_grip
+    "operating_gate": "not_near", "operating_gate_L": "not_near", "operating_gate_R": "no_arm",
+    "operating_upright_box": true,
+    "operating_validity": null,     // 开启 requireValidity 时为 {enabled,ok,area_ratio,...,reasons}（门会自动启用）
     // 多边形/多区域 ROI 的诊断（rect/旧导出为 null/0）
     "operating_roi_mode": "polygon",   // none|rect|polygon
     "operating_roi_zones": 2,
@@ -66,7 +75,7 @@
     "posture": "stand",             // stand|sit|upper_upright|upper_lean；连髋都不可见时为 null。躺卧/下蹲已下线
     "flags": {
       "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
-      "onHips": false, "armsOpen": false, "handAtHead": false,
+      "onHips": false, "armsOpen": false, "handAtHead": false, "oilSample": false,
       "reaching": false, "carrying": false, "operating": false, "pointing": false,
       "armFront": false, "armSide": false,
       // 逐侧粒度：单手动作额外给出是哪只手；聚合 flag 保持旧语义
@@ -75,6 +84,7 @@
       "reachingL": false, "reachingR": false,
       "pointingL": false, "pointingR": false,
       "handAtHeadL": false, "handAtHeadR": false,
+      "oilSampleL": false, "oilSampleR": false,
       "carryingL": false, "carryingR": false,
       "operatingL": false, "operatingR": false,
       "nearEquipment": false

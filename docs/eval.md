@@ -486,8 +486,62 @@ node web/test/evaluate.mjs --dir eval-data --sweep actions.posture.stand.kneeGt 
 - 代价是 N 倍重放（基准 + 4 个变体 ≈ 5 倍评估时间），长素材上要有心理准备。
 - 用途：找出「一动就崩」的脆弱阈值。掉得最多的阈值应该先回头看信号本身，而不是继续调数。
 
+## 确定性回放（感知层 A/B）
+
+实时播放的抽帧**每次都不一样**：同一段 58s 素材三次播放记录了 1549 / 1511 / 1428 帧
+（`docs/equipment-detector.md` §6）。这意味着换模型、加裁切、改检测间隔这类**感知层**改动
+根本没有可比较的基线——跨导出的指标差异里混着抽样差异，而同一份 JSONL 重放只能比较**判定层**。
+
+`scripts/deterministic-replay.mjs`（`npm run record:det`）把回放改成固定输入：
+
+```bash
+npm run serve    # 另开终端
+
+node scripts/deterministic-replay.mjs \
+  http://127.0.0.1:8765/eval-data/refuel/oil-sample-demo.mp4 \
+  http://127.0.0.1:8765/web/profiles/refuel-equipment.json refuel-det \
+  --fps=10 --model=full --delegate=CPU
+
+# 第二次：直接比对逐帧内容的 sha256
+node scripts/deterministic-replay.mjs \
+  http://127.0.0.1:8765/eval-data/refuel/oil-sample-demo.mp4 \
+  http://127.0.0.1:8765/web/profiles/refuel-equipment.json refuel-det-b \
+  --fps=10 --model=full --delegate=CPU \
+  --expect-hash=<上一次打印的 sha256>
+```
+
+它做的事：
+
+1. 页面带 `?det=1` 打开：**不开 rAF 主循环**，由脚本逐帧调用 `__pose.step()`；
+2. 取样点是 `(k + 0.5) / fps`（网格中间，躲开源视频帧边界）。seek → 等 `seeked` →
+   等两帧 rAF，然后才推理；
+3. `ts` 用**媒体时间**（`round(currentTime*1000)`）而不是 `performance.now()`：
+   Hold 的 1500ms、One Euro 的 dt、tracker 的 `maxLostMs` 才能逐帧复现；
+4. 每帧末尾 `await` 物体推理，ONNX 的框不会因为机器快慢落到不同帧；
+5. 开始前 `__pose.prepare()` 等物体/多人模型**建好**，否则前几帧有没有 `objects`/`ppe`
+   取决于 12MB ONNX 的加载耗时。
+
+输出 `eval-data/incoming/<outName>.jsonl` + `<outName>.meta.json`。打印的 `sha256` **只算逐帧内容**
+（首行 meta 含 `exported_at`，每次必然不同）。实测同一段 290 帧素材两次回放逐帧一致。
+导出里会带 `objects_ts`（设备框时序确认用）；meta 里另有 `equipment` 连续性统计：
+有人帧、检出/确认/使用帧、闪烁次数、有框检测轮次——换检测器或改 `inputSize`/`intervalMs`
+时先看这张表，不需要人工标框。
+
+口径：`confirmRate = confirmedWithRawFrames / rawFrames`（**本帧有新检出且确认态仍有效**的帧 / 检出帧），
+恒 ≤ 1。`confirmedFrames` 是「确认态仍有效」的全部帧，包含 `maxAgeMs` 内沿用、本帧没有新检出的帧，
+可以大于 `rawFrames`，所以不能拿它当分子。旧 meta 里的 `confirmRate > 1`（如 1.038）就是那个旧口径。
+
+注意：
+
+- 默认 `--delegate=CPU`：GPU 推理结果可能随驱动/硬件浮动，跨机器不保证一致；
+- **采样率会改变 Hold 语义**。5fps（200ms/帧）与 10fps（100ms/帧）下的 `operatingMaxGap=600ms`
+  放过的丢帧数不同，**不同 fps 的导出不要直接比指标**；同一组 A/B 固定 `--fps`。
+- 它是「固定输入下比较感知/判定」的工具，不测真实播放的吞吐与丢帧；线上表现仍用 `throughput-probe.mjs`。
+
 ## 已知限制
 
+- **实时播放的抽帧不可复现**：同一素材每次播放记录的帧集合都不同，所以两段实时导出之间的
+  指标差异不能全算到改动头上。感知层（模型/裁切/检测间隔）的 A/B 用上面的「确定性回放」。
 - 评估复算是**离线**的：滤波与短窗状态跨帧保留，但如果导出时中途「停止」过，滤波会重置，起止时间会偏；
   录素材时一口气录完，中间别停。
 - `replay()` 依赖导出里的 `persons[].kp`（像素坐标）、`kp_world`（3D）与 `hands`（手部开合）；

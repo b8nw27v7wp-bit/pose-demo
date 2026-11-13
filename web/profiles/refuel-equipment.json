@@ -1,7 +1,7 @@
 {
   "name": "refuel-equipment",
   "model": "full",
-  "note": "refuel 场景 + 自训设备检测器（panel/valve/gauge）。物体检测走 YOLOv8n→ONNX；有设备框时 operating 用「腕/肘到框边距离」判定（equipmentMaxDist=0.7，0.35 实测太紧，正例掉到 1/6），near_equipment 取「人体框与检测框重叠」和「与 ROI 重叠」的较大值；没有设备框的帧退回人工 ROI（equipmentFallbackRoi=true）。同一份 590 帧导出上（修正 Hold 掉帧语义、operatingMaxGap=600）：operating 3/3/2（R0.5/P0.6），ROI-only 是 3/3/3（R0.5/P0.5）；near_equipment 3/3/2 与 ROI 档一致。ROI 仍是固定机位的人工配置，换机位必须重画。模型是在同一段 58s 演示片的分镜框上训练的，属于同集冒烟验证，**不能当泛化准确率**。",
+  "note": "refuel 场景 + 自训设备检测器（panel/valve/gauge）。物体检测走 YOLOv8n→ONNX；有设备框时 operating 用「腕/肘到框边距离」判定（equipmentMaxDist=0.7，0.35 实测太紧，正例掉到 1/6），near_equipment 取「人体框与检测框重叠」和「与 ROI 重叠」的较大值；没有设备框的帧退回人工 ROI（equipmentFallbackRoi=true）。同一份 590 帧导出上（修正 Hold 掉帧语义、operatingMaxGap=600）：operating 3/3/2（R0.5/P0.6），ROI-only 是 3/3/3（R0.5/P0.5）；near_equipment 3/3/2 与 ROI 档一致。ROI 仍是固定机位的人工配置，换机位必须重画。模型是在同一段 58s 演示片的分镜框上训练的，属于同集冒烟验证，**不能当泛化准确率**。 2026-11-12 补：设备框加了时序确认（boxMinHits=2/boxMaxAgeMs=600，默认；同一份确定性导出上过滤掉 5/153 个单帧误检框，段级指标不变）和 ROI 约束（boxRequireInRoi=true，框必须与本工位 ROI 相交；本片全部框都相交，等于零成本护栏）。useForearm/requireGrip/requireUprightBox/requireValidity 默认关，A/B 数字见 docs/equipment-detector.md §9。",
   "params": {
     "perception": {
       "objects": {
@@ -13,19 +13,33 @@
         "scoreThreshold": 0.35,
         "iouThreshold": 0.45,
         "intervalMs": 150,
-        "labels": ["panel", "valve", "gauge"]
+        "labels": [
+          "panel",
+          "valve",
+          "gauge"
+        ]
       }
     },
     "signals": {
       "arm": {
         "operating": {
-          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 },
+          "roi": {
+            "x": 0.42,
+            "y": 0.08,
+            "w": 0.56,
+            "h": 0.86
+          },
           "minElbowVis": 0.21,
           "minElbowReach": 0.315,
-          "equipmentLabels": ["panel", "valve", "gauge"],
+          "equipmentLabels": [
+            "panel",
+            "valve",
+            "gauge"
+          ],
           "equipmentMinScore": 0.35,
           "equipmentMaxDist": 0.7,
-          "equipmentFallbackRoi": true
+          "equipmentFallbackRoi": true,
+          "boxRequireInRoi": true
         },
         "nearEquipment": {
           "minOverlap": 0.5

@@ -103,14 +103,15 @@ export class CDP {
     return r.result.value;
   }
 
+  /** 等一个 CDP 事件。返回 true=等到，false=超时（超时不再静默成功）。 */
   waitFor(method, timeoutMs = 15000) {
     const seen = this.events.findIndex((e) => e.method === method);
-    if (seen >= 0) { this.events.splice(seen, 1); return Promise.resolve(); }
+    if (seen >= 0) { this.events.splice(seen, 1); return Promise.resolve(true); }
     return new Promise((resolve) => {
-      const t = setTimeout(resolve, timeoutMs);
+      const t = setTimeout(() => { clearInterval(tick); resolve(false); }, timeoutMs);
       const tick = setInterval(() => {
         const i = this.events.findIndex((e) => e.method === method);
-        if (i >= 0) { this.events.splice(i, 1); clearInterval(tick); clearTimeout(t); resolve(); }
+        if (i >= 0) { this.events.splice(i, 1); clearInterval(tick); clearTimeout(t); resolve(true); }
       }, 50);
     });
   }
@@ -152,8 +153,19 @@ export async function openPage(url, { width = 1440, height = 900 } = {}) {
   await cdp.send('Emulation.setDeviceMetricsOverride', {
     width, height, deviceScaleFactor: 1, mobile: false,
   });
-  await cdp.send('Page.navigate', { url });
-  await cdp.waitFor('Page.loadEventFired', 20000);
+  // 导航失败必须当场报出来：否则页面停在 about:blank，后续 localStorage / __pose
+  // 全部抛 SecurityError，看起来像应用坏了（实测 pose-screenshots 0/5 就是服务没起）。
+  const nav = await cdp.send('Page.navigate', { url });
+  if (nav?.errorText) {
+    throw new Error(`无法打开 ${url}：${nav.errorText}（本地服务没起来？先运行 npm run serve）`);
+  }
+  if (!(await cdp.waitFor('Page.loadEventFired', 20000))) {
+    throw new Error(`等待 ${url} 加载超时`);
+  }
+  const hasApp = await cdp.eval('typeof window.__pose !== "undefined"').catch(() => false);
+  if (!hasApp) {
+    throw new Error(`页面已打开但没有 __pose（${url}）：确认 http 服务的根目录是仓库根目录（npm run serve）`);
+  }
 
   const close = async () => {
     try { ws.close(); } catch { /* ignore */ }

@@ -1,0 +1,46 @@
+{
+  "name": "refuel-equipment-strict",
+  "model": "full",
+  "note": "refuel-equipment 的「精度优先」实验变体：设备框时序确认 + ROI 约束 + 人形门（横框不算人）。2026-11-12 在 290 帧确定性导出（5fps）上 A/B：operating 从 4TP/2FN/3FP 变成 2TP/4FN/0FP（R0.333/P1.0），near_equipment 不变（4/2/3）。FP 来自手/油枪特写被凑成躯干（bbox 159×59、220×147），这道门把它们全部挡掉，但也会挡掉 2 个真作业段（37.1-39.3s 只剩上半身、47.1-48.9s 仪表特写）。是否接受这个折中由现场决定，默认档不要换成它。",
+  "params": {
+    "perception": {
+      "objects": {
+        "enabled": true,
+        "backend": "onnx",
+        "model": "equipment.onnx",
+        "inputSize": 320,
+        "maxResults": 8,
+        "scoreThreshold": 0.35,
+        "iouThreshold": 0.45,
+        "intervalMs": 150,
+        "labels": ["panel", "valve", "gauge"]
+      }
+    },
+    "signals": {
+      "arm": {
+        "operating": {
+          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 },
+          "minElbowVis": 0.21,
+          "minElbowReach": 0.315,
+          "equipmentLabels": ["panel", "valve", "gauge"],
+          "equipmentMinScore": 0.35,
+          "equipmentMaxDist": 0.7,
+          "equipmentFallbackRoi": true,
+          "boxMinHits": 2,
+          "boxMaxAgeMs": 600,
+          "boxRequireInRoi": true,
+          "requireUprightBox": true
+        },
+        "nearEquipment": {
+          "minOverlap": 0.5
+        }
+      }
+    },
+    "actions": {
+      "holds": {
+        "operating": 1500,
+        "operatingMaxGap": 600
+      }
+    }
+  }
+}

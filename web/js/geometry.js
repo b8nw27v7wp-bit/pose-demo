@@ -340,3 +340,56 @@ export function headPointsFromRaw(raw33, frameW, frameH) {
   }
   return out;
 }
+
+/** 点到线段的最短距离。 */
+function pointSegmentDistance(p, a, b) {
+  const vx = b[0] - a[0];
+  const vy = b[1] - a[1];
+  const wx = p[0] - a[0];
+  const wy = p[1] - a[1];
+  const len2 = vx * vx + vy * vy;
+  const t = len2 > 0 ? Math.max(0, Math.min(1, (wx * vx + wy * vy) / len2)) : 0;
+  return Math.hypot(p[0] - (a[0] + t * vx), p[1] - (a[1] + t * vy));
+}
+
+/** 两条线段是否相交（含端点接触）。 */
+function segmentsIntersect(p1, p2, p3, p4) {
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const d1 = cross(p3, p4, p1);
+  const d2 = cross(p3, p4, p2);
+  const d3 = cross(p1, p2, p3);
+  const d4 = cross(p1, p2, p4);
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
+    && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return true;
+  // 共线/端点接触：用点到线段距离判断
+  return pointSegmentDistance(p1, p3, p4) < 1e-9 || pointSegmentDistance(p2, p3, p4) < 1e-9
+    || pointSegmentDistance(p3, p1, p2) < 1e-9 || pointSegmentDistance(p4, p1, p2) < 1e-9;
+}
+
+/** 点到轴对齐矩形的距离（框内为 0）。 */
+export function pointBoxDistance(x, y, box) {
+  if (!isNum(x) || !isNum(y) || !Array.isArray(box) || box.length < 4) return NaN;
+  const dx = x < box[0] ? box[0] - x : x > box[2] ? x - box[2] : 0;
+  const dy = y < box[1] ? box[1] - y : y > box[3] ? y - box[3] : 0;
+  return Math.hypot(dx, dy);
+}
+
+/**
+ * 线段（腕→肘）到轴对齐矩形的距离；相交为 0。
+ * 用途：手被面板挡住时腕点会漂，但前臂仍然贴着设备——比只看腕点稳。
+ * 非相交情况下，线段与凸多边形的最近距离一定在「线段端点 → 矩形」或
+ * 「矩形顶点 → 线段」上取得，所以取这 6 个候选的最小值即可。
+ */
+export function segmentBoxDistance(a, b, box) {
+  if (!Array.isArray(a) || !Array.isArray(b) || !Array.isArray(box) || box.length < 4) return NaN;
+  const x1 = box[0]; const y1 = box[1]; const x2 = box[2]; const y2 = box[3];
+  const corners = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]];
+  const inside = (p) => p[0] >= x1 && p[0] <= x2 && p[1] >= y1 && p[1] <= y2;
+  if (inside(a) || inside(b)) return 0;
+  for (let i = 0; i < 4; i++) {
+    if (segmentsIntersect(a, b, corners[i], corners[(i + 1) % 4])) return 0;
+  }
+  let best = Math.min(pointBoxDistance(a[0], a[1], box), pointBoxDistance(b[0], b[1], box));
+  for (const c of corners) best = Math.min(best, pointSegmentDistance(c, a, b));
+  return best;
+}

@@ -164,8 +164,13 @@ async function setSettings(cdp, extra) {
 
 async function navigate(cdp, url) {
   cdp.events.length = 0;
-  await cdp.send('Page.navigate', { url: base + url });
-  await cdp.waitFor('Page.loadEventFired', 30000);
+  const full = base + url;
+  const nav = await cdp.send('Page.navigate', { url: full });
+  if (nav?.errorText) throw new Error(`导航失败 ${full}：${nav.errorText}`);
+  if (!(await cdp.waitFor('Page.loadEventFired', 30000))) throw new Error(`加载超时 ${full}`);
+  // 页面没起来时不要继续往下跑：后面每一步都会以 SecurityError 的形式失败，掩盖真因
+  const hasApp = await cdp.eval('typeof window.__pose !== "undefined"').catch(() => false);
+  if (!hasApp) throw new Error(`页面没有 __pose（${full}）：确认设备/服务与 URL 正确`);
 }
 
 async function pauseVideo(cdp) {
