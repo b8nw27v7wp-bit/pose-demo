@@ -68,6 +68,11 @@ export const DEFAULT_PARAMS = {
       // 腕到鼻尖 / scale，小于此值算「手在头部附近」。
       // aboveShoulder：腕最多低于肩多少 scale；走路时手臂前摆会经过脸前，只判距离会误报。
       head: { maxDist: 0.55, aboveShoulder: 0.5 },
+      // 油样取样（举瓶到眼前对光检查）：在 head 的距离判据上加一道「手在身体前方」。
+      // 摸头/扶眼镜是从侧后方靠近，3D 方位角大；取样是对着光看，手在面前。
+      // 没有 3D 时方位角是 NaN，退回纯距离判据（与 hand_head 同口径）——宁可少一层
+      // 区分度，也不要把动作整段判掉。maxHeadDist 单位同 head.maxDist（腕-鼻尖 / 躯干长）。
+      sampling: { maxHeadDist: 0.55, maxAzimuth: 60 },
       // 3D 抬臂角（相对躯干）：0°=手在躯干延长线上（举起），90°=水平，180°=沿身体下垂
       elevTorso: { raised: 75 },
       // 手臂伸出：腕到肩距离 / scale。自然下垂实测 ≈0.84，前伸约 1.5+
@@ -95,6 +100,12 @@ export const DEFAULT_PARAMS = {
         minElbowVis: 0.3,
         minElbowReach: 0.35,
         minElbowElev: 60,
+        // 肘兜底总开关。2026-11-12 实测油样片：110 个 operating 帧里 67 个是「只有肘」成立的，
+        // 80 个连手都没检出——这条兜底在 refuel 上承担了大部分召回，也承担了大部分误报。
+        elbowFallback: true,
+        // 只有腕点不可用（真的被挡住）时才允许肘兜底。
+        // 默认 false（旧行为）；打开后，手可见但张开的帧不会再被肘兜底判成操作。
+        elbowFallbackHideWrist: false,
         roi: null,
         // 多边形/多区域 ROI：rois 非空时完全忽略上面的 roi（换机位按设备形状圈）。
         // 每个 zone: { id, points: [[x,y],...] }，归一化 0~1；未配置时保持旧行为。
@@ -111,6 +122,38 @@ export const DEFAULT_PARAMS = {
         // false = 失败即不判（fail-closed）：这一帧没有设备框就 both operating / near_equipment
         //   都不成立。这是「物体证据」真正生效的开关，代价是检测器漏检直接变 FN。
         equipmentFallbackRoi: true,
+        // —— 设备框的时序确认（equipment.js）——
+        // 单帧误检不能立刻变成「设备证据」：同一位置要在**两次不同的检测**里都命中才算确认。
+        // 1 = 关闭时序确认（旧行为）。检测器隔帧出框/单帧误检多时，2 是性价比最高的一档。
+        boxMinHits: 2,
+        // 确认过的框消失超过这么久才作废；与 actions.holds 的 maxGap 分工：
+        // 这里管「框在不在」，maxGap 管「动作信号断了几帧还算连续」。
+        // 硬约束（validateParams 校验）：配了 equipmentLabels 且 boxMinHits>1 时，
+        // 必须 boxMaxAgeMs >= perception.objects.intervalMs + 300。检测间隔比框有效期还长时，
+        // 两次检测之间的普通帧会先把轨迹过期，下一次检测又从 hits=1 开始，框永远确认不了。
+        boxMaxAgeMs: 600,
+        // 有 ROI 时，检测框必须与本工位 ROI **相交**才算设备：
+        // 背景里别人的阀门/仪表被检出时，不能拿来给当前操作员当证据。
+        // 用「相交」而不是「框中心在内」：ROI 是手圈的设备区域，检测框常常跨在边界上，
+        // 中心在 ROI 外但压在设备上的框同样有效（refuel 实测 159 个框里 105 个中心在 ROI 外）。
+        // 默认关（逐位保持旧行为）；固定机位 + 有 ROI 的场景在 profile 里打开。
+        // ROI 未配置或没有帧尺寸时这道门自动跳过（无法换算像素）。
+        // 注意：框被 ROI 挡掉后，仍然按 equipmentFallbackRoi 决定要不要退回 ROI。
+        boxRequireInRoi: false,
+        // 用「腕→肘线段到框的距离」代替「腕点到框的距离」：
+        // 手被面板挡住时腕点会漂到设备外，前臂仍然贴着设备。默认关，按场景打开。
+        useForearm: false,
+        // operating 必须握持（手型属于 signals.hand.closedShapes）：
+        // 走过去/扶着东西时手掌是张开的。没有手部数据时判不成立（fail-closed）。
+        requireGrip: false,
+        // 人形门：人体框面积/高度/出画/肩髋可见性不合格时不判 operating。
+        // 阈值复用 signals.arm.nearEquipment.validity（同一套几何门）；
+        // 专门挡「手/油枪特写被凑成躯干」这一类误检。
+        requireValidity: false,
+        // 人形门的另一半：人体框必须「高于宽」（上限用 signals.upperBody.minAspect）。
+        // 横着的框多半是手臂/设备特写被模型凑成了人（refuel 实测 220×147、159×59）。
+        // refuel 演示片上会更严格：25/66 个 operating 帧的框低于 0.9，按段看是否真掉召回再开。
+        requireUprightBox: false,
       },
       // 在设备旁（上下文事件）：只回答「人站在设备区域里」，**不要**把它并进 operating。
       // 曾经把「人体框与 ROI 重叠」当 operating 的兜底，refuel 上 233/249 条判定都成立，太宽。
@@ -262,6 +305,10 @@ export const DEFAULT_PARAMS = {
     single: {
       fallback: true,
       fallbackMinScore: 0.45,
+      // 单人道主目标：largest（默认，面积最大）| torso（躯干长最大）| upright（优先高宽比正常）
+      // 近景/特写里「面积最大的人」可能是被凑成人的手和设备；换机位前不要凭感觉改。
+      target: 'largest',
+      targetMinAspect: 0.9,
     },
 
     objects: {
@@ -317,6 +364,13 @@ export const DEFAULT_PARAMS = {
       operatingMaxGap: 300,
       // 在设备旁是上下文事件：1s 才成立，避免走过/路过时闪一下
       nearEquipment: 1000,
+      // 油样取样是「持续在看」的事件：看一次样瓶通常 2~5s，取 1s 避免抬手擦汗/扶眼镜
+      // 这类瞬时动作命中；比 handFace(350ms) 长，是因为它要表达「在做作业」而不是「手在头边」。
+      oilSample: 1000,
+      // 取样时腕点常被样瓶/自己的手挡住，逐帧判定会断续（实测公开素材上相邻命中间隔
+      // 100~500ms）。和 operatingMaxGap 同一套理由：短暂掉帧不重新计时。
+      // 不能更大——两段独立动作（看一次、放下、再看）之间的间隔通常 >1s，粘连就失去意义。
+      oilSampleMaxGap: 500,
       // 前/侧平举原本是瞬时布尔：走路摆臂会被 3D 方位角的噪声凑成「前平举」，
       // 实测 45 帧里断续命中 41 帧、最长一段仅 250ms。加保持窗把瞬时误报滤掉。
       front: 300, side: 300,
@@ -344,6 +398,46 @@ function deepMerge(base, over) {
 /** 把 profile 覆盖项合到默认参数上。未给出的键保持默认，便于 profile 只写差分。 */
 export function resolveParams(overrides = {}) {
   return deepMerge(DEFAULT_PARAMS, overrides);
+}
+
+/** 设备框时序确认的推理耗时余量（ms）：boxMaxAgeMs 至少要覆盖 intervalMs + 这个值。 */
+export const BOX_MAX_AGE_MARGIN_MS = 300;
+
+/**
+ * 参数一致性校验：非法组合在**加载时**报错，而不是让判定静默失效。
+ *
+ * 目前只有一条硬约束——设备框的时序确认要求框的有效期覆盖检测间隔：
+ *   `equipmentLabels` 非空 且 `boxMinHits > 1` 时，`boxMaxAgeMs >= objects.intervalMs + 300`。
+ * 违反时，两次检测之间的普通帧会先把轨迹过期，下一次检测又从 hits=1 开始，框永远累计不到
+ * `minHits`，operating 会整段丢掉设备证据（审查实测 intervalMs=1000：确认态 328/366 → 4/30）。
+ * 300ms 是 ONNX 推理耗时量级；不静默自动放大 maxAge——那会让「框在不在」的语义随配置漂移。
+ *
+ * 只约束「时序确认真的在用」的组合：没配设备类别、或 boxMinHits=1 时不消费这两条时间。
+ *
+ * @param {object} overrides profile 覆盖项（与 resolveParams 同一口径）
+ * @throws {Error} 组合非法时
+ * @returns {object} 合并后的完整参数
+ */
+export function validateParams(overrides = {}) {
+  const resolved = resolveParams(overrides);
+  const op = resolved.signals?.arm?.operating || {};
+  const labels = Array.isArray(op.equipmentLabels) ? op.equipmentLabels : [];
+  const minHits = Number(op.boxMinHits);
+  const maxAge = Number(op.boxMaxAgeMs);
+  const interval = Number(resolved.perception?.objects?.intervalMs);
+  if (!labels.length || !(minHits > 1) || !Number.isFinite(maxAge) || !Number.isFinite(interval)) {
+    return resolved;
+  }
+  const minMaxAge = interval + BOX_MAX_AGE_MARGIN_MS;
+  if (maxAge < minMaxAge) {
+    throw new Error(
+      `参数组合非法：signals.arm.operating.boxMaxAgeMs=${maxAge} 必须 >= `
+      + `perception.objects.intervalMs（${interval}）+ ${BOX_MAX_AGE_MARGIN_MS} = ${minMaxAge}。`
+      + ' 检测间隔不短于框有效期时，两次检测之间的帧会先把设备框过期，'
+      + ' boxMinHits 永远累计不到，operating 会丢掉设备证据。',
+    );
+  }
+  return resolved;
 }
 
 /**

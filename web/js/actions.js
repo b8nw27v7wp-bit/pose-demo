@@ -20,6 +20,7 @@ const EMPTY_FLAGS = {
   carryingL: false, carryingR: false,
   operating: false, operatingL: false, operatingR: false,
   nearEquipment: false,
+  oilSample: false, oilSampleL: false, oilSampleR: false,
 };
 
 /**
@@ -89,6 +90,8 @@ export class ActionEngine {
     this.openHold = new Hold(this.cfg.holds.open);
     this.upHold = new Hold(this.cfg.holds.bothHandsUp);
     this.headHold = new Hold(this.cfg.holds.handFace);
+    // 油样取样：举瓶到眼前「持续在看」，1s 才成立（见 params.actions.holds.oilSample）
+    this.sampleHold = new Hold(this.cfg.holds.oilSample, this.cfg.holds.oilSampleMaxGap);
     this.reachHold = new Hold(this.cfg.holds.reach);
     this.carryHold = new Hold(this.cfg.holds.carry);
     this.pointHold = new Hold(this.cfg.holds.point);
@@ -123,6 +126,7 @@ export class ActionEngine {
     this.openHold.reset();
     this.upHold.reset();
     this.headHold.reset();
+    this.sampleHold.reset();
     this.reachHold.reset();
     this.carryHold.reset();
     this.pointHold.reset();
@@ -229,6 +233,8 @@ export class ActionEngine {
     const bothHandsUp = this.upHold.update(raisedL && raisedR, ts);
     // 手在头部附近：扶额/摸头/敬礼一类，动作本身不重要，重要的是「手不在躯干平面」
     const handAtHead = this.headHold.update(s.arm.head_near_L || s.arm.head_near_R, ts);
+    // 油样取样：手举到眼前看样瓶（信号层已含「手在身体前方」这道门），保持 1s
+    const oilSample = this.sampleHold.update(!!(s.arm.sample_L || s.arm.sample_R), ts);
 
     // —— 伸手 / 指向 / 持物 / 拿取
     // 这些判定需要「手是张开还是握紧」，而姿态层只有腕的位置。
@@ -305,6 +311,7 @@ export class ActionEngine {
       frozen: false,
       flags: {
         armRaised, waving, crossed, onHips, armsOpen, bothHandsUp, handAtHead,
+        oilSample,
         reaching, carrying, pointing, armFront, armSide,
         // 逐侧粒度：界面用它说「左手举手」，导出也能按手拆准确率
         armRaisedL: armRaised && raisedL,
@@ -317,6 +324,8 @@ export class ActionEngine {
         pointingR: pointing && pointArmR,
         handAtHeadL: handAtHead && !!s.arm.head_near_L,
         handAtHeadR: handAtHead && !!s.arm.head_near_R,
+        oilSampleL: oilSample && !!s.arm.sample_L,
+        oilSampleR: oilSample && !!s.arm.sample_R,
         carryingL: carrying && closedL,
         carryingR: carrying && closedR,
         operating,
@@ -365,6 +374,9 @@ export const POSTURE_IDS = ACTION_CATALOG.map((a) => a.id);
 // context：不是手臂动作，是上下文事件；面板单独一行显示，不混进动作网格。
 export const ARM_ACTIONS = [
   { id: 'operating', name: '操作设备', flag: 'operating' },
+  // 机场加油特有：取样瓶/取样管举到眼前对光检查。判据见 signals.arm.sampling，
+  // 与 hand_head 的区别是多了「手在身体前方」这道门 + 1s 保持窗。
+  { id: 'oil_sample', name: '油样取样', flag: 'oilSample' },
   { id: 'reach', name: '伸手', flag: 'reaching' },
   { id: 'carry', name: '持物', flag: 'carrying' },
   { id: 'point', name: '指向', flag: 'pointing' },

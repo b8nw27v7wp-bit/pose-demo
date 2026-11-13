@@ -187,6 +187,14 @@ refuel 档的保持参数是 `holds.operating=1500ms`、`operatingMaxGap=600ms`�
 上面的 A/B 全部在同一份 JSONL 上重放。所有数字都在 Hold 修正后重测（真值帧间隔超过
 `operatingMaxGap` 也重置），refuel 档 `operatingMaxGap=600ms`。
 
+> 上表的录制走的是实时播放（`record-clip.mjs`），帧集合每次不同，所以只适合比较**判定层**
+> （同一份 JSONL 换 profile）。要比较**感知层**（换检测模型、改 `inputSize`/`intervalMs`、
+> 加 ROI 裁切）必须用 `scripts/deterministic-replay.mjs`：按固定媒体时间逐帧 seek，
+> 同一素材两次回放的逐帧内容 sha256 相同（见 `docs/eval.md`「确定性回放」）。
+> 2026-11-12 实测：油样片 5fps / 290 帧，两次回放 sha256 一致。
+> 注意它给出的 operating 指标与实时导出不是一回事（采样率/框的落地帧都不同），
+> 只能和**同参数的另一份确定性导出**比。
+
 复现：
 
 ```bash
@@ -259,8 +267,59 @@ node web/test/headless-multi.mjs
   必须重标重训。当前数字只能说明链路通了。
 - **valve 没有指标**：两个留出分镜不含阀门，valve 的 mAP 是缺失值，不是 0。
 - **gauge 基本没检出**：320 输入、conf 0.35 下小仪表检不到；要提高输入尺寸/单独采标。
-- **框不连续**：检测间隔 150ms + 异步推理，框会隔帧出现/消失；ROI 兜底和 union 是必要的。
+- **框不连续**：检测间隔 150ms + 异步推理，框会隔帧出现/消失。2026-11-12 起由
+  `equipment.js` 的时序确认（`boxMinHits`/`boxMaxAgeMs`）兜底：同一位置要在两次不同检测里
+  都命中才算证据，见 §9。
 - 仍然需要**人体检测器**来区分「真手臂镜头」和「手部特写」；设备框只解决「设备在不在、
   手离设备多远」，不解决「画面里的人是不是完整的人」。
 - 想真正考核：≥2 个机位 × 每个动作 20 个正例段 + 20 个反例段，按
   [`docs/annotation-kit.md`](annotation-kit.md) 走一遍，再报 recall/precision。
+
+## 9. 设备框的时序确认与额外门（2026-11-12）
+
+单帧误检 + 异步落地是 operating 误报的主要来源。现在设备框先过 `web/js/equipment.js`：
+
+- **时序确认**：同一位置（IoU ≥0.3 或中心距 ≤0.75×框对角线）在两次**不同的检测**里都命中才确认；
+  `objects_ts` 相同的重复帧不重复计数；超过 `boxMaxAgeMs`（默认 600ms）没再看到就过期。
+  过期过滤在匹配**之前**：超龄轨迹不会因为这一次检测匹配上就续命到 hits=2
+  （`update()` 只在有人的帧调用，漏检期间的旧轨迹以前正是这样绕过 `boxMinHits` 的）。
+  与检测间隔的关系由 `validateParams()` 校验：配了 `equipmentLabels` 且 `boxMinHits>1` 时要求
+  `boxMaxAgeMs >= perception.objects.intervalMs + 300`，非法组合在加载时报错。
+- **ROI 约束**（`boxRequireInRoi`）：框必须与本工位 ROI 相交，挡背景里别人的阀门。
+  refuel 的 159 个框里 105 个中心在 ROI 外，但绝大多数与 ROI 有重叠，所以用相交而不是中心在内。
+- **人形门**（`requireUprightBox` / `requireValidity`）：横着的人体框（手/油枪特写被凑成躯干）
+  不算人；默认关，精度优先档见 `web/profiles/refuel-equipment-strict.json`。
+  `requireValidity` 打开时会**自动启用** `nearEquipment.validity` 那道门并导出
+  `operating_validity`（只写 requireValidity 不再静默失效）。
+- **握持/前臂**（`requireGrip` / `useForearm`）：默认关，原因见下表。
+
+同一份 290 帧确定性导出（5fps）上的 A/B，基准是 `refuel-equipment.json`：
+
+| 变体 | operating TP/FN/FP | R | 说明 |
+|---|---|---|---|
+| 基准（boxMinHits=2, boxRequireInRoi=true） | 4/2/3 | 0.667 | 时序确认在帧级过滤掉 5/153 个单帧误检框，段级不变 |
+| boxMinHits=1（旧行为） | 4/2/3 | 0.667 | 本片没有「靠单帧框才成立」的段 |
+| useForearm=true | 4/2/3 | 0.667 | 没有「腕在外、前臂在框内」的帧 |
+| requireGrip=true | 4/2/3 | 0.667 | 肘兜底绕过握持门；手部模型只有 48/290 帧检出、8 次闭合手型检出（operating 帧里仅 1 帧） |
+| requireUprightBox=true | **2/4/0** | 0.333 | 精度到 1.0，但挡掉 2 个真作业段 |
+| elbowFallback=false | **1/5/0** | 0.167 | 肘兜底承担了大部分召回，不能关 |
+
+结论：**时序确认 + ROI 约束进默认档**；人形门与握持门保留为 profile 选项，
+必须按场景自己的标注重扫，不要直接抄 `refuel-equipment-strict.json` 的取舍。
+
+诊断字段：`operating_boxes_raw/confirmed/used`、`operating_gate(_L/_R)`、
+`operating_upright_box`，见 `docs/frame-schema.md`。`scripts/deterministic-replay.mjs`
+在导出末尾还会打一行「设备框连续性」：有人帧数、检出/确认/使用帧数、闪烁次数、有框检测轮次。
+其中 `confirmRate` 的分子是「本帧有新检出且确认态仍有效」的帧（`confirmedWithRawFrames`），
+恒 ≤ 1；`confirmedFrames` 含 `maxAgeMs` 内沿用的帧，可以大于检出帧数。
+
+**2026-11-12 确定性基线**（10fps / 580 帧 / CPU，`refuel-det-baseline.jsonl`，本机不进 git）：
+operating 4TP/2FN/5FP（R0.667/P0.444），near_equipment 2/4/2；
+设备框连续性：有人 366 帧、检出 316（0.863）、确认率 0.984（311/316）、确认态 325、参与判定 325、
+闪烁 10 次、有框检测轮次 180。
+同一导出两次回放 sha256 一致（`333409c6…`）。**采样率改了指标就会变**，这份只能和同 fps/同参数的导出比。
+
+> 2026-11-12 审查修复后基线有变：过期过滤移到匹配**之前**（`equipment.js`），
+> 有 3 帧（t≈21s/29s/42s）的「陈旧轨迹 + 一次新检出」不再算确认，确认态 328 → 325，
+> 确认率 0.994 → 0.984。**段级指标不变**（operating 4/2/5、near_equipment 2/4/2）。
+> 修复前的基线 sha 是 `aae4c098…`，两边的差异只在 `operating_boxes_confirmed/used`。

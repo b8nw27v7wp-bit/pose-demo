@@ -1779,6 +1779,29 @@ console.log('\n[29] 多人评估口径');
   const eqTl = replay([eqFrame], eqParams);
   check('离线回放把 objects 传给信号层', eqTl[0].sig.arm.operating_any === true,
     `any=${eqTl[0].sig.arm.operating_any}`);
+
+  // requireGrip 的手部归属：单人路径也走页面同一个 assignHands（按手到腕点的距离绑人），
+  // 不能拿整帧里离这个人很远的手当握持证据（旧版按 handedness 直接取，页面与离线会不一致）。
+  const gripParams = {
+    signals: { arm: { operating: {
+      roi: null, equipmentLabels: ['valve'], equipmentMinScore: 0.3,
+      equipmentMaxDist: 0.2, equipmentFallbackRoi: false, requireGrip: true,
+    } } },
+  };
+  // 框只包住左腕 [80,200]；两肘在 y=150，离框 30px > 0.2×scale(100)，肘兜底不会命中
+  const gripFrame = (hand) => ({
+    ...opFrame(),
+    objects: [{ label: 'valve', score: 0.9, box: [60, 180, 120, 220] }],
+    ...(hand ? { hands: [hand] } : {}),
+  });
+  const handAt = (x, y) => ({ handedness: 'Left', shape: 'fist', score: 0.9, kp: [[x, y], [x + 6, y]] });
+  const nearGrip = replay([gripFrame(handAt(80, 200))], gripParams);
+  check('离线 grip：贴住腕点的握拳 → operating', nearGrip[0].sig.arm.operating_any === true,
+    `gate=${nearGrip[0].sig.arm.operating_gate}`);
+  const farGrip = replay([gripFrame(handAt(400, 100))], gripParams);
+  check('离线 grip：远离腕点的手不归属给这个人（与页面 assignHands 一致）',
+    farGrip[0].sig.arm.operating_any === false && farGrip[0].sig.arm.operating_grip_L === null,
+    `gate=${farGrip[0].sig.arm.operating_gate} gripL=${farGrip[0].sig.arm.operating_grip_L}`);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

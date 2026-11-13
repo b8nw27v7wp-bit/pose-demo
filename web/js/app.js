@@ -12,7 +12,9 @@ import {
 } from './actions.js';
 import { explainArmActions, DEFAULT_HINT } from './armhint.js';
 import { loadAccuracyReport, accuracyFor, formatAccuracy, accuracyStale } from './accuracy.js';
-import { resolveParams, profileParams, profileName as profileNameOf, paramsHash } from './params.js';
+import {
+  resolveParams, validateParams, profileParams, profileName as profileNameOf, paramsHash,
+} from './params.js';
 import { hasRegionConfig } from './geometry.js';
 import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS, HARDCASE_BEFORE_MS } from './hardcase.js';
 import { drawSkeleton, drawHand, drawBoxes, drawTrackLabel, clearCanvas } from './draw.js';
@@ -20,6 +22,7 @@ import { Tracker, area } from './track.js';
 import {
   PersonPipelines, assignHands, logLimitFor,
   TrackShapeStabilizers, classifyHandsByTrack, bindClassifiedHands, pickRoiPersons,
+  pickSingleTarget,
 } from './multi.js';
 import { PpeMonitor } from './ppe.js';
 import {
@@ -73,6 +76,11 @@ const inferInterval = () => 1000 / (Number($('fpsCapSel').value) || 30);
 
 // profile：URL 参数 ?profile=/web/profiles/refuel.json，用于切场景时只换阈值不改代码
 const profileUrl = new URLSearchParams(location.search).get('profile');
+// 确定性回放：?det=1 时不开 rAF 主循环，由外部脚本按固定媒体时间逐帧调用
+// __pose.step()（scripts/deterministic-replay.mjs）。实时播放每次抽到的帧都不同
+// （同一段 58s 素材三次播放记录 1549/1511/1428 帧），感知层改动因此无法同帧比较。
+// 这个模式下 ts 用媒体时间而不是墙钟，Hold/滤波/tracker 的计时才可复现。
+const detReplay = new URLSearchParams(location.search).get('det') === '1';
 let activeParams = {};
 let profileName = 'default';
 // profile 可以声明它是在哪个模型档位下校准的（lite/full）。阈值与档位是绑定的：
@@ -112,6 +120,9 @@ let multiCfgKey = '';   // 建多人估计器时用的 numPoses|detConf|presence
 let objectError = null;
 let multiError = null;
 let objectBusy = false;   // ONNX 后端同一时刻只允许一帧在推理（见 loop()）
+// 确定性回放时在每帧末尾 await 这次推理：否则「框什么时候回来」取决于 CPU 快慢，
+// 同一份素材两次回放会得到不同的 objects 序列（详见 detReplay）。
+let objectInflight = null;
 let objectGen = 0;        // 物体检测器代次：换 profile/关开关时 +1，作废在途的创建与推理
 let replaySeq = 0;        // 重播代次：快速连点时只让最后一次的 seek→play 生效
 let profileLoaded = false;   // initProfile() 完成（无头脚本等它再改开关，避免抢跑用默认参数建模型）
@@ -121,6 +132,9 @@ let multiMaxFromSettings = false;   // 用户保存过多人数选择后，profi
 const stageMs = { pose: 0, hands: 0, objects: 0, draw: 0, total: 0, n: 0 };
 const ema = (old, v) => old + (v - old) * 0.15;
 let lastObjects = [];
+// 这批 lastObjects 是哪次检测产生的（毫秒，与 ts 同基准）。设备框的时序确认靠它
+// 区分「新一次检测」和「两次检测之间沿用上一帧结果」，否则一次误检会在重复帧里攒够命中。
+let lastObjectsTs = null;
 let lastVerdicts = [];
 
 
@@ -134,9 +148,12 @@ let shapeStable = makeShapeStable(activeParams);
 
 /** 换参数要重建引擎：滤波器和计数器持有状态，只改字段会让它们停在上一次的参数上 */
 function applyParams(params, name = 'default') {
+  // 先校验再落地：非法组合（如 boxMaxAgeMs 覆盖不了 objects.intervalMs）直接抛给调用方，
+  // loadProfile 会显示错误并保留上一个 profile。不能先改 activeParams 再报错——
+  // 那时引擎已经按半套参数重建，界面上的 profile 名与真实阈值对不上。
+  const resolved = validateParams(params || {});
   activeParams = params || {};
   profileName = name;
-  const resolved = resolveParams(activeParams);
   // 换参数必须重建：滤波器和计数器持有状态，只改字段会让它们停在上一次的参数上
   pipelines = new PersonPipelines(activeParams);
   tracker = new Tracker(resolved.signals.track);
@@ -201,8 +218,9 @@ async function loadProfile(url) {
     const res = await fetch(url, { cache: 'no-cache' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const raw = await res.json();
-    profileModel = typeof raw.model === 'string' && raw.model ? raw.model : null;
+    // applyParams 先校验参数；抛错时 profileModel 不能已经改掉（否则状态栏/报告的档位对不上）
     applyParams(profileParams(raw), profileNameOf(raw, url));
+    profileModel = typeof raw.model === 'string' && raw.model ? raw.model : null;
     // 不要覆盖状态栏的输入状态；profile 名显示在工具条
     updateProfileTag();
     return true;
@@ -630,6 +648,7 @@ function invalidateObjectDetector() {
   objectBusy = false;
   objectError = null;   // 旧配置的失败信息不要挂到新配置上
   lastObjects = [];     // 旧检测框不能留到新后端/新 profile 里
+  lastObjectsTs = null;
 }
 
 async function ensureObjectDetector() {
@@ -675,6 +694,7 @@ function resetRuntime() {
   fallbackPoseFailed = false;   // 新输入/新会话允许补救路径重试一次
   lastVerdicts = [];
   lastObjects = [];
+  lastObjectsTs = null;
   frameLog = [];
   lastVideoTime = -1;
   lastObjectTs = 0;
@@ -1230,8 +1250,10 @@ async function analyzeStill(img) {
     .map((p, i) => ({ ...p, track_id: i, track_age_ms: 0 }));
   let target = null;
   if (persons.length) {
-    target = persons[0];
-    for (const p of persons) if (area(p.bbox) > area(target.bbox)) target = p;
+    // 与视频单人道同一套主目标规则（profile 可换 torso/upright）
+    target = multiOn
+      ? persons.slice().sort((a, b) => area(b.bbox) - area(a.bbox))[0]
+      : pickSingleTarget(persons, singleCfg.target, { minAspect: singleCfg.targetMinAspect });
   }
   // 单张图没有时间窗：多人时全部判（各自独立状态机），单人时只判主目标。
   // 单人道固定用 track_id 0：帧内序号随检出顺序变，状态机会在 0/1 之间来回分叉。
@@ -1282,7 +1304,8 @@ async function analyzeStill(img) {
       hands = cls.hands;
       // 单人也必须走一遍归属：ActionEngine 拿的是「每个人每只手」的 map，
       // 之前单人模式传 null，导致伸手/持物/指向/拿取在默认单人道里永远不成立。
-      verdicts = pipelines.update(judged, t, cls.handsByTrack, objects);
+      // 单张图片没有「上一次检测」：objectsTs 传 null，设备框不做时序确认（保持旧行为）。
+      verdicts = pipelines.update(judged, t, cls.handsByTrack, objects, null);
     }
     const primaryV = pipelines.primary(verdicts);
     sig = primaryV ? primaryV.sig : null;
@@ -1470,7 +1493,17 @@ function setActiveInput(kind) {
 }
 
 function ensureLoop() {
-  if (rafId === null) rafId = requestAnimationFrame(loop);
+  // 确定性回放由 __pose.step() 逐帧驱动，rAF 一开就会在脚本 seek 之间偷跑帧
+  if (detReplay) return;
+  if (rafId === null) rafId = requestAnimationFrame(loopSafe);
+}
+
+/** rAF 回调：loop 是 async 的，异常必须显式接住，否则只会变成一条 unhandled rejection */
+function loopSafe() {
+  loop().catch((e) => {
+    setStatus(`推理错误：${e.message}`, 'err');
+    stopLoop();
+  });
 }
 
 // —— 主循环 -------------------------------------------------------------
@@ -1498,17 +1531,22 @@ function mayLogFrame() {
   return true;
 }
 
-function loop() {
-  rafId = requestAnimationFrame(loop);
-  if (!estimatorReady) return;
+async function loop() {
+  // detReplay 下不自己排下一帧（见 ensureLoop），返回值只用于驱动脚本判断有没有推进
+  if (!detReplay) rafId = requestAnimationFrame(loopSafe);
+  if (!estimatorReady) return false;
 
   const v = videoEl;
-  if (!v.videoWidth || v.readyState < 2) return;
+  if (!v.videoWidth || v.readyState < 2) return false;
 
-  const ts = Math.max(performance.now(), lastTs + 1);
+  // 实时播放用墙钟；确定性回放用媒体时间：同样一串 seek 得到同样的 ts，
+  // Hold 的 1500ms、One Euro 的 dt、tracker 的 maxLostMs 才能逐帧复现。
+  const ts = detReplay
+    ? Math.round(v.currentTime * 1000)
+    : Math.max(performance.now(), lastTs + 1);
   lastTs = ts;
-  if (ts - lastInferTs < inferInterval()) return;
-  if (mode === 'file' && v.currentTime === lastVideoTime) return;
+  if (!detReplay && ts - lastInferTs < inferInterval()) return false;
+  if (mode === 'file' && v.currentTime === lastVideoTime) return false;
   lastInferTs = ts;
   lastVideoTime = v.currentTime;
   const tLoop = performance.now();
@@ -1551,7 +1589,7 @@ function loop() {
   } catch (e) {
     setStatus(`推理错误：${e.message}`, 'err');
     stopLoop();
-    return;
+    return false;
   }
   let poseMs = performance.now() - tPose;
 
@@ -1589,7 +1627,7 @@ function loop() {
   // 判谁：单人道只判主目标（其余人只画骨架），多人道所有人都判
   let judged = persons;
   if (!multi) {
-    const main = persons.slice().sort((a, b) => area(b.bbox) - area(a.bbox))[0] || null;
+    const main = pickSingleTarget(persons, singleCfg.target, { minAspect: singleCfg.targetMinAspect });
     // 单人道固定 track_id 0（与 PersonPipelines 的注释一致）：帧内序号随检出顺序变，
     // 两人同框时主目标会在 0/1 两条流水线之间来回切，Hold/滤波/计数全部被打断。
     if (main) main.track_id = 0;
@@ -1610,6 +1648,7 @@ function loop() {
       $('chkObjects').checked = false;
       setStatus(`物体检测失败，已关闭：${e.message}`, 'err');
       lastObjects = [];
+      lastObjectsTs = null;
     };
     try {
       // 必须先看 objectBusy 再调用：ONNX 的 detectObjects 在返回 Promise 之前就同步做了
@@ -1619,19 +1658,28 @@ function loop() {
         // 上一次推理还没回来，这一帧跳过（沿用上一帧的框）
       } else {
         const detGen = objectGen;
-        const det = detectObjects(v, ts, w, h);
+        // 记下这次检测的帧时间：结果可能晚一两帧才回来，但「是哪一次检测」不能变，
+        // 否则设备框的时序确认会把同一次的重复结果当成两次命中。
+        const detTs = ts;
+        const det = detectObjects(v, detTs, w, h);
         if (det && typeof det.then === 'function') {
           objectBusy = true;
-          det.then((o) => {
+          const inflight = det.then((o) => {
             // 推理期间换了 profile / 关了开关：结果属于旧代次，丢掉
-            if (detGen === objectGen && objectOn) lastObjects = o;
+            if (detGen === objectGen && objectOn) {
+              lastObjects = o;
+              lastObjectsTs = detTs;
+            }
           }).catch((e) => {
             if (detGen === objectGen) fail(e);
           }).finally(() => {
             if (detGen === objectGen) objectBusy = false;
+            if (objectInflight === inflight) objectInflight = null;
           });
+          objectInflight = inflight;
         } else {
           lastObjects = det;
+          lastObjectsTs = detTs;
         }
       }
     } catch (e) {
@@ -1639,6 +1687,7 @@ function loop() {
     }
   } else if (!objectOn) {
     lastObjects = [];
+    lastObjectsTs = null;
   }
   const objMs = performance.now() - tObj;
 
@@ -1680,7 +1729,7 @@ function loop() {
   const handsMs = performance.now() - tHands;
 
   // 判定：每人一条独立流水线
-  const verdicts = pipelines.update(judged, ts, handsByTrack, lastObjects);
+  const verdicts = pipelines.update(judged, ts, handsByTrack, lastObjects, lastObjectsTs);
   if (multi) {
     // 跟踪器已经 prune 过超时轨迹：流水线/PPE 计时器不能继续留着（长会话里会无限增长，
     // 而且旧 id 的 PPE 计时会在新人拿到新 id 后仍然占着内存）
@@ -1778,6 +1827,12 @@ function loop() {
     updateUI();
     lastUiTs = ts;
   }
+
+  // 确定性回放：等这一帧启动的物体推理落地再返回。不 await 的话「框什么时候回来」
+  // 取决于机器快慢，同一份素材两次回放会得到不同的 objects 序列。
+  // 语义仍是「上一帧结果」——本帧的 frameLog/lastResult 在这之前已经写完。
+  if (detReplay && objectInflight) await objectInflight;
+  return true;
 }
 
 function countFps(ts) {
@@ -1853,6 +1908,9 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
     // 多人/物体模型一轮要几十到几百毫秒，读此刻的时间会让日志比实际分析的帧晚好几帧，
     // 离线按帧对齐 gt（web/test/mot17-eval.mjs）会系统性错位。
     video_time: mode === 'file' ? Math.round(lastVideoTime * 1000) / 1000 : null,
+    // 这批 objects 是哪次检测产生的（毫秒）。设备框的时序确认靠它区分「新检测」与
+    // 「两次检测之间沿用的上一帧结果」；旧导出没有这个字段时按「无时序信息」处理。
+    objects_ts: Number.isFinite(lastObjectsTs) ? Math.round(lastObjectsTs) : null,
     person_count: personCount,
     // 多人时是全部判定人员（每人带 kp/kp_world/scale/score），单人时仍是 1 个元素、字段不变。
     // 迁移旧数据的工具不需要知道模式：只看数组长度即可。
@@ -1889,6 +1947,16 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       operating_any: !!sig.arm.operating_any,
       // 本帧是否用了物体检测器给出的设备框（false = 退回人工 ROI / 无 ROI）
       operating_equipment: !!sig.arm.operating_equipment,
+      // 为什么没判成 operating（ok / no_equipment / reach_low / not_near / no_grip ...）
+      operating_gate: sig.arm.operating_gate ?? null,
+      operating_gate_L: sig.arm.operating_gate_L ?? null,
+      operating_gate_R: sig.arm.operating_gate_R ?? null,
+      // 设备框的三段计数：raw 检出 → confirmed 时序确认 → used 过 ROI 后参与判定
+      operating_boxes_raw: sig.arm.operating_boxes_raw ?? 0,
+      operating_boxes_confirmed: sig.arm.operating_boxes_confirmed ?? 0,
+      operating_boxes_used: sig.arm.operating_boxes_used ?? 0,
+      operating_validity: sig.arm.operating_validity ?? null,
+      operating_upright_box: sig.arm.operating_upright_box ?? null,
       // 多边形 ROI / 人框有效性的诊断（老字段不变，只增可选字段）
       operating_roi_mode: sig.armPose.operating_roi_mode ?? null,
       operating_roi_zones: sig.armPose.operating_roi_zones ?? 0,
@@ -2807,6 +2875,7 @@ window.__pose = {
   get state() {
     return {
       estimatorReady, handReady, mode, fps: r1(fps), frames: frameLog.length, lastResult,
+      detReplay,
       // 多人 / 物体检测（无头检查断言用）
       multiOn, multiReady, objectOn, objectReady, multiError, objectError,
       multiKey: multiEstimatorInfo().key, multiTiles: multiCfg.tiles,
@@ -2864,6 +2933,36 @@ window.__pose = {
   initEstimator,
   startCamera,
   useVideoSource,
+  /**
+   * 确定性回放：先建好懒加载的感知模型。物体检测器/多人估计器原本在 loop() 里首次
+   * 需要时才建，det 模式没有 rAF，必须由驱动脚本显式触发——否则前几帧有没有 objects/PPE
+   * 取决于 12MB ONNX 什么时候加载完，同一输入两次回放结果不同。
+   */
+  async prepare() {
+    if (multiOn && !multiReady) await ensureMultiEstimator().catch(() => {});
+    if (objectOn && !objectReady) await ensureObjectDetector().catch(() => {});
+    return { multiOn, multiReady, objectOn, objectReady, multiError, objectError };
+  },
+  /**
+   * 确定性回放：把 video 当前时间点的那一帧跑一遍完整判定（需 URL 带 ?det=1）。
+   * 驱动脚本负责「seek → 等 seeked → step()」，见 scripts/deterministic-replay.mjs。
+   * 返回本帧是否真的推进了（同一 currentTime 重复调用会 advanced=false）。
+   */
+  async step() {
+    if (!detReplay) throw new Error('确定性回放未启用：URL 需要带 ?det=1');
+    const before = frameLog.length;
+    const advanced = await loop();
+    return {
+      advanced: !!advanced,
+      ready: estimatorReady,
+      frames: frameLog.length,
+      added: frameLog.length - before,
+      video_time: videoEl && Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : null,
+      ts: lastResult ? lastResult.ts : null,
+      persons: lastResult ? lastResult.persons.length : 0,
+      objects: lastResult ? lastResult.objects.length : 0,
+    };
+  },
   // 难例闭环：返回摘要而不是整份帧，避免 CDP 传输大对象
   hardcaseInfo(action = 'none') {
     const last = frameLog[frameLog.length - 1];

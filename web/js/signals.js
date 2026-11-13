@@ -7,7 +7,9 @@ import { KPT, IDX, MP_INDEX } from './kpt.js';
 import { resolveParams } from './params.js';
 import {
   resolveRegions, scaleZones, pointInAnyZone, maxZoneOverlap, personBoxValidity,
+  segmentBoxDistance, pointBoxDistance,
 } from './geometry.js';
+import { EquipmentBoxTracker } from './equipment.js';
 
 // MediaPipe worldLandmarks：米制、原点在髋中心、**y 向下为正**（docs/signals.md §一·五）。
 // 重力方向向量因此是 [0,1,0]；「竖直向上」是 [0,-1,0]。
@@ -435,6 +437,11 @@ export class SignalEngine {
     // 设备区域是静态配置：构造时解析一次，逐帧只做归一化→像素换算。
     // 多边形 rois 非空时优先；全部非法时 valid=false（fail-closed）。
     this.regions = resolveRegions(p.arm.operating, 0, 0);
+    // 设备检测框的时序确认（只对配置了 equipmentLabels 的场景生效）
+    this.eqBoxes = new EquipmentBoxTracker({
+      minHits: p.arm.operating.boxMinHits,
+      maxAgeMs: p.arm.operating.boxMaxAgeMs,
+    });
     this.kpFilter = new KpFilter(p.smoothing, p.visMin, p.occlusion.maxExtrapMs);
     this.angleOpts = { minCutoff: p.smoothing.angleCutoff, beta: p.smoothing.angleBeta };
     this.angleFilters = {};
@@ -465,6 +472,7 @@ export class SignalEngine {
 
   reset() {
     this.kpFilter.reset();
+    this.eqBoxes.reset();
     this.angleFilters = {};
     this.angleLast = {};
     this.angleOutliers = {};
@@ -527,7 +535,15 @@ export class SignalEngine {
    * @param {object} person toPersons() 产出的单人对象
    * @param {number} ts 毫秒时间戳
    */
-  update(person, ts, objects = []) {
+  /**
+   * @param {object} person 统一 person 对象（见 docs/frame-schema.md）
+   * @param {number} ts 帧时间（毫秒，与调用方的时钟同基准）
+   * @param {Array<{label:string,score:number,box:number[]}>} objects 本帧物体检测框
+   * @param {{L:object|null,R:object|null}|null} hands 已归属到本人的手（门控握持用）
+   * @param {number|null} objectsTs 这批 objects 是哪次检测产生的；null=无时序信息
+   *        （旧导出 / 单张图片），此时设备框不做时序确认
+   */
+  update(person, ts, objects = [], hands = null, objectsTs = null) {
     const tSec = ts / 1000;
     this.angleRejected = [];   // 本帧的坏点清单（逐帧重置）
     const C = this.params;
@@ -908,22 +924,35 @@ export class SignalEngine {
     // 没有阀门/仪表模型时 equipmentLabels 为空，行为与旧版完全一致。
     const eqLabels = new Set((opCfg.equipmentLabels || [])
       .map((s) => String(s).toLowerCase()));
-    const eqBoxes = (Array.isArray(objects) ? objects : [])
+    const rawEqObjects = (Array.isArray(objects) ? objects : [])
       .filter((o) => o && Array.isArray(o.box) && o.box.length >= 4
         && eqLabels.has(String(o.label ?? '').toLowerCase())
         && (o.score ?? 0) >= (opCfg.equipmentMinScore ?? 0.35))
-      .map((o) => o.box);
+      .map((o) => ({ label: String(o.label ?? '').toLowerCase(), box: o.box }));
+    // 时序确认：同一位置要在两次不同的检测里都命中才算「设备证据」。
+    // objectsTs=null（旧导出 / 单张图片）时不过滤，保持旧行为。
+    const eqTrust = this.eqBoxes.update(rawEqObjects, ts, objectsTs);
+    // ROI 约束：检测器可能在背景里检出别的阀门/仪表，与本工位 ROI 没有任何交集的框不算。
+    // 用「相交」而不是「中心在内」：ROI 是手圈的设备区域，检测框常常跨在边界上
+    // （refuel 实测 159 个框里 105 个中心在 ROI 外，但多数与 ROI 有重叠）。
+    const eqInRoi = (b) => {
+      if (opCfg.boxRequireInRoi === false || !roiUsable) return true;
+      if (regionCfg.mode === 'rect' && rectPx) {
+        return b[2] > rectPx[0] && b[0] < rectPx[2] && b[3] > rectPx[1] && b[1] < rectPx[3];
+      }
+      if (regionCfg.mode === 'polygon' && pixelZones.length) {
+        return maxZoneOverlap(b, pixelZones).ratio > 0;
+      }
+      return true;
+    };
+    const eqBoxes = eqTrust.boxes.filter(eqInRoi);
     const hasEquipmentBox = eqBoxes.length > 0;
     // 配了设备类别但本帧没框时是否退回 ROI。false = 没有物体证据就不判（fail-closed）。
     const eqFallback = opCfg.equipmentFallbackRoi !== false;
     // 本帧到底有没有「设备证据」：检测框，或（允许时）可用的 ROI
     const hasEquipEvidence = hasEquipmentBox || (eqFallback && roiUsable);
     const eqMaxDist = (opCfg.equipmentMaxDist ?? 0.35) * scale;
-    const distToBox = (x, y, b) => {
-      const dx = x < b[0] ? b[0] - x : x > b[2] ? x - b[2] : 0;
-      const dy = y < b[1] ? b[1] - y : y > b[3] ? y - b[3] : 0;
-      return Math.hypot(dx, dy);
-    };
+    const distToBox = (x, y, b) => pointBoxDistance(x, y, b);
     // 返回 {near, zone}：zone 只在多边形 ROI 命中时有值（矩形保持旧语义，不给假 id）。
     const pointNearEquipment = (x, y) => {
       if (hasEquipmentBox) return { near: eqBoxes.some((b) => distToBox(x, y, b) <= eqMaxDist), zone: null };
@@ -935,45 +964,111 @@ export class SignalEngine {
       }
       return { near: false, zone: null };
     };
-    const opSide = (wr, reachVal, elevVal, headNear, usable) => {
-      const near = pointNearEquipment(wr[0], wr[1]);
-      const ok = usable
-        && visShoulder >= opCfg.minShoulderVis
-        && !headNear
-        && Number.isFinite(reachVal) && reachVal >= opCfg.minReachRoi
-        && Number.isFinite(elevVal) && elevVal >= opCfg.minElev && elevVal <= opCfg.maxElev
-        && near.near;
-      // zone 只在真正成立时上报：否则「手在 zone 里但抬臂角不满足」会把诊断带偏。
-      return { ok, zone: ok ? near.zone : null };
+    // 腕→肘线段到框的距离：手被面板挡住时腕点会漂，前臂仍然贴着设备。
+    const segmentNearEquipment = (a, b) => {
+      if (!hasEquipmentBox) return { near: false, zone: null };
+      return { near: eqBoxes.some((box) => segmentBoxDistance(a, b, box) <= eqMaxDist), zone: null };
+    };
+    const nearForSide = (side, wr) => {
+      const byPoint = pointNearEquipment(wr[0], wr[1]);
+      if (!opCfg.useForearm) return byPoint;
+      const elbow = P(`elbow_${side}`);
+      if ((V(`elbow_${side}`) ?? 0) < opCfg.minElbowVis) return byPoint;
+      const bySeg = segmentNearEquipment(wr, elbow);
+      return bySeg.near ? bySeg : byPoint;
+    };
+    // 握持：手型属于 closedShapes（fist/ok）才算「在操作」。没有手部数据 = 不成立。
+    const closedShapes = new Set(C.hand.closedShapes || []);
+    const gripShape = (side) => hands?.[side]?.cls?.shape ?? null;
+    const gripOk = (side) => closedShapes.has(gripShape(side));
+    // 人形门：阈值复用 nearEquipment.validity（面积/高度/出画/肩髋可见性）。
+    // requireValidity 打开时强制启用这道门：personBoxValidity() 在 enabled!==true 时
+    // 直接返回 ok=true，只写 operating.requireValidity 而不顺带打开 validity.enabled
+    // 会让门**静默失效**——配置者以为开了，实际没开。误报控制门不能静默。
+    const opValidityCfg = (C.arm.nearEquipment.validity || {});
+    const opValidity = personBoxValidity(
+      person.bbox, frameW, frameH, visShoulder, visTorso,
+      opCfg.requireValidity ? { ...opValidityCfg, enabled: true } : opValidityCfg,
+    );
+    const validityBlocked = () => opCfg.requireValidity && !opValidity.ok;
+    // 人形门的另一半：人体框通常「高于宽」。横着的框多半是手臂/设备特写被凑成了人
+    // （refuel 实测 220×147 的手+油枪、159×59 的面板特写），和 upperBody 用同一道几何门。
+    const pBb = person.bbox;
+    const pBw = Array.isArray(pBb) && pBb.length >= 4 ? pBb[2] - pBb[0] : NaN;
+    const pBh = Array.isArray(pBb) && pBb.length >= 4 ? pBb[3] - pBb[1] : NaN;
+    const opUprightBox = !(pBw > 0 && pBh > 0)
+      || pBh >= pBw * C.upperBody.minAspect;
+    const uprightBlocked = () => opCfg.requireUprightBox && !opUprightBox;
+    // gate 记录「最靠后的一关」，用来回答「这帧为什么没判成 operating」。
+    const opSide = (side, wr, reachVal, elevVal, headNear, usable) => {
+      if (!hasEquipEvidence) return { ok: false, zone: null, gate: 'no_equipment' };
+      if (!usable) return { ok: false, zone: null, gate: 'no_arm' };
+      if (!(visShoulder >= opCfg.minShoulderVis)) return { ok: false, zone: null, gate: 'low_shoulder' };
+      if (headNear) return { ok: false, zone: null, gate: 'head_near' };
+      if (validityBlocked()) return { ok: false, zone: null, gate: 'person_invalid' };
+      if (uprightBlocked()) return { ok: false, zone: null, gate: 'person_not_upright' };
+      if (!Number.isFinite(reachVal) || reachVal < opCfg.minReachRoi) {
+        return { ok: false, zone: null, gate: 'reach_low' };
+      }
+      if (!Number.isFinite(elevVal) || elevVal < opCfg.minElev) {
+        return { ok: false, zone: null, gate: 'elev_low' };
+      }
+      if (elevVal > opCfg.maxElev) return { ok: false, zone: null, gate: 'elev_high' };
+      const near = nearForSide(side, wr);
+      if (!near.near) return { ok: false, zone: null, gate: 'not_near' };
+      if (opCfg.requireGrip && !gripOk(side)) return { ok: false, zone: null, gate: 'no_grip' };
+      return { ok: true, zone: near.zone, gate: 'ok' };
     };
     // 没有设备 ROI/检测框就不判：只剩「伸手」会把拿东西/扶栏杆误报成操作设备
-    const opL = hasEquipEvidence
-      ? opSide(wristL, reachL, elevL, headNearL, armUsableL) : { ok: false, zone: null };
-    const opR = hasEquipEvidence
-      ? opSide(wristR, reachR, elevR, headNearR, armUsableR) : { ok: false, zone: null };
+    const opL = opSide('L', wristL, reachL, elevL, headNearL, armUsableL);
+    const opR = opSide('R', wristR, reachR, elevR, headNearR, armUsableR);
     const operatingL = opL.ok;
     const operatingR = opR.ok;
     // 手被设备挡住时的兜底：肘在 ROI/检测框内、离肩够远、不是垂在身侧。
     // 肘比「整个人框在 ROI 里」更接近手臂在设备上，误报低得多。
-    const opElbowSide = (elbow, elbowVis, sh) => {
+    // 这一支不要求握持：它存在的理由正是「手看不见」。
+    const opElbowSide = (elbow, elbowVis, sh, wristUsable) => {
+      if (!hasEquipEvidence) return { ok: false, zone: null, gate: 'no_equipment' };
+      if (opCfg.elbowFallback === false) return { ok: false, zone: null, gate: 'no_elbow' };
+      // 手是可用的（腕可见、骨骼正常）却还要用肘兜底，等于绕过了「手没贴到设备」这一关。
+      if (opCfg.elbowFallbackHideWrist && wristUsable) {
+        return { ok: false, zone: null, gate: 'no_elbow' };
+      }
+      if ((elbowVis ?? 0) < opCfg.minElbowVis) return { ok: false, zone: null, gate: 'no_elbow' };
+      if (!(visShoulder >= opCfg.minShoulderVis)) return { ok: false, zone: null, gate: 'low_shoulder' };
+      if (validityBlocked()) return { ok: false, zone: null, gate: 'person_invalid' };
+      if (uprightBlocked()) return { ok: false, zone: null, gate: 'person_not_upright' };
+      if (!Number.isFinite(d2(elbow, sh)) || d2(elbow, sh) / scale < opCfg.minElbowReach) {
+        return { ok: false, zone: null, gate: 'reach_low' };
+      }
+      const elevElbow = elev(sh, elbow);
+      if (!Number.isFinite(elevElbow) || elevElbow < opCfg.minElbowElev) {
+        return { ok: false, zone: null, gate: 'elev_low' };
+      }
+      if (elevElbow > opCfg.maxElev) return { ok: false, zone: null, gate: 'elev_high' };
       const near = pointNearEquipment(elbow[0], elbow[1]);
-      const ok = elbowVis >= opCfg.minElbowVis
-        && visShoulder >= opCfg.minShoulderVis
-        && Number.isFinite(d2(elbow, sh)) && d2(elbow, sh) / scale >= opCfg.minElbowReach
-        && Number.isFinite(elev(sh, elbow)) && elev(sh, elbow) >= opCfg.minElbowElev
-        && elev(sh, elbow) <= opCfg.maxElev
-        && near.near;
-      return { ok, zone: ok ? near.zone : null };
+      if (!near.near) return { ok: false, zone: null, gate: 'not_near' };
+      return { ok: true, zone: near.zone, gate: 'ok' };
     };
-    const opElbowL = hasEquipEvidence
-      ? opElbowSide(P('elbow_L'), V('elbow_L'), shL) : { ok: false, zone: null };
-    const opElbowR = hasEquipEvidence
-      ? opElbowSide(P('elbow_R'), V('elbow_R'), shR) : { ok: false, zone: null };
+    const opElbowL = opElbowSide(P('elbow_L'), V('elbow_L'), shL, armUsableL);
+    const opElbowR = opElbowSide(P('elbow_R'), V('elbow_R'), shR, armUsableR);
     const operatingElbowL = opElbowL.ok;
     const operatingElbowR = opElbowR.ok;
     const operatingAny = operatingL || operatingR || operatingElbowL || operatingElbowR;
     // 诊断：第一个命中的 zone；用设备框或矩形 ROI 时为 null。
     const operatingRoiZone = opL.zone || opR.zone || opElbowL.zone || opElbowR.zone || null;
+    // 汇总 gate：命中就是 ok；否则取四条分支里**走得最远**的那一关。
+    // 「这条手臂不可用」信息量最低（rank 1），「手没贴到设备/没握住」最具体（rank 7/8）。
+    // 这样导出里一眼能看出 FN 是「没人/没设备」还是「手没够到」。
+    const GATE_RANK = {
+      no_equipment: 0, no_arm: 1, no_elbow: 1, person_invalid: 2, low_shoulder: 3,
+      person_not_upright: 3,
+      head_near: 4, reach_low: 5, elev_low: 6, elev_high: 6, not_near: 7, no_grip: 8, ok: 9,
+    };
+    const opGates = [opL.gate, opR.gate, opElbowL.gate, opElbowR.gate];
+    const operatingGate = operatingAny
+      ? 'ok'
+      : opGates.reduce((best, g) => ((GATE_RANK[g] ?? -1) > (GATE_RANK[best] ?? -1) ? g : best), opGates[0]);
 
     // —— 伸手 / 指向 / 持物（拿取动作的基础信号）
     // 伸出 = 腕离肩足够远且不是自然下垂。用 reach（已按 scale 归一）而不是像素。
@@ -993,6 +1088,19 @@ export class SignalEngine {
       if (visWristL >= VIS_MIN) azimL = azimuth(Wp('shoulder_L'), Wp('wrist_L'));
       if (visWristR >= VIS_MIN) azimR = azimuth(Wp('shoulder_R'), Wp('wrist_R'));
     }
+    // —— 油样取样（举瓶到眼前对光检查）——
+    // 复用 head 的距离判据（腕-鼻尖 < maxHeadDist 且不明显低于肩），再加一道
+    // 「手在身体前方」：摸头/扶眼镜是从侧后方靠近，方位角偏大；取样是对着光看，手在面前。
+    // 没有 3D 时方位角是 NaN，此时只按距离判——与 hand_head 同口径，少一层区分度，
+    // 但不会把整个动作判掉（公开素材多为手持近景，3D 时有时无）。
+    const sampleCfg = C.arm.sampling;
+    const sampleSide = (reachHead, azim, wr, sh) => Number.isFinite(reachHead)
+      && reachHead < sampleCfg.maxHeadDist
+      && wr[1] < sh[1] + C.arm.head.aboveShoulder * scale
+      && (!Number.isFinite(azim) || Math.abs(azim) <= sampleCfg.maxAzimuth);
+    const sampleL = sampleSide(reachHeadL, azimL, wristL, shL);
+    const sampleR = sampleSide(reachHeadR, azimR, wristR, shR);
+
     const azimCfg = C.arm.azimuth;
     // 方位角只在手臂接近水平时才有意义：自然下垂时水平分量≈0，atan2 出来的是噪声。
     // 实测过没这道门控时，走路视频里 armFront 一直是 true。
@@ -1245,6 +1353,10 @@ export class SignalEngine {
         any_raised_sel: raisedSelL || raisedSelR,
         head_near_L: headNearL,
         head_near_R: headNearR,
+        // 油样取样：手举到眼前看样瓶（瞬时布尔，动作层再加 1s 保持窗）。
+        // 与 head_near 的区别是多了「手在身体前方」这道门，见 C.arm.sampling。
+        sample_L: sampleL,
+        sample_R: sampleR,
         // 操作设备：手在设备 ROI 内，或肘在 ROI 内（手被设备挡住时的兜底）
         operating_L: operatingL,
         operating_R: operatingR,
@@ -1265,6 +1377,21 @@ export class SignalEngine {
         near_equipment_validity: nearValidity && nearValidity.enabled ? nearValidity : null,
         // 本帧的 operating 是否有设备检测框参与（诊断用；没有框时退回 ROI）
         operating_equipment: hasEquipmentBox,
+        // 框的时序/ROI 过滤诊断：raw=本帧检出，confirmed=通过时序确认，used=最终参与判定
+        operating_boxes_raw: rawEqObjects.length,
+        operating_boxes_confirmed: eqTrust.confirmed,
+        operating_boxes_used: eqBoxes.length,
+        operating_boxes_pending: eqTrust.pending,
+        // 为什么没判成 operating：ok / no_equipment / no_arm / low_shoulder / head_near /
+        // person_invalid / reach_low / elev_low / elev_high / not_near / no_grip
+        operating_gate: operatingGate,
+        operating_gate_L: opL.gate,
+        operating_gate_R: opR.gate,
+        operating_validity: opValidity && opValidity.enabled ? opValidity : null,
+        operating_upright_box: opUprightBox,
+        // 本帧的手型（诊断 requireGrip 用）：null=该侧没有手部数据
+        operating_grip_L: gripShape('L'),
+        operating_grip_R: gripShape('R'),
       },
       armPose: {
         elev_L: elevL,

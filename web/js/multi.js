@@ -268,6 +268,35 @@ export function assignHands(persons, hands, { maxDist = 0.8, minMargin = 0.15 } 
 /**
  * 多人流水线容器：track_id → 一对独立的状态机。
  */
+/** 人体框是否「高于宽」（与 signals.upperBody 同一道几何门）。 */
+function isUprightBox(bbox, minAspect = 0.9) {
+  if (!Array.isArray(bbox) || bbox.length < 4) return true;
+  const bw = bbox[2] - bbox[0];
+  const bh = bbox[3] - bbox[1];
+  return !(bw > 0 && bh > 0) || bh >= bw * minAspect;
+}
+
+/**
+ * 单人道主目标选择。
+ *   largest（默认）：面积最大，保持旧语义（UI 面板看这个人）。
+ *   torso：躯干长最大——近景里一只戴手套的手可能比远处的工人还大。
+ *   upright：优先「高于宽」的人体框，再按面积——横框多半是手臂/设备特写被凑成了人。
+ * 注意 selected 只决定「判谁/导出谁」；手部归属、PPE 仍按各自几何走。
+ */
+export function pickSingleTarget(persons, mode = 'largest', { minAspect = 0.9 } = {}) {
+  const list = (Array.isArray(persons) ? persons : []).filter(Boolean);
+  if (!list.length) return null;
+  const byArea = (a, b) => area(b.bbox) - area(a.bbox);
+  if (mode === 'torso') {
+    return list.slice().sort((a, b) => (b.scale || 0) - (a.scale || 0) || byArea(a, b))[0];
+  }
+  if (mode === 'upright') {
+    const upright = list.filter((p) => isUprightBox(p.bbox, minAspect));
+    return (upright.length ? upright : list).slice().sort(byArea)[0];
+  }
+  return list.slice().sort(byArea)[0];
+}
+
 export class PersonPipelines {
   /**
    * @param {object} params resolveParams() 的结果（Profile 已合并）
@@ -321,16 +350,20 @@ export class PersonPipelines {
    * @param {Map<number, {L:object|null, R:object|null}>} handsByTrack assignHands() 的结果
    * @param {Array<{label:string, score:number, box:number[]}>} objects 本帧物体检测框
    *   （operating 有 equipmentLabels 时用它判断手/肘是否在设备框附近）
+   * @param {number|null} objectsTs 这批框是哪次检测产生的（设备框时序确认用）；
+   *   null = 没有时序信息（旧导出 / 单张图片），不过滤
    * @returns {Array<{track_id:number, bbox:number[], score:number, sig:object, act:object, hands:object, age_ms:number}>}
    */
-  update(persons, ts, handsByTrack = null, objects = []) {
+  update(persons, ts, handsByTrack = null, objects = [], objectsTs = null) {
     const out = [];
     for (const p of persons || []) {
       if (!p || p.track_id == null) continue;
       const pipe = this.ensure(p.track_id, ts);
       const hands = handsByTrack?.get?.(p.track_id) || { L: null, R: null };
       pipe.hands = hands;
-      const sig = pipe.sig.update(p, ts, objects);
+      // hands 给 operating 的 requireGrip 用；同一帧内同一位置的多条流水线各算一份，
+      // 结果一致（设备框是全局的，重复计算只是几毫秒）。
+      const sig = pipe.sig.update(p, ts, objects, hands, objectsTs);
       const handState = {
         L: hands.L?.cls?.shape ?? null,
         R: hands.R?.cls?.shape ?? null,

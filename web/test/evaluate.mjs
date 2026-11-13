@@ -27,7 +27,9 @@ import {
   REP_IDS, REP_UI_ACTIONS,
 } from '../js/actions.js';
 import { SHAPE_IDS } from '../js/handshape.js';
-import { resolveParams, mergeParams, profileParams, profileName, paramsHash } from '../js/params.js';
+import {
+  resolveParams, validateParams, mergeParams, profileParams, profileName, paramsHash,
+} from '../js/params.js';
 import { assignHands, PersonPipelines } from '../js/multi.js';
 import { stripBom, videoTimeMonotonic } from './frame-io.mjs';
 
@@ -234,6 +236,25 @@ function handStateFromFrame(frame) {
 }
 
 /**
+ * 单人路径的手部归属（requireGrip 用）：走页面同一个 `assignHands`，
+ * 不能用导出的 `handedness` 直接把整帧的手都算给这个人——
+ * 手属于画面里没被跟踪到的另一人、或 handedness 标反时，页面与离线会给出不同的握持结论。
+ * 返回 assignHands 的槽位 `{L,R,list}`（信号层读 `slot[side].cls.shape`），没有手部数据时 null。
+ */
+function gripHandsForSingle(frame, person) {
+  const list = Array.isArray(frame.hands) ? frame.hands : [];
+  // 导出只有稳定后的 shape；信号层读 cls.shape，这里补一层适配（与多人路径同一套）。
+  const hands = list
+    .filter((h) => h && Array.isArray(h.kp) && h.kp.length)
+    .map((h) => ({
+      ...h,
+      cls: h.cls || { shape: typeof h.shape === 'string' ? h.shape : null, raw: h.shape_raw ?? null },
+    }));
+  if (!hands.length || !person) return null;
+  return assignHands([person], hands).get(person.track_id) || null;
+}
+
+/**
  * 导出记录里的 persons 已经是统一契约，直接喂给信号层（从 kp 重算，不用 export 里的 signals）。
  * kp_world 与 hands 必须一起带上：动作层用 has_world 在 2D/3D 之间选、用 hands 判手部动作，
  * 漏了任何一个，评估就与页面不是同一套规则。
@@ -332,7 +353,13 @@ function replaySingle(frames, params) {
       out.push(emptyRow(f.ts));
       continue;
     }
-    const sig = se.update(person, f.ts, Array.isArray(f.objects) ? f.objects : []);
+    // objects_ts：设备框时序确认用；旧导出没有这个字段 → null（不过滤，保持旧指标）。
+    // hands：requireGrip 用的手部归属与页面同一函数（assignHands），见 gripHandsForSingle。
+    // ActionEngine 仍用旧的整帧 handState，避免改动已发布的动作指标。
+    const gripHands = gripHandsForSingle(f, person);
+    const sig = se.update(
+      person, f.ts, Array.isArray(f.objects) ? f.objects : [], gripHands, f.objects_ts ?? null,
+    );
     const act = ae.update(sig, f.ts, person.hands);
     // person 只用于 label.track 的校验与调试，不参与任何指标计算。
     out.push({ ts: f.ts, empty: false, sig, act, person });
@@ -368,7 +395,7 @@ function replayMulti(frames, personsByFrame, trackIds, params) {
         cls: h.cls || { shape: typeof h.shape === 'string' ? h.shape : null, raw: h.shape_raw ?? null },
       }));
     const handsByTrack = assignHands(persons, hands);
-    for (const r of pipes.update(persons, f.ts, handsByTrack, Array.isArray(f.objects) ? f.objects : [])) {
+    for (const r of pipes.update(persons, f.ts, handsByTrack, Array.isArray(f.objects) ? f.objects : [], f.objects_ts ?? null)) {
       if (!perFrame.has(i)) perFrame.set(i, new Map());
       perFrame.get(i).set(r.track_id, {
         ts: f.ts, empty: false, sig: r.sig, act: r.act,
@@ -2556,6 +2583,8 @@ export async function pairsFromDir(dir) {
 async function readProfile(file) {
   const raw = JSON.parse(stripBom(await readFile(file, 'utf8')));
   const params = profileParams(raw);
+  // 与页面同一套校验：非法组合在加载时报错，不要让它静默跑出一份「看着正常」的数字。
+  validateParams(params);
   const name = profileName(raw, path.basename(file));
   return {
     file,

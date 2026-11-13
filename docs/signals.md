@@ -190,6 +190,55 @@ ROI + 检测框 **3/3/2**（检测框把 9.2–12.9s 特写误报压掉，召回
 模型是用同一段视频的分镜框训练的，**同集，不是泛化准确率**；valve 在 val 集里没有实例，
 gauge 在 320/0.35 下基本检不到。换机位必须重标重训并重扫 `equipmentMaxDist`。
 
+**设备框的时序确认与额外门（2026-11-12 加）**。检测器给的是逐帧独立的框，单帧误检直接
+变成「设备证据」是误报的主要来源。`web/js/equipment.js` 先把框做成有记忆的证据，再进判定：
+
+| 选项 | 默认 | 作用 |
+|---|---|---|
+| `boxMinHits` | 2 | 同一位置要在**两次不同的检测**里都命中才算确认。`objects_ts` 相同的重复帧不重复计数（app 在两次检测之间沿用上一帧结果）。1 = 关闭时序确认 |
+| `boxMaxAgeMs` | 600 | 确认过的框消失超过这么久才作废。**过期过滤在匹配之前**：间隔超过 maxAgeMs 的旧轨迹不会因为这一次检测匹配上就续命到 hits=2（漏检/多人缺席期间 `update()` 不会被调用，旧实现里这正是 minHits 失效的路径）|
+| `boxRequireInRoi` | false | 框必须与本工位 ROI **相交**才算设备证据（挡背景里别人的阀门）。用相交而不是中心在内：refuel 159 个框里 105 个中心在 ROI 外、但多数与 ROI 有重叠 |
+| `useForearm` | false | 用「腕→肘线段到框的距离」代替「腕点到框」，手被面板挡住时更稳 |
+| `requireGrip` | false | 手型必须属于 `signals.hand.closedShapes`（fist/ok）；没有手部数据 = 不成立 |
+| `requireUprightBox` | false | 人体框必须「高于宽」（`signals.upperBody.minAspect`），挡「手/油枪特写被凑成躯干」 |
+| `requireValidity` | false | 复用 `nearEquipment.validity` 的面积/高度/出画/可见性门。打开时**自动启用**这道门：不必（也不该指望）同时写 `nearEquipment.validity.enabled: true`，否则 `personBoxValidity()` 会直接返回 `ok:true`，门静默失效 |
+| `elbowFallback` | true | 肘兜底总开关 |
+| `elbowFallbackHideWrist` | false | 只有腕点不可用（真被挡住）时才允许肘兜底 |
+
+时序确认只对**新导出**生效：判定需要 `objects_ts`（该批框是哪次检测产生的）。旧导出没有这个
+字段、单张图片路径也传 `null`，此时**不过滤**，逐位保持引入本模块前的行为。
+
+判定失败时导出 `operating_gate`（汇总）与 `operating_gate_L/R`（逐侧），取值：
+`ok` / `no_equipment` / `no_arm` / `no_elbow` / `low_shoulder` / `head_near` / `person_invalid` /
+`person_not_upright` / `reach_low` / `elev_low` / `elev_high` / `not_near` / `no_grip`。
+汇总取四条分支里**走得最远**的那一关（`not_near` 比 `elev_low` 更具体），所以逐侧原因要看 `_L/_R`。
+另有 `operating_boxes_raw/confirmed/used` 三段计数与 `operating_upright_box`，离线一眼能看出
+FN 是「没人/没设备」还是「手没够到」。
+
+同一份 290 帧确定性导出（5fps，`scripts/deterministic-replay.mjs`）上的 A/B
+（基准 `refuel-equipment.json`：operating 4TP/2FN/3FP）：
+
+| 变体 | operating TP/FN/FP | 结论 |
+|---|---|---|
+| `boxMinHits=1`（旧行为） | 4/2/3 | 时序确认在本片不改段级结果；帧级过滤掉 5/153 个单帧误检框 |
+| `boxRequireInRoi=true` | 4/2/3 | 本片所有框都与 ROI 相交，零成本护栏 |
+| `useForearm=true` | 4/2/3 | 本片没有「腕在外、前臂在框内」的帧 |
+| `requireGrip=true` | 4/2/3 | 肘兜底绕过了握持门；只在腕成立的分支上加门，指标不变 |
+| `requireUprightBox=true` | **2/4/0** | FP 清零，但也会挡掉 2 个真作业段（上身构图/仪表特写） |
+| `elbowFallback=false` | **1/5/0** | 肘兜底承担了大部分召回，不能关 |
+| `elbowFallbackHideWrist=true` | 4/2/3 | 肘-only 的帧本来腕就不可用，等价于旧行为 |
+
+> 结论：时序确认、ROI 约束、前臂/握持门是**零成本或低成本护栏**；人形门是明确的
+> 精度/召回折中（见 `web/profiles/refuel-equipment-strict.json`），默认档不要换。
+> 手部模型在这段素材上只有 48/290 帧检出、8 次闭合手型检出（同一帧左右手各算一次，
+> 不是 8 帧；`operating` 帧里仅 1 帧带闭合手型），**requireGrip 目前不可用**。
+
+**参数一致性**：`boxMaxAgeMs` 与检测间隔由 `validateParams()`（`web/js/params.js`）校验。
+配了 `equipmentLabels` 且 `boxMinHits>1` 时要求 `boxMaxAgeMs >= perception.objects.intervalMs + 300`
+（300ms 是推理耗时余量），否则页面加载 profile、评估器 `--profile`、确定性回放都会直接报错。
+不满足时两次检测之间的普通帧会先把轨迹过期，框永远累计不到 `boxMinHits`
+（审查实测 `intervalMs=1000`：确认态从 328/366 掉到 4/30）。
+
 **多边形/多区域 ROI**（`operating.rois`）：每个 zone 是归一化点集 `[[x,y],...]`，至少 3 点、
 简单（非自交）、0~1；`id` 可选。`rois` 非空时优先于旧 `roi`，多区域按「任一包含」判 operating，
 `near_equipment` 按「人体框与区域的最大重叠比例」判（不做面积求和）。缺 `frame_w/frame_h`
@@ -232,6 +281,52 @@ shoulder_vis, torso_vis, reasons}`，`near_equipment` 额外要求 `ok`。示例
 near_equipment 3/3/2），证明多边形接线没有改变旧语义；`refuel-strict.json` 也一致——
 这段素材里的人框都通过了有效性门，所以门没有触发。它主要作为硬负例/特写护栏，
 需要更多特写素材才能量化收益。
+
+### 油样取样（`oil_sample`，2026-11-13 加）
+
+机场加油特有动作：**手持取样瓶/取样管举到眼前对光看水/杂质**。判据分两层：
+
+| 层 | 条件 | 参数 |
+|---|---|---|
+| 信号（瞬时） | 腕到鼻尖 < `maxHeadDist` 躯干长、腕不明显低于肩、**手在身体前方**（3D 方位角 \|az\| ≤ `maxAzimuth`） | `signals.arm.sampling.{maxHeadDist,maxAzimuth}`，默认 0.55 / 60° |
+| 动作（保持窗） | 上面这条持续 1000ms | `actions.holds.oilSample`，默认 1000 |
+
+和 `hand_head` 的关系：共用「腕靠近鼻尖」的距离判据，区别只有两点——多一道「手在身体前方」
+（摸头/扶眼镜是从侧后方靠近，方位角大；看样瓶是对着光，手在面前），以及更长的保持窗
+（350ms → 1000ms，避免抬手擦汗/扶眼镜命中）。**没有 3D 时方位角是 NaN，退化成纯距离判据**，
+此时它和 `hand_head` 只差保持窗。
+
+**实测（2026-11-13，`eval-data/airport-refuel/` 的 4 段公开取样素材，共 150s）：召回 0/4。**
+不是判据写错，是姿态层在这些画面上看不到动作：
+
+| 片段 | 正例窗内「有人且腕-鼻距可算」的帧 | 结果 |
+|---|---|---|
+| a320 | 2 / 220 帧 | 0 TP |
+| light | 5 / 420 帧 | 0 TP |
+| b787 | 3 / 130 帧 | 0 TP，另在 21s 处 1 FP（人站在面板前抬手扶耳机） |
+| mil | 0 / 30 帧 | 0 TP |
+
+原因是机位：这几段都是**近景/手持**，取样时人脸低下去凑近样瓶，**手被样瓶整个挡住**，
+姿态模型给不出可用的腕点——一帧里连腕-鼻距都算不出来，1s 保持窗自然攒不够。
+反过来，唯一命中过的时刻（b787 21s）恰好是「手抬到脸边」，说明判据本身是灵敏的，
+缺的是**能看见手**的机位。
+
+更根本的一条：**这条判据的核心假设（手举到脸前）和真实取样姿势不一致**。看 b787 的取样帧，
+人是把**样瓶**举到脸前，手还在胸腹高度——腕-鼻距本来就不小。四段素材上分别统计
+`reach` / `elev` / `hands_close`，正例窗和反例窗的中位数互相矛盾（同一段正例里 `elev`
+中位 179°，即手臂朝下，说明模型对看不见的手臂在乱猜），**没有哪组姿态特征能稳定分开两者**。
+所以别指望在这些画面上重调阈值就能出召回：要么按第二节的要求拍（全身、固定机位），
+要么走物体检测（给取样瓶训练检测框）。
+
+限制：
+
+- 只有姿态骨架，没有物体检测：空手举到眼前也会命中；样瓶本身检不出。
+  真要提精度，方向是给「取样瓶」训练一个检测框（复用 `operating` 的设备框那套），
+  用「腕到瓶框的距离」替代「腕到鼻尖的距离」——那样手被挡住也能判。
+- 单手举瓶、双手捧瓶都能判（任一侧成立即可，逐侧给 `oilSampleL/R`）；
+  手在身体侧后方看样瓶（有人习惯斜着举）会漏判。
+- 3D 可用时方位角门能挡掉一部分摸头误报；近景素材的 world 时有时无，实际经常走 2D 退化路径。
+- 阈值必须用**甲方机位**素材校准：本节的 0.55 / 60° / 1000ms 只是先验值，没有在这 4 段上调过。
 
 ## 三·七、持物与指向
 

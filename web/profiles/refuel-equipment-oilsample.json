@@ -1,7 +1,7 @@
 {
   "name": "refuel-equipment-oilsample",
   "model": "full",
-  "note": "油样取样片（58s，runs/oil-sample-2026-11-11）单独训练的两类设备检测器 panel/valve，用于和 refuel-equipment（panel/valve/gauge，含 RF100）做同集 A/B。gauge 在这段素材里只出现在一个分镜，留作 val 后训练集没有 gauge 实例，所以这一版不训 gauge（由 equipment.onnx 那版负责）。训练/验证按分镜留出（37.0-41.4 panel、44.56-46.6 与 48.88-51.04 valve、46.6-48.88 panel+gauge 作 val），属于同集验证，**不是泛化准确率**。换机位必须重新标注与校准 equipmentMaxDist。",
+  "note": "油样取样片（58s，runs/oil-sample-2026-11-11）单独训练的两类设备检测器 panel/valve，用于和 refuel-equipment（panel/valve/gauge，含 RF100）做同集 A/B。gauge 在这段素材里只出现在一个分镜，留作 val 后训练集没有 gauge 实例，所以这一版不训 gauge（由 equipment.onnx 那版负责）。训练/验证按分镜留出（37.0-41.4 panel、44.56-46.6 与 48.88-51.04 valve、46.6-48.88 panel+gauge 作 val），属于同集验证，**不是泛化准确率**。换机位必须重新标注与校准 equipmentMaxDist。 2026-11-12 补：设备框加了时序确认（boxMinHits=2/boxMaxAgeMs=600，默认；同一份确定性导出上过滤掉 5/153 个单帧误检框，段级指标不变）和 ROI 约束（boxRequireInRoi=true，框必须与本工位 ROI 相交；本片全部框都相交，等于零成本护栏）。useForearm/requireGrip/requireUprightBox/requireValidity 默认关，A/B 数字见 docs/equipment-detector.md §9。",
   "params": {
     "perception": {
       "objects": {
@@ -13,19 +13,31 @@
         "scoreThreshold": 0.35,
         "iouThreshold": 0.45,
         "intervalMs": 150,
-        "labels": ["panel", "valve"]
+        "labels": [
+          "panel",
+          "valve"
+        ]
       }
     },
     "signals": {
       "arm": {
         "operating": {
-          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 },
+          "roi": {
+            "x": 0.42,
+            "y": 0.08,
+            "w": 0.56,
+            "h": 0.86
+          },
           "minElbowVis": 0.21,
           "minElbowReach": 0.315,
-          "equipmentLabels": ["panel", "valve"],
+          "equipmentLabels": [
+            "panel",
+            "valve"
+          ],
           "equipmentMinScore": 0.35,
           "equipmentMaxDist": 0.7,
-          "equipmentFallbackRoi": true
+          "equipmentFallbackRoi": true,
+          "boxRequireInRoi": true
         },
         "nearEquipment": {
           "minOverlap": 0.5
