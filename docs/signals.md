@@ -182,8 +182,12 @@
 设备检测器已经接进判据（`docs/equipment-detector.md`），但仓库**不附带**训练好的权重：
 `web/profiles/refuel-equipment.json` 是接入示例（panel/valve/gauge，ONNX 320），
 `web/profiles/refuel.json` 仍只用 ROI。有 `equipmentLabels` 的检测框时，信号层用
-「点到框边的距离」而不是「点在 ROI 内」，导出 `operating_equipment=true`；框没检出的帧退回 ROI。
-`equipmentFallbackRoi=false` 是 fail-closed：没有框就一律不判（硬负例/无 ROI 场景用）。
+「点到框边的距离」而不是「点在 ROI 内」，导出 `operating_equipment=true`。
+`operating.equipmentFallbackRoi=false` 是 fail-closed：没有框就一律不判（硬负例/无 ROI 场景用）；
+**2026-11-16 起 `refuel-equipment.json` 与 `refuel-equipment-strict.json` 默认开**——
+只靠 ROI 的 `operating` 在 8 段硬负例里 6/8 段整段误报，见 `docs/equipment-detector.md` §6。
+`nearEquipment` 的 `nearEquipment.equipmentFallbackRoi` 默认是 `null`（跟随 `operating`）；
+profile 里显式设 `true` 可以让它在 `operating` fail-closed 时仍走 ROI 兜底，否则上下文事件会整段消失。
 
 refuel 冒烟实测（同一份 590 帧导出，`operatingMaxGap=600`）：ROI-only `operating` 3/3/3，
 ROI + 检测框 **3/3/2**（检测框把 9.2–12.9s 特写误报压掉，召回不变）；无 ROI 的 detector-only 也是 3/3/2。
@@ -259,7 +263,7 @@ FN 是「没人/没设备」还是「手没够到」。
 | 区域 | `operating.roi` / `operating.rois` 和/或 `operating.equipmentLabels` 的检测框 | 两者都没有时不判；多边形按「人体框 ∩ 多边形 / 人体框面积」精确计算，多 zone 取最大 |
 | 重叠 | 人体框面积 ≥ `nearEquipment.minOverlap`(0.3) 落在区域里 | refuel 档用 0.5 |
 | 有检测框时 | 取「与检测框重叠」和「与 ROI 重叠」的**较大值**（union） | 检测框只框设备本体，人站在面板前与框的重叠很小；只认框会把 refuel 从 3/6 压到 1/6 |
-| fail-closed | `operating.equipmentFallbackRoi=false` 时只认检测框 | 没有框 → 不判，ROI 完全不参与 |
+| fail-closed | `nearEquipment.equipmentFallbackRoi`：默认 `null` 跟随 `operating`；显式 `true` 时不受 `operating` 的 fail-closed 影响，显式 `false` 时只认检测框 | 没有框且开关为 false → 不判，ROI 完全不参与 |
 | 两肩可见 | ≥ `nearEquipment.minShoulderVis`(0.4) | 挡掉只检出手臂/设备的特写 |
 | 人体框竖直 | `requireUprightBox=true` 时 h ≥ 0.9·w | 挡横向特写；关掉会提高召回、也增加特写误报 |
 | 人框有效性（可选） | `nearEquipment.validity.enabled=true` 时：面积/高度比例、出画比例、肩/躯干可见度 | 默认**关闭**，逐位保持旧行为；挡过小/满屏/大半出画的特写。`person.bbox` 由全部 33 点取极值，`minInFrame` 默认只取 0.5 |

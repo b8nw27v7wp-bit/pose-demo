@@ -30,6 +30,8 @@
 //   --model=<档位>     lite | full | heavy，默认 full
 //   --delegate=<后端>  GPU | CPU，默认 CPU（确定性优先；GPU 结果可能随驱动浮动）
 //   --fps=<n>          采样帧率（媒体时间网格），默认 10
+//   --start=<秒>       从素材的某一时刻开始取样（默认 0）；长片只看某一段时用
+//   --end=<秒>         取样到该时刻为止（默认到片尾）
 //   --max-frames=<n>   只跑前 n 帧（调试用），默认不限制
 //   --expect-hash=<sha256>  与导出的 sha256 比对，不一致则退出码 1（回归用）
 //
@@ -101,7 +103,7 @@ const rawSrc = positional[0];
 const rawProfile = positional[1];
 const outName = positional[2];
 if (!rawSrc || !rawProfile || !outName) {
-  console.error('用法：node scripts/deterministic-replay.mjs <src> <profile> <outName> [--base=...] [--model=full] [--delegate=CPU] [--fps=10]');
+  console.error('用法：node scripts/deterministic-replay.mjs <src> <profile> <outName> [--base=...] [--model=full] [--delegate=CPU] [--fps=10] [--start=0] [--end=0]');
   process.exit(2);
 }
 
@@ -110,9 +112,19 @@ const model = flags.get('model') || 'full';
 const delegate = flags.get('delegate') || 'CPU';
 const fps = Number(flags.get('fps') || 10);
 const maxFrames = Number(flags.get('max-frames') || 0) || Infinity;
+const startArg = Number(flags.get('start') || 0);
+const endArg = Number(flags.get('end') || 0);
 const expectHash = flags.get('expect-hash') || null;
 if (!(fps > 0)) {
   console.error(`--fps 无效：${flags.get('fps')}`);
+  process.exit(2);
+}
+if (!(startArg >= 0)) {
+  console.error(`--start 无效：${flags.get('start')}（必须 >= 0）`);
+  process.exit(2);
+}
+if (!(endArg >= 0)) {
+  console.error(`--end 无效：${flags.get('end')}（必须 >= 0，0 = 到片尾）`);
   process.exit(2);
 }
 
@@ -230,9 +242,15 @@ try {
   // 暂停：det 模式没有 rAF 循环，这里暂停只是防止 play() 自动推进媒体时间
   await cdp.eval('(() => { const v = document.querySelector("video"); v.pause(); return v.paused; })()');
 
-  // 取样点是 (k+0.5)/fps，所以最后一个 k 必须让 t 仍落在时长内
-  const total = Math.min(maxFrames, Math.floor(meta.duration * fps));
-  console.log(`▶ 时长 ${meta.duration.toFixed(2)}s · ${meta.w}×${meta.h} · 计划 ${total} 帧`);
+  // 取样范围：[start, end]。长片（十分钟级素材）只看某一段时不必从头跑。
+  const startSec = Math.min(Math.max(0, startArg), Math.max(0, meta.duration - 1e-3));
+  const endSec = Math.min(endArg > 0 ? endArg : meta.duration, meta.duration);
+  if (!(endSec > startSec)) throw new Error(`取样范围为空：${startSec}s → ${endSec}s（时长 ${meta.duration.toFixed(2)}s）`);
+  // 取样点是 start + (k+0.5)/fps，所以最后一个 k 必须让 t 仍落在区间内
+  const total = Math.min(maxFrames, Math.floor((endSec - startSec) * fps));
+  if (!(total > 0)) throw new Error(`取样范围内不足一帧：${startSec}s → ${endSec}s @ ${fps}fps`);
+  console.log(`▶ 时长 ${meta.duration.toFixed(2)}s · ${meta.w}×${meta.h}`
+    + ` · 范围 ${startSec.toFixed(2)}–${endSec.toFixed(2)}s · 计划 ${total} 帧`);
 
   const t0 = Date.now();
   let advanced = 0;
@@ -240,7 +258,7 @@ try {
   for (let k = 0; k < total; k++) {
     // 取样点放在网格**中间**（(k+0.5)/fps）而不是 k/fps：正好落在源视频帧边界上时，
     // 解码器可能按浮点误差选前后两帧（实测 5.4s 两次回放拿到了不同帧，关键点差 3px）。
-    const t = Math.round(((k + 0.5) / fps) * 1000) / 1000;
+    const t = Math.round((startSec + (k + 0.5) / fps) * 1000) / 1000;
     // seek → 等 seeked → 再等两帧 rAF：seeked 只保证位置更新，硬件解码交给合成器是异步的
     const seek = await cdp.eval(`(async () => {
       const v = document.querySelector('video');
@@ -307,6 +325,7 @@ try {
     createdAt: new Date().toISOString(),
     src, profile, base, model, delegate, fps,
     durationSec: meta.duration,
+    rangeSec: [startSec, endSec],
     video: { width: meta.w, height: meta.h },
     steps: total,
     recorded: lines.length - 1,   // 第一行是 meta

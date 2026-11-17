@@ -35,6 +35,7 @@
     "sample": "node web/test/make-sample.mjs",
     "eval": "node web/test/evaluate.mjs --dir eval-data",
     "compare": "node web/test/signal-compare.mjs",
-    "serve": "node scripts/py.mjs serve.py"
+    "serve": "node scripts/py.mjs serve.py",
+    "inspect": "node scripts/py-cv.mjs -I scripts/video-sheet.py"
   }
 }

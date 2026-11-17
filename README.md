@@ -114,7 +114,9 @@ minElbowReach 0.315`；563 帧复核导出上 TP5/FN1/FP3，段级 R 0.833 / P 0
 只认框会把人站在面板前的正例压掉）。
 仓库**不附带**训练好的权重，但完整链路已跑通：`web/profiles/refuel-equipment.json`
 （panel/valve/gauge，ONNX 320）在同一份 refuel 导出上把 `operating` 从 ROI-only 的 3/3/3
-变成 **3/3/2**，召回不变；8 段街景/姿态硬负例从 6/8 触发降到 **0/8**。
+变成 **3/3/2**，召回不变；2026-11-16 起该档默认 `equipmentFallbackRoi=false`
+（没有设备框就不判），8 段街景/姿态硬负例从 6/8 触发降到 **0/8**，
+`near_equipment` 由独立开关保持 3/3/2。
 模型是用同一段 58s 演示片的分镜框训练的（同集冒烟，valve 无 val 实例、gauge 基本检不到），
 **不能当泛化准确率**。训练、导出、sidecar 与验收见
 [`docs/equipment-detector.md`](docs/equipment-detector.md)；信号导出带 `operating_equipment`
@@ -185,15 +187,16 @@ minElbowReach 0.315`；563 帧复核导出上 TP5/FN1/FP3，段级 R 0.833 / P 0
 ## 验证
 
 ```bash
-npm test                            # 50 几何 + 300 逻辑 + 44 动作提示 + 37 准确率 + 298 评估器 + 46 难例 + 19 自动标注 + 23 清单 + 106 多人 + 31 ONNX + 52 PPE + 19 PPE 评估；合计 1025 项
+npm test                            # 50 几何 + 26 设备框 + 34 operating + 15 油样取样 + 300 逻辑 + 44 动作提示 + 37 准确率 + 301 评估器 + 46 难例 + 19 自动标注 + 23 清单 + 106 多人 + 31 ONNX + 52 PPE + 19 PPE 评估；合计 1103 项
 node web/test/geometry-test.mjs     # 50 项：旧矩形规整、多边形配置/点内测试/面积/矩形裁剪、多 zone 最大重叠、resolveRegions 优先级与 fail-closed、人框有效性、头部 9 点换算
 node web/test/logic-test.mjs        # 300 项：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立 vs 上半身直立/前倾）/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/统计/拿取阶段机/注册表 flag 一致/上半身构图/腕部 ROI/手归属/平举物理门/换侧滞回/角度突变剔除/不可靠原因/手-臂对应/手型与左右侧绑定/操作设备掉帧容忍（含引擎漏调用的大间隔）/设备框与 ROI 的 union/fail-closed/多边形 ROI/人框有效性/operating 不成立时不报 zone
 node web/test/armhint-test.mjs      # 44 项：14 个动作的提示覆盖、手部关闭/未加载/未检出、无 3D/配置关闭、置信不足、多动作提示优先级、准确率文案（提示行与 tooltip）、左右手粒度、无画面时按 profile 标 ROI/检测框不可用（detector-only 还要求物体检测已开且就绪）、人框有效性文案
 node web/test/accuracy-test.mjs     # 37 项：flag→id 映射、n/95%CI 保留、样本不足不报百分比（含段数与 TP/FN/FP）、未评估、合成来源标记、profile/数据源目录透传、档位边界、报告加载容错、参数指纹过期检测、多 track 池化
-node web/test/eval-test.mjs         # 298 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样、多人逐 track 与 label.track/uid、旧单人回归、物体模型指纹与跨模型 baseline 拒绝、多 track baseline/sweep/A-B、逐 track 抖动与姿态混淆矩阵、帧尺寸透传、objects 接线与 operating 离线回放、上下文事件不计入 noArm/none、kp_head/多边形回放）
+node web/test/eval-test.mjs         # 301 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样、多人逐 track 与 label.track/uid、旧单人回归、物体模型指纹与跨模型 baseline 拒绝、多 track baseline/sweep/A-B、逐 track 抖动与姿态混淆矩阵、帧尺寸透传、objects 接线与 operating 离线回放、上下文事件不计入 noArm/none、kp_head/多边形回放）
 node web/test/hardcase-test.mjs     # 46 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口、!动作/noArm 反例导出、尾部锚点（区分播完与暂停）
-node web/test/equipment-test.mjs    # 24 项：设备框时序确认/过期/重帧去重、线段到框距离、单人道主目标选择
-node web/test/operating-test.mjs    # 21 项：operating 的 gate 诊断、框时序、ROI 约束、前臂/握持/人形门
+node web/test/equipment-test.mjs    # 26 项：设备框时序确认/过期/重帧去重、线段到框距离、单人道主目标选择
+node web/test/operating-test.mjs    # 34 项：operating 的 gate 诊断、框时序、ROI 约束、前臂/握持/人形门、nearEquipment 独立兜底开关
+node web/test/sampling-test.mjs     # 15 项：油样取样（oil_sample）与「手在头部」的边界、3D 方位角门、保持窗
 node web/test/autolabel-test.mjs    # 19 项：区间合并/丢弃、计数周期、草稿内容与自评全通过、注册表覆盖
 node web/test/manifest-test.mjs     # 23 项：清单字段与文件校验（含 heavy 档位）、覆盖度、计数与反例、动作 id/flag 等价、清单骨架、注册表覆盖
 node web/test/multi-test.mjs        # 106 项：跟踪 id 稳定/防换 id/超时换 id、每人独立状态机与 gap 重置、手部归属（bbox 内/腕部外扩 + 次近人 margin）、逐 track 手势去抖隔离、ROI 预算与 minScalePx、PPE 标签/几何/unknown 语义/持续门槛、平铺几何、运动/外观/最优分配、物体框坐标（像素/归一化）、导出上限与 meta 接线、face/hand 区域
@@ -223,6 +226,13 @@ node web/test/mot17-eval.mjs --rate 0.4   # 慢放逐帧：A/B 对比用（实�
 素材切片 / 抽帧（可选）：
 
 ```bash
+# 先「看懂素材」：读编码（H.264/HEVC/AV1 都能解），按间隔抽帧拼成带时间戳的接触表。
+# 输出 eval-data/incoming/_inspect/<文件名>/：frames/、sheet.jpg、manifest.json
+npm run inspect -- eval-data/incoming/<素材>.mp4 --step 10 --max 24
+# 只看某一段：--start 60 --end 120（秒）；--no-frames 只写接触表，不碰已有帧
+# 解释器由 scripts/py-cv.mjs 自动探测（仓库 .venv-ppe/.venv → PATH 上的 py/python3/python），
+# 不需要手动写 .venv-ppe/Scripts/python.exe；找不到装了 cv2 的 Python 时会给出建 venv 的命令。
+
 .venv-ppe/Scripts/python.exe scripts/slice-video.py <video> <outDir> [--step 0.5]
 # → clips/（按镜头切段）、frames/（每 0.5s）、keyframes/、sheets/（接触表）、manifest.json
 # 同一个 outDir 换素材重跑会先删掉上一轮的 frames/clips/keyframes/sheets，不会新旧混集。
@@ -231,12 +241,21 @@ node web/test/mot17-eval.mjs --rate 0.4   # 慢放逐帧：A/B 对比用（实�
 
 node scripts/clip-recognition.mjs --clip /eval-data/refuel/oil-sample-demo.mp4 \
   --profile /web/profiles/refuel.json --out runs/clip-test --name refuel-roi --export
-# → 整段播完并记录识别状态：动作/设备框变化时截图 + shots/ + <name>.md，
+# → 整段播完并记录识别状态：动作/设备框变化时截图 + shots/ + <name>.md + <name>.html，
+#   HTML 里时间线和截图在同一页，浏览器打开 runs/<run>/<name>.html 即可回看。
 #   --export 收下 Demo 的 JSONL，可直接接 node web/test/evaluate.mjs 做离线评估
+#   长片只看某一段：--start 55 --end 80（秒，时间戳仍是素材绝对时间；给了 --end 不算截断）。
+#   --start 会先暂停、seek、清空起点前的记录再开播，导出只含这一段。
 #   播放上限默认按素材时长 1.5×+30s；到上限没播完会在报告顶部标注截断并以非 0 退出，
 #   明确只想要前段数据时加 --allow-truncate（或 --max-seconds N 指定上限）。
 #   --export 下载失败同样非 0 退出，报告写明「后续 evaluate 没有输入」。
 ```
+
+> 素材编码：抽帧（`npm run inspect` / `slice-video.py`）走 OpenCV，H.264、HEVC（`hvc1`/`hev1`）、
+> AV1 都能解，和浏览器无关。识别链路走 Chrome `<video>`：AV1 是软解，通常直接可播；
+> HEVC 需要系统装「HEVC 视频扩展」且机器支持硬件解码，远程/无 GPU 机器上可能报
+> `MEDIA_ERR_SRC_NOT_SUPPORTED` / decode error。这时先转成 H.264 再跑：
+> `ffmpeg -i in.mp4 -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart out.mp4`。
 
 > Git Bash（MSYS）会把 `/eval-data/...` 这类参数改写成 `D:\git\...`；传页面同源路径时加
 > `MSYS_NO_PATHCONV=1`，否则页面会报「视频加载失败：decode error」。
@@ -320,9 +339,10 @@ node web/test/accuracy-report.mjs \
 `autolabel` 只生成正例；反例必须人工补，否则 precision 恒为 1（见 `docs/data-collection.md` §六）。
 新素材（新机位/新人员）的接入、ROI 重画、接触表复核与 `near_equipment` 标注口径见
 [`docs/annotation-kit.md`](docs/annotation-kit.md)。仓库目前没有第二段设备作业视频；
-8 段非设备素材（MOT17 街景 + 姿态样例）的硬负例压力测试里 **6 段触发** `operating`
-（如 MOT17-05 57/102 帧、走路样例 10/20 帧）——它证明这条规则是
+只用 ROI 的 `refuel.json` 在 8 段非设备素材（MOT17 街景 + 姿态样例）的硬负例里
+**6 段触发** `operating`（如 MOT17-05 57/102 帧、走路样例 10/20 帧）——它证明这条规则是
 「手/肘在矩形区域 + 抬臂角」，没有物体证据，不能靠调阈值变成设备专用判据。
+`refuel-equipment.json` 已改为 fail-closed（必须有设备框），同一批反例 **0 段触发**。
 清单校验的退出码：0 达标 / 2 覆盖不足 / 1 清单有错，可直接进 CI。
 `--max-count-err` 的单位是**每 20 次的绝对误差**（验收口径）：20 次里错 1 次记 1，多算一倍或完全漏数是 20。
 
@@ -496,10 +516,10 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 - 准确率单测 **37/37**：评估报告 flag→动作 id 映射、n/95%CI 原样保留、样本不足不报百分比但保留段数/TP/FN/FP、
   没有数据写「未评估」、合成来源标记、档位边界、报告加载的 404/格式错误/网络异常容错、
   参数指纹不一致时标记报告过期
-- 评估器单测 **298/298**：反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson 区间、
+- 评估器单测 **301/301**：反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson 区间、
   门槛、灵敏度扫描、A/B、时延与抖动、`video_time` 回绕、手势帧级指标/弃权/归属、
   分位→profile、LOSO、帧率重采样、多人逐 track 回放与 `label.track` 绑定、旧单人数据回归
-- 难例/自动标注/清单单测 **46 + 18 + 23**：窗口边界、两种 label 时间基、反例导出、
+- 难例/自动标注/清单单测 **46 + 19 + 23**：窗口边界、两种 label 时间基、反例导出、
   区间合并、草稿自评、清单字段与覆盖度、`heavy` 档位、动作 id/flag 等价
 - 图片模式：单张真人全身照 → 33 关键点，置信度 0.935，膝角 163.1°、直立度 1.000、腿竖直比 1.33
 - 视频模式：样例视频 146 帧连续推理，姿态判定「站立」，无 JS 报错，帧记录符合

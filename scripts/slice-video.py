@@ -26,6 +26,14 @@ import shutil
 import subprocess
 import sys
 
+# Windows 下 Python 默认按 GBK 写 stdout，Git Bash/Windows Terminal 是 UTF-8，
+# 中文会显示成乱码；统一改 UTF-8（不支持时退回原编码而不是崩掉）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import cv2
 import numpy as np
 

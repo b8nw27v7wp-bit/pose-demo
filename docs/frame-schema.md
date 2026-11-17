@@ -52,7 +52,7 @@
     "operating_L": false, "operating_R": true,
     "operating_elbow_L": false, "operating_elbow_R": false,
     "operating_any": true,
-    "operating_equipment": false,   // 本帧是否有设备检测框（false=operating 退回 ROI）
+    "operating_equipment": false,   // 本帧是否有设备检测框（false=没有框；是否退回 ROI 由 equipmentFallbackRoi 决定）
     // 设备框的三段计数：raw=检测器本帧检出 → confirmed=通过时序确认 → used=过 ROI 后参与判定
     "operating_boxes_raw": 1, "operating_boxes_confirmed": 1, "operating_boxes_used": 1,
     // 为什么没判成 operating：ok/no_equipment/no_arm/no_elbow/low_shoulder/head_near/
