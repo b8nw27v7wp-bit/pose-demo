@@ -580,7 +580,10 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
   RF100 gauge 训练，val mAP50 0.692（panel 0.995 / gauge 0.39 / **valve 没有 val 实例**），
   gauge 在 320/0.35 下基本检不到。同一份导出上它能把 `operating` 的 1 个特写 FP 压掉、
   8 段硬负例 8/8 不触发，但换机位/换人完全没有验证；模型不进 git（`web/models/`），
-  训练与接入见 `docs/equipment-detector.md`。
+  训练与接入见 `docs/equipment-detector.md`。2026-11-17 另用 `eval-data/airport-refuel/`
+  的下载素材做了跨分镜重训：panel 的 val mAP50 0.99、浏览器端能稳定出框；
+  valve/gauge 的 val 指标被「分镜框套整段运动镜头」拖低（仪表 12s 内漂移 40–140px），
+  定性推理仍能检出。见 `docs/equipment-detector.md` §10。
 - 物体检测的 GPU delegate 对该模型会 trap（wasm divide by zero，且会污染整个运行时），
   默认走 CPU；换自训模型后需要自己验证能否上 GPU。
 - 多人**姿态/手势**已能按 track 评估（`evaluate.mjs` 的逐 track 回放与 labels 的 `track` 字段）；

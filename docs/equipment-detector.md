@@ -359,3 +359,121 @@ operating 4TP/2FN/5FP（R0.667/P0.444），near_equipment 2/4/2；
 > 有 3 帧（t≈21s/29s/42s）的「陈旧轨迹 + 一次新检出」不再算确认，确认态 328 → 325，
 > 确认率 0.994 → 0.984。**段级指标不变**（operating 4/2/5、near_equipment 2/4/2）。
 > 修复前的基线 sha 是 `aae4c098…`，两边的差异只在 `operating_boxes_confirmed/used`。
+
+## 10. 下载素材切片与重训（2026-11-17）
+
+用 `eval-data/airport-refuel/` 里下载的 10 段公开视频做了一次「切片 → 分镜标注 → 训练 → 留出测试」。
+素材版权归原 UP 主，**仅限内部评测/研究**；切片、帧、标签、权重都在 `eval-data/`（不进 git），
+仓库里只有流程和结论。本节脚本在 `eval-data/equipment/airport/`（同样不进 git）。
+
+### 10.1 切片
+
+选 4 段有设备/流程的素材，`scripts/slice-video.py --step 1.0`：
+
+| 素材 | 时长 | 分镜 | 抽帧 | 用途 |
+|---|---:|---:|---:|---|
+| `b787_jar.mp4` | 613s | 23 | 613 | 加油车控制面板 + 仪表盘（284–364s） |
+| `hydraulic_valve.mp4` | 153s | 17 | 153 | 液压取样阀特写（78–111s） |
+| `a320_box.mp4` | 437s | 305 | 437 | 机上取样箱 + 红色阀门（208–217s） |
+| `transformer_sample.mp4` | 237s | 55 | 237 | 完全留出，只做定性测试 |
+
+本机没有 ffmpeg，切出来的 `clips/` 是 OpenCV mp4v（浏览器不能 `?src=` 回放）；
+训练只用 `frames/`、`keyframes/`，浏览器测试直接用原始 mp4（b787 是 H.264）。
+
+### 10.2 分镜标注
+
+`labels_airport.json` 共 **7 个分镜 / 23 个唯一框**：panel 4、valve 7、gauge 12。
+b787 的仪表先用 `HoughCircles` 找圆候选，再人工剔除误检（头盔、阀门手轮、金属圈都曾被检出）。
+7 个分镜的关键帧核对图在 `eval-data/equipment/airport/check/`。
+
+这是**代理标注**：同一分镜复用关键帧的框，镜头内机位基本静止。和 refuel 分镜框一样，
+正式考核前必须逐帧复核，尤其 gauge 这种小目标——镜头移动几十像素，IoU 就掉到 0.5 以下。
+
+### 10.3 数据集
+
+`build_ds.py` 生成 `airport/ds/`：
+
+| 集 | 标注帧 | 负例帧 | panel | valve | gauge |
+|---|---:|---:|---:|---:|---:|
+| train | 81 | 12 | 70 | 25 | 441 |
+| val | 36 | 10 | 19 | 23 | 80 |
+
+- train：b787 284–347s、hydraulic 78–82s / 105–111s、a320 208–214s；
+- val：b787 348–364s、hydraulic 82–99s、a320 214–217s（按分镜留出，不跨集复用帧）；
+- 负例：`zhicha-hevc.mp4`（厂区安全片）与 `c919-av1.mp4`（飞机外景）各抽 11 帧，
+  按时间前后分到 train/val，标签为空。
+
+### 10.4 训练与指标
+
+YOLOv8n，CPU，50 epoch，`imgsz=416/640`：
+
+| 输入 | 时间 | all P / R | all mAP50 | all mAP50-95 |
+|---:|---:|---|---:|---:|
+| 416 | 6.4 min | 0.533 / 0.387 | 0.392 | 0.119 |
+| 640 | 15.0 min | 0.983 / 0.328 | 0.372 | 0.124 |
+
+逐类（val 46 张，含 10 张负例）：
+
+| 类别 | 416 P / R / mAP50 | 640 P / R / mAP50 | 实例数 |
+|---|---|---|---:|
+| panel | 0.795 / **1.0** / **0.995** | 0.949 / 0.985 / 0.99 | 19 |
+| valve | 0.722 / 0.087 / 0.159 | 1.0 / 0 / 0.11 | 23 |
+| gauge | 0.083 / 0.075 / 0.023 | 1.0 / 0 / 0.015 | 80 |
+
+**怎么读这组数字**：
+
+- **panel 可用**：416 输入就在 val 上 mAP50 0.995；640 把框的定位质量（mAP50-95）从 0.274
+  提到 0.307。定性图上它能从 b787 的不锈钢面板跨到 a320 的白色取样箱。
+- **valve/gauge 的 mAP 不能当成模型能力**：val 的框来自分镜中点关键帧，而这两类在 15–17s
+  的镜头里相机/物体在动，小框很快对不上，IoU@0.5 判 TP 失败。对 b787 分镜做 Hough 复测：
+  350s→362s 之间仪表中心漂移 **40–140px**，而仪表框高只有约 80px，后段帧的 IoU 直接掉到 0.5 以下。
+  同一批留出帧上做定性推理，320 输入仍能每帧检出 4–7 个 gauge、a320 能检出 1–3 个 valve——
+  **模型在检，是标注粒度不够**。
+- **提高输入尺寸不是瓶颈**：640 没有提升 valve/gauge 的召回（都是 0），只改善 panel 定位。
+  下一步应该做的是逐帧标注（或固定机位/缩短分镜），不是继续加输入尺寸。
+
+### 10.5 端到端冒烟
+
+把 416 模型导出 ONNX 320 + sidecar（`web/models/airport-equipment.onnx`，不进 git），
+用 `eval-data/equipment/airport/airport-profile.json`（临时 profile，`equipmentFallbackRoi=false`）
+在 b787 留出段 348–363s 跑 Demo：
+
+```
+422 帧 / 26.6 fps / 31 次采样
+设备框：30 次采样有框；panel 30 次、gauge 累计 147 个框
+operating 命中 2 次；nearEquipment 0 次；JS 错误 0
+```
+
+说明「ONNX → 浏览器物体检测 → operating 判据」这条链路在未参与训练的新素材上能跑通。
+截图里设备框没有叠加显示（页面开关状态待查），但采样计数与离线推理一致，不是检测没跑。
+
+### 10.6 复现
+
+```bash
+# 切片（无 ffmpeg 时 clips 是 mp4v，只影响回放，不影响帧）
+.venv-ppe/Scripts/python.exe scripts/slice-video.py \
+  eval-data/airport-refuel/b787_jar.mp4 eval-data/airport-refuel/slice/b787_jar --step 1.0
+
+# 标签核对 + 建数据集
+.venv-ppe/Scripts/python.exe eval-data/equipment/airport/check_labels.py
+.venv-ppe/Scripts/python.exe eval-data/equipment/airport/build_ds.py
+
+# 训练 / 留出定性测试
+.venv-ppe/Scripts/yolo.exe detect train model=yolov8n.pt \
+  data=E:/pose-demo/eval-data/equipment/airport/ds/data.yaml \
+  imgsz=416 epochs=50 batch=16 device=cpu \
+  project=E:/pose-demo/eval-data/equipment/airport/runs name=airport exist_ok=True plots=False
+.venv-ppe/Scripts/python.exe eval-data/equipment/airport/predict_sheet.py \
+  eval-data/equipment/airport/runs/airport/weights/best.pt 0.25 416
+```
+
+### 10.7 下一步
+
+1. **逐帧标注 gauge/valve**：分镜级框只适合大类（panel）。gauge 建议固定机位、每帧或每 0.5s 标一次，
+   或者先用 panel 框裁出 ROI 再标，保证框是真的跟着仪表走。
+2. **补阀门的视角**：hydraulic 的 99–113s、116–120s 还有几种阀门姿态没进训练集。
+   hydraulic 的 valve 只有 11 张训练帧（另有 a320 7 张），且 val 是不同焦距的特写。
+3. **ROI 裁切推理**：gauge 只有 30–50px（1080p），全帧 320/416 下只剩 5–10px。即使训练好了，
+   运行时也应先按 panel 框裁切再检测，否则分辨率不够。
+4. **时序确认复用**：`equipment.js` 的 `boxMinHits/boxMaxAgeMs` 已经能压掉单帧误检；
+   新模型接进去之前，先用同一份确定性导出做 A/B，不要直接替换 refuel 档的模型。
