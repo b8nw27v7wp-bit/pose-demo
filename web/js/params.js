@@ -111,7 +111,7 @@ export const DEFAULT_PARAMS = {
         // 每个 zone: { id, points: [[x,y],...] }，归一化 0~1；未配置时保持旧行为。
         rois: [],
         // 设备检测框（可选）：物体检测器输出这些类别时，优先用「腕/肘到框的距离」，
-        // ROI 只作检测不到时的兜底。空数组 = 只用 ROI（当前默认，因为还没有阀门模型）。
+        // ROI 只在允许兜底时参与。空数组 = 只用 ROI（默认；接入档见 refuel-equipment.json）。
         equipmentLabels: [],
         equipmentMinScore: 0.35,
         // 点到检测框边缘的距离 / scale；框内为 0。0.35 ≈ 躯干长的 35%。
@@ -119,8 +119,9 @@ export const DEFAULT_PARAMS = {
         // 配了 equipmentLabels 但本帧没检出设备框时，是否退回人工 ROI。
         // true（默认）= 旧行为：检测器漏检时仍靠 ROI 判，召回稳，但**没有物体证据**
         //   （硬负例里只要 ROI 里有人走过就会命中；实测见 docs/equipment-detector.md §6）。
-        // false = 失败即不判（fail-closed）：这一帧没有设备框就 both operating / near_equipment
-        //   都不成立。这是「物体证据」真正生效的开关，代价是检测器漏检直接变 FN。
+        // false = 失败即不判（fail-closed）：这一帧没有设备框，operating 不成立。
+        //   这是「物体证据」真正生效的开关，代价是检测器漏检直接变 FN。
+        //   nearEquipment 默认跟随这个开关（null），可在它自己的配置里单独覆盖。
         equipmentFallbackRoi: true,
         // —— 设备框的时序确认（equipment.js）——
         // 单帧误检不能立刻变成「设备证据」：同一位置要在**两次不同的检测**里都命中才算确认。
@@ -165,6 +166,11 @@ export const DEFAULT_PARAMS = {
         // 人体框竖直门：挡掉横向的手臂/设备特写；但也会挡掉「只见手臂」的真作业镜头。
         // refuel 演示片可关掉换取召回，代价是特写误报会变多（见 docs/signals.md）。
         requireUprightBox: true,
+        // 没有设备框时是否退回 ROI。null = 跟随 operating.equipmentFallbackRoi（旧行为）；
+        // 显式 true/false 可以让 nearEquipment 独立于 operating：operating 需要「手在设备上」
+        // 的强证据，可以失败即不判；nearEquipment 只回答「人站在设备区域里」，跟着关会让它
+        // 整段消失（refuel 实测 operating fail-closed 时 near 4TP/3FP → 1TP/0FP）。
+        equipmentFallbackRoi: null,
         // 人体框有效性门（默认关，保持旧行为）：挡掉过小/满屏/大半出画的「人框」。
         // person.bbox 由全部 33 点取极值，含不可见/出画点，in_frame 天生偏低，
         // 所以 minInFrame 默认只取 0.5；不要在没修 bbox 的前提下收紧。

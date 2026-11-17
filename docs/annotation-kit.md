@@ -15,6 +15,10 @@ eval-data/incoming/<scene>.mp4
 
 `<scene>` 用机位/场景命名（如 `site-b`、`night-01`）。同一个 profile 对应同一个固定机位。
 
+HEVC（`hvc1`/`hev1`）或 AV1 素材不用先转码：`npm run inspect -- eval-data/incoming/<scene>.mp4`
+先用 OpenCV 抽帧拼接触表（任何编码都能解）；识别链路走 Chrome，HEVC 需要系统 HEVC 扩展 +
+硬件解码，报 decode error 时按 README「素材编码」一段转成 H.264 再跑。
+
 ## 二、建 profile（设备 ROI 必须重画）
 
 复制 `web/profiles/refuel.json` 为 `web/profiles/<scene>.json`，至少改：
@@ -142,8 +146,8 @@ node web/test/accuracy-report.mjs \
 
 这些结果**不要**混进设备场景的 `accuracy.json`（ROI 不是设备，混在一起没有意义），
 只作为「规则是否物体专用」的压力测试。只用 ROI 时 8 段里有 6 段触发；换成
-`equipment-only`（只认设备检测框、`equipmentFallbackRoi=false`）后 **8/8 段 0 触发**，
-细节和复现命令见 [`docs/equipment-detector.md`](equipment-detector.md) §6。
+`refuel-equipment.json`（2026-11-16 起 `equipmentFallbackRoi=false`，只认设备检测框）后
+**8/8 段 0 触发**，细节和复现命令见 [`docs/equipment-detector.md`](equipment-detector.md) §6。
 
 ## 八、采够没有
 

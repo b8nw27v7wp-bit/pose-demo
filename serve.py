@@ -84,6 +84,19 @@ class RangeHandler(SimpleHTTPRequestHandler):
             remaining -= len(chunk)
         self._range_remaining = None
 
+    def guess_type(self, path):
+        """text/* 显式带 charset=utf-8。
+
+        仓库里的 .md/.txt 报告都是 UTF-8，但 http.server 默认只给 MIME，不带 charset；
+        浏览器打开 .md 报告（评估报告、识别报告）时会按本地默认编码解，中文全是乱码。
+        """
+        ctype = super().guess_type(path)
+        if isinstance(ctype, tuple):
+            ctype = ctype[0]
+        if ctype.startswith("text/") and "charset=" not in ctype:
+            ctype += "; charset=utf-8"
+        return ctype
+
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
         super().end_headers()

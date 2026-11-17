@@ -37,13 +37,16 @@ const mkPerson = (over = {}, { bbox = [80, 40, 160, 300], frameW = 1000, frameH 
   frame_w: frameW, frame_h: frameH,
 });
 const valve = (box, label = 'valve') => ({ label, score: 0.9, box });
-const opParams = (operating = {}) => ({
-  signals: { arm: { operating: {
-    roi: { x: 0.0, y: 0.0, w: 1.0, h: 1.0 },
-    equipmentLabels: ['valve'],
-    equipmentMinScore: 0.3,
-    ...operating,
-  } } },
+const opParams = (operating = {}, nearEquipment = {}) => ({
+  signals: { arm: {
+    operating: {
+      roi: { x: 0.0, y: 0.0, w: 1.0, h: 1.0 },
+      equipmentLabels: ['valve'],
+      equipmentMinScore: 0.3,
+      ...operating,
+    },
+    nearEquipment,
+  } },
 });
 
 console.log('\n[1] 基本判定与 gate 诊断');
@@ -97,6 +100,31 @@ console.log('\n[3] ROI 约束：背景里的设备框不算');
   const off = new SignalEngine(opParams({ boxRequireInRoi: false, equipmentFallbackRoi: false, roi: { x: 0, y: 0, w: 0.5, h: 1 } }))
     .update(p, 1000, boxes, null, null);
   check('关掉 ROI 约束 → 照常判定', off.arm.operating_any === true);
+}
+
+console.log('\n[3b] 没有设备框：operating 失败即不判，nearEquipment 仍走 ROI');
+{
+  // 人体框 [80,40,160,280] 在 200×300 画面里与满屏 ROI 的重叠 ≈ 0.32（默认 minOverlap=0.3）
+  const p = mkPerson({}, { bbox: [80, 40, 160, 280], frameW: 200, frameH: 300 });
+  const roi = { x: 0, y: 0, w: 1, h: 1 };
+  const base = new SignalEngine(opParams({ roi })).update(p, 1000, [], null, null);
+  check('默认退回 ROI → operating', base.arm.operating_any === true, base.arm.operating_gate);
+  check('nearEquipment 成立', base.arm.near_equipment === true);
+
+  const closed = new SignalEngine(opParams({ roi, equipmentFallbackRoi: false }))
+    .update(p, 1000, [], null, null);
+  check('equipmentFallbackRoi=false → no_equipment',
+    closed.arm.operating_any === false && closed.arm.operating_gate === 'no_equipment',
+    closed.arm.operating_gate);
+  check('nearEquipment 默认跟随 operating（一起 fail-closed）', closed.arm.near_equipment === false);
+
+  const nearOpen = new SignalEngine(opParams({ roi, equipmentFallbackRoi: false }, { equipmentFallbackRoi: true }))
+    .update(p, 1000, [], null, null);
+  check('nearEquipment 显式 true → operating 关了它仍走 ROI', nearOpen.arm.near_equipment === true);
+
+  const nearClosed = new SignalEngine(opParams({ roi }, { equipmentFallbackRoi: false }))
+    .update(p, 1000, [], null, null);
+  check('nearEquipment 显式 false 也生效', nearClosed.arm.near_equipment === false);
 }
 
 console.log('\n[4] 前臂线段到框的距离');

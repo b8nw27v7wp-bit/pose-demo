@@ -1235,10 +1235,13 @@ export class SignalEngine {
       const boxOverlap = hasEquipmentBox ? Math.max(...eqBoxes.map(overlap)) : NaN;
       // ROI 只在允许兜底、且知道帧尺寸时参与。fail-closed（equipmentFallbackRoi=false）
       // 时 ROI 完全不参与——这正是硬负例里「人走过 ROI 但没有任何设备框」不判的开关。
+      // nearEquipment 默认跟随 operating；显式配置时可独立（operating 失败即不判，
+      // nearEquipment 是上下文，跟着关会让它整段消失，见 params.js 的说明）。
+      const nearEqFallback = (nearCfg.equipmentFallbackRoi ?? opCfg.equipmentFallbackRoi ?? true) !== false;
       let roiOverlap = NaN;
       let roiZone = null;
       let roiSource = null;
-      if (eqFallback && hasFrame) {
+      if (nearEqFallback && hasFrame) {
         if (regionCfg.mode === 'rect' && rectPx) {
           roiOverlap = overlap(rectPx);
           roiSource = 'rect';
@@ -1375,7 +1378,7 @@ export class SignalEngine {
         near_equipment_zone: nearEquipmentZone,
         near_equipment_source: nearEquipmentSource,
         near_equipment_validity: nearValidity && nearValidity.enabled ? nearValidity : null,
-        // 本帧的 operating 是否有设备检测框参与（诊断用；没有框时退回 ROI）
+        // 本帧是否有设备检测框（诊断用；没有框时是否退回 ROI 由 equipmentFallbackRoi 决定）
         operating_equipment: hasEquipmentBox,
         // 框的时序/ROI 过滤诊断：raw=本帧检出，confirmed=通过时序确认，used=最终参与判定
         operating_boxes_raw: rawEqObjects.length,

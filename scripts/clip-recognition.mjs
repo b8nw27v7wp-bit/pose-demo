@@ -12,6 +12,8 @@
 // --max-seconds N   播放上限（默认按素材时长 1.5×+30s，至少 60s）；到上限没播完会
 //                   在报告里标注截断并以非 0 退出，除非再加 --allow-truncate。
 // --allow-truncate  明确接受「只播了一部分」的数据，退出码仍为 0。
+// --start N         先 seek 到第 N 秒、清空起点前的记录再开始识别（长片只看某一段时用，默认 0）
+// --end N           识别到第 N 秒停止（默认到片尾）；给了 --end 就不算截断
 // --export 下载失败同样以非 0 退出，并在 <name>.md 顶部写明原因。
 //
 // 输出：
@@ -33,6 +35,8 @@ const args = {
   export: false,
   maxSeconds: null,
   allowTruncate: false,
+  start: 0,
+  end: 0,
   width: 1440,
   height: 900,
 };
@@ -47,11 +51,21 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--export') args.export = true;
   else if (a === '--max-seconds') args.maxSeconds = Number(next());
   else if (a === '--allow-truncate') args.allowTruncate = true;
+  else if (a === '--start') args.start = Number(next());
+  else if (a === '--end') args.end = Number(next());
   else if (a === '--width') args.width = Number(next());
   else if (a === '--height') args.height = Number(next());
   else if (a === '-h' || a === '--help') {
     console.log('用法见文件头注释'); process.exit(0);
   } else throw new Error(`未知参数 ${a}`);
+}
+// 数值参数缺值/写错时必须是硬错误：NaN 落到下面的范围计算里会被当成 0，
+// 结果跑的是整段素材，报告却看起来正常。
+for (const [name, v] of [['--start', args.start], ['--end', args.end]]) {
+  if (!Number.isFinite(v) || v < 0) {
+    console.error(`${name} 需要一个 >= 0 的秒数（收到 ${String(v)}）`);
+    process.exit(2);
+  }
 }
 const base = args.base.replace(/\/+$/, '');
 const outDir = path.resolve(args.out);
@@ -156,21 +170,80 @@ try {
         loc: location.href,
       };
     })()`).catch((e) => ({ evalError: e.message }));
-    throw new Error(`模型/profile 未就绪：${JSON.stringify(diag)}`);
+    const decodeFailed = /视频加载失败|decode|不支持/i.test(diag.status || '')
+      || (diag.video && diag.video.readyState === 0);
+    const codecHint = decodeFailed
+      ? '\n提示：Chrome 解不了这段素材。HEVC 需要系统装「HEVC 视频扩展」且机器有硬件解码，'
+        + 'AV1 需要较新 Chrome；换机器仍失败时先转 H.264：\n'
+        + '  ffmpeg -i in.mp4 -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart out.mp4'
+      : '';
+    throw new Error(`模型/profile 未就绪：${JSON.stringify(diag)}${codecHint}`);
   }
   // 物体检测是懒加载的（loop() 第一帧才 ensureObjectDetector）：不等就绪就开播，
   // 前几秒 objectSamples=0、截图里没有设备框，和带 --export 的运行不可比。
   // ROI 档 objectOn=false，条件立刻为真。
   const objReady = await waitUntil(cdp, '!__pose.state.objectOn || __pose.state.objectReady || __pose.state.objectError', 60000);
   if (!objReady) console.warn('[clip-recognition] 物体模型 60s 内未就绪，开头几秒的采样可能缺少设备框');
+  // 长片只看某一段：先 seek 到 --start，再开播。时间戳保留素材的绝对时间，
+  // 报告和截图文件名里的 t 与原始素材一致，便于回查。
+  const durNow = await cdp.eval('(() => { const v = document.querySelector("video"); return v && Number.isFinite(v.duration) ? v.duration : null; })()');
+  const startSec = Math.min(Math.max(0, Number.isFinite(args.start) ? args.start : 0),
+    Math.max(0, (Number.isFinite(durNow) ? durNow : 0) - 0.001));
+  const endSec = Number.isFinite(args.end) && args.end > 0
+    ? (Number.isFinite(durNow) ? Math.min(args.end, durNow) : args.end)
+    : null;
+  if (endSec != null && endSec <= startSec) throw new Error(`--end (${endSec}s) 必须大于 --start (${startSec}s)`);
+  if (startSec > 0) {
+    // 暂停 → seek → 清空已录帧 → 再开播。只 seek 不够：
+    //   · 页面自动播放已经把起始点之前的帧写进 frameLog，导出会混进 0–start 的数据；
+    //   · 向回 seek（start 小于当前播放位置）会被 app 判成「时间回退」，置
+    //     videoWrapDetected 并停止记录，整段导出缺帧；
+    //   · Hold/tracker 状态也会带着起始点之前的残留。
+    // 点「清空记录」就是 resetRuntime()：清 frameLog、wrap 标记和运行时状态。
+    const seek = await cdp.eval(`new Promise((resolve) => {
+      const v = document.querySelector('video');
+      if (!v) return resolve({ ok: false, reason: 'no video' });
+      v.pause();
+      let done = false;
+      const finish = (timedOut) => {
+        if (done) return;
+        done = true;
+        v.removeEventListener('seeked', onSeeked);
+        resolve({
+          ok: !timedOut && Math.abs(v.currentTime - ${startSec}) <= 0.5,
+          t: v.currentTime,
+          reason: timedOut ? 'timeout' : 'seeked',
+        });
+      };
+      const onSeeked = () => requestAnimationFrame(() => requestAnimationFrame(() => finish(false)));
+      v.addEventListener('seeked', onSeeked);
+      v.currentTime = ${startSec};
+      setTimeout(() => finish(true), 10000);
+    })`);
+    if (!seek?.ok) {
+      throw new Error(`seek 到 ${startSec}s 失败（currentTime=${seek?.t ?? '?'}，${seek?.reason || 'unknown'}）`);
+    }
+    const cleared = await cdp.eval(`(() => {
+      const b = document.getElementById('btnClearLog');
+      if (b && !b.disabled) b.click();
+      return { frames: __pose.state.frames };
+    })()`);
+    // 视频已暂停，clearLog() 同步执行；还有帧说明清空没生效，不能带着起始点前的数据继续。
+    if (cleared && cleared.frames > 0) {
+      throw new Error(`清空起始点前的记录失败（仍有 ${cleared.frames} 帧）`);
+    }
+  }
   await cdp.eval('(() => { const v = document.querySelector("video"); if (v) v.play().catch(() => {}); return 1; })()');
 
   // 播放上限按素材时长给余量（默认 1.5×+30s，至少 60s），不再固定 180s 静默截断。
   // 未知时长（流/元数据未就绪）退回 180s 估算。
-  const durSec = await cdp.eval('(() => { const v = document.querySelector("video"); return v && Number.isFinite(v.duration) ? v.duration : null; })()');
+  const durSec = durNow;
+  // 给了 --end 时按「要看的这段」给余量，而不是整片时长——否则 10 分钟素材只看 30s，
+  // 默认上限会是 15 分钟，脚本会一直等到那段播完。
+  const watchSec = endSec != null ? endSec - startSec : (Number.isFinite(durSec) ? durSec - startSec : 180);
   const maxSec = Number.isFinite(args.maxSeconds) && args.maxSeconds > 0
     ? args.maxSeconds
-    : Math.max(60, (Number.isFinite(durSec) ? durSec : 180) * 1.5 + 30);
+    : Math.max(30, watchSec * 1.5 + 30);
   const maxMs = maxSec * 1000;
 
   const startedAt = Date.now();
@@ -212,6 +285,8 @@ try {
 
     prev = s;
     if (s.ended) break;
+    // 显式范围：播到 --end 就收尾，不算截断
+    if (endSec != null && s.t != null && s.t >= endSec - 0.15) break;
     if (s.dur && s.t != null && s.t >= s.dur - 0.15) {
       await sleep(800);
       break;
@@ -230,8 +305,10 @@ try {
   shots.push({ i: shotIdx, t: final.t, tag: 'final', file: path.relative(outDir, finalFile).replace(/\\/g, '/') });
 
   // 到上限退出但没播到片尾 = 数据截断。最终帧离片尾 0.5s 内算正常收尾。
-  const truncated = hitLimit
-    && !(Number.isFinite(final.dur) && Number.isFinite(final.t) && final.t >= final.dur - 0.5);
+  // 到了 --end 或片尾都算正常收尾；只有「播放上限先到、区间没播完」才算截断。
+  const reachedWantedEnd = (endSec != null && Number.isFinite(final.t) && final.t >= endSec - 0.5)
+    || (Number.isFinite(final.dur) && Number.isFinite(final.t) && final.t >= final.dur - 0.5);
+  const truncated = hitLimit && !reachedWantedEnd;
   if (truncated) {
     console.warn(`[clip-recognition] 播放到上限 ${maxSec.toFixed(0)}s 仍未播完`
       + `（t=${final.t ?? '?'}s / ${final.dur ?? '?'}s）：帧数据被截断，evaluate 的 recall 结论不可信。`
@@ -282,6 +359,7 @@ try {
     profile: args.profile,
     startedAt: new Date().toISOString(),
     durationSec: final.dur,
+    rangeSec: [startSec, endSec],
     coveredSec: final.t,
     maxSeconds: Math.round(maxSec),
     truncated,
@@ -314,6 +392,9 @@ try {
   md.push(`- 素材：\`${args.clip}\``);
   md.push(`- profile：\`${args.profile}\``);
   md.push(`- 时长：${final.dur ?? '?'}s；记录 ${final.frames} 帧（${final.fps ?? '?'} fps）`);
+  if (startSec > 0 || endSec != null) {
+    md.push(`- 识别范围：${startSec}s – ${endSec != null ? `${endSec}s` : '片尾'}（时间戳为素材绝对时间）`);
+  }
   md.push(`- 采样：${samples.length} 次；operating 命中 ${operating.length} 次；nearEquipment 命中 ${near.length} 次`);
   md.push(`- 设备框：${withObjects.length} 次采样有框 ${JSON.stringify(labelCounts)}`);
   if (summary.meta) {
@@ -349,6 +430,70 @@ try {
     md.push(`### ${sh.tag} @ ${sh.t}s`, '', `![](${sh.file})`, '');
   }
   await writeFile(path.join(outDir, `${args.name}.md`), md.join('\n'));
+
+  // 同内容的 HTML 版：截图直接内联显示，人用浏览器打开一页就能看完时间线和关键帧。
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const rows = [];
+  let shownRow = -999;
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    const prevS = samples[i - 1];
+    const changed = !prevS
+      || s.operating !== prevS.operating || s.nearEquipment !== prevS.nearEquipment
+      || JSON.stringify(s.objectTags) !== JSON.stringify(prevS.objectTags)
+      || s.posture !== prevS.posture;
+    if (!changed && (s.t || 0) - shownRow < 3) continue;
+    shownRow = s.t || 0;
+    rows.push(`<tr><td>${esc(s.t)}s</td><td>${esc(s.posture || '—')}</td>`
+      + `<td>${s.operating ? '✓' : ''}</td><td>${s.nearEquipment ? '✓' : ''}</td>`
+      + `<td>${s.objects ? esc(JSON.stringify(s.objectTags)) : ''}</td></tr>`);
+  }
+  const html = `<!doctype html>
+<meta charset="utf-8">
+<title>识别结果 · ${esc(args.name)}</title>
+<style>
+  body { margin: 0; font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif; background: #111; color: #ddd; }
+  header { padding: 18px 24px; border-bottom: 1px solid #333; }
+  h1 { margin: 0 0 6px; font-size: 20px; }
+  .meta { color: #999; }
+  .warn { color: #ffb347; }
+  main { padding: 16px 24px 40px; }
+  .shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+  figure { margin: 0; background: #1b1b1b; border: 1px solid #333; border-radius: 6px; overflow: hidden; }
+  figure img { width: 100%; display: block; }
+  figcaption { padding: 6px 10px; color: #aaa; font-size: 12px; }
+  table { border-collapse: collapse; margin: 12px 0 24px; font-size: 13px; }
+  th, td { border: 1px solid #333; padding: 4px 10px; text-align: left; }
+  th { background: #1b1b1b; color: #bbb; }
+  a { color: #6cf; }
+</style>
+<header>
+  <h1>识别结果 · ${esc(args.name)}</h1>
+  <div class="meta">
+    素材 <a href="${esc(args.clip)}">${esc(args.clip)}</a> ·
+    profile <code>${esc(args.profile)}</code> ·
+    时长 ${esc(final.dur)}s · 记录 ${esc(final.frames)} 帧（${esc(final.fps)} fps）
+  </div>
+  <div class="meta">
+    识别范围 ${startSec}s – ${endSec != null ? `${endSec}s` : '片尾'} ·
+    采样 ${samples.length} 次 · operating ${operating.length} 次 · near ${near.length} 次 ·
+    有设备框 ${withObjects.length} 次 ${esc(JSON.stringify(labelCounts))}
+  </div>
+  ${truncated ? `<div class="warn">⚠ 只覆盖到 t=${esc(final.t)}s / ${esc(final.dur)}s（播放上限 ${Math.round(maxSec)}s）：帧数据被截断。</div>` : ''}
+  ${exportError ? `<div class="warn">⚠ 帧导出失败：${esc(exportError)}</div>` : ''}
+</header>
+<main>
+  <h2>截图</h2>
+  <div class="shots">
+  ${shots.map((sh) => `<figure><a href="${esc(sh.file)}"><img src="${esc(sh.file)}" alt="${esc(sh.tag)} @ ${esc(sh.t)}s"></a>`
+    + `<figcaption>${esc(sh.tag)} @ ${esc(sh.t)}s</figcaption></figure>`).join('\n  ')}
+  </div>
+  <h2>时间线</h2>
+  <table><thead><tr><th>t</th><th>姿态</th><th>operating</th><th>near</th><th>设备框</th></tr></thead>
+  <tbody>${rows.join('')}</tbody></table>
+</main>`;
+  await writeFile(path.join(outDir, `${args.name}.html`), html);
 
   console.log(JSON.stringify({
     name: args.name, frames: final.frames, fps: final.fps,

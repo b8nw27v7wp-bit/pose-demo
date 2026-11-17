@@ -112,13 +112,13 @@ node scripts/ppe-model-manifest.mjs web/models/equipment.onnx \
     "signals": {
       "arm": {
         "operating": {
-          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 }, // 检测不到时的兜底
+          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 }, // nearEquipment 仍用它兜底
           "equipmentLabels": ["panel", "valve", "gauge"],
           "equipmentMinScore": 0.35,
           "equipmentMaxDist": 0.7,
-          "equipmentFallbackRoi": true
+          "equipmentFallbackRoi": false        // 2026-11-16 起：没有设备框就不判
         },
-        "nearEquipment": { "minOverlap": 0.5 }
+        "nearEquipment": { "minOverlap": 0.5, "equipmentFallbackRoi": true }
       }
     }
   }
@@ -142,11 +142,15 @@ near_equipment。示例见 `web/profiles/refuel-polygon.json`。
 
 1. **operating**：本帧有 `equipmentLabels` 的检测框 → 腕/肘到框边距离 ≤
    `equipmentMaxDist × scale` 才算；有框时 ROI 不参与「手在设备上」这一步。
-   本帧没有设备框 → 退回人工 ROI（`equipmentFallbackRoi=true`，默认）。
-   `equipmentFallbackRoi=false` 是 **fail-closed**：没有框就一律不判，用于硬负例/无 ROI 场景。
+   本帧没有设备框 → 由 `equipmentFallbackRoi` 决定：`true` 退回人工 ROI，
+   `false`（**fail-closed**，`refuel-equipment` / `refuel-equipment-strict` 从 2026-11-16 起）
+   一律不判。params 里的全局默认仍是 `true`，但部署档不要依赖它——只靠 ROI 的 operating
+   在 8 段硬负例里 6/8 段整段误报（见 §6.1）。
 2. **near_equipment**：人体框与检测框的重叠、与 ROI 的重叠**取较大值**（union）。
    检测框只框设备本体，人站在面板前时与框的重叠常常远小于与 ROI 的重叠；
-   只认框会把 refuel 的召回从 3/6 压到 1/6。fail-closed 时只认检测框。
+   只认框会把 refuel 的召回从 3/6 压到 1/6。它的兜底由独立开关
+   `nearEquipment.equipmentFallbackRoi` 控制（默认 `null` = 跟随 `operating`；
+   refuel-equipment 档显式设 `true`，否则会跟着 operating 一起整段消失）。
 3. 两者都没有 → 不判。
 
 `equipmentMaxDist` 的默认值是 0.35，但 refuel 图像上这个距离太紧：正例段掉到 1/6。
@@ -168,7 +172,7 @@ refuel 档的保持参数是 `holds.operating=1500ms`、`operatingMaxGap=600ms`�
 | profile | operating TP/FN/FP | near_equipment TP/FN/FP |
 |---|---|---|
 | `refuel.json`（只用 ROI） | 3 / 3 / 3 | 3 / 3 / 2 |
-| `refuel-equipment.json`（ROI + 检测框） | **3 / 3 / 2** | 3 / 3 / 2 |
+| `refuel-equipment.json`（ROI + 检测框，2026-11-16 起 fail-closed） | **3 / 3 / 2** | 3 / 3 / 2 |
 | `equipment-only`（无 ROI，fail-closed） | 3 / 3 / 2 | 1 / 5 / 0 |
 
 - 检测框把 ROI 的 3 个 FP 压到 2 个（9.29–12.91s 手套/阀门特写），召回不变（n=6 正例段）。
@@ -180,6 +184,38 @@ refuel 档的保持参数是 `holds.operating=1500ms`、`operatingMaxGap=600ms`�
   **8/8 段 0 触发**。检测器在这 8 段里确实在工作（mot17-04 有 296 个框、
   mot17-02 6 个、mot17-05 8 个，其余 0 个），不是「模型没跑」造成的假通过。
   配置：`eval-data/negative/equipment-only.json`（gitignored）。
+
+### 6.1 2026-11-16：fail-closed 进默认档，反例误报归零
+
+把 `equipmentFallbackRoi=false` 从 `equipment-only` 临时档提升到
+`refuel-equipment.json` / `refuel-equipment-strict.json`，并给 `nearEquipment`
+加了独立开关（`nearEquipment.equipmentFallbackRoi`，默认 `null` = 跟随 `operating`）：
+`operating` 要求「有设备框才判」，这两个 profile 显式把 near 设为 `true`，
+所以 `nearEquipment` 仍然可以退回 ROI。
+
+同输入确定性 A/B（5fps，290 帧正例导出 `eq-check-2026-11-16.jsonl`）：
+
+| profile | operating TP/FN/FP | nearEquipment TP/FN/FP |
+|---|---|---|
+| 旧档（fallback=true） | 4 / 2 / 3 | 4 / 2 / 3 |
+| 新档（fail-closed） | 4 / 2 / 3 | 4 / 2 / 3 |
+
+10fps / 580 帧导出（`refuel-det-baseline.jsonl`）上则从 4/2/5 变成 3/3/4：
+fail-closed 会丢掉「整段没有确认框」的那个正例段，**采样率不同结论不同，只能同导出比较**。
+
+反例：8 段（MOT17×6 + pose-two/walk）用 `refuel-equipment.json` 重新录制（带设备框，5fps）：
+
+| profile | operating |
+|---|---|
+| 旧档（fallback=true） | 6/8 段整段误报 |
+| 新档（fail-closed） | **0 段触发**；检测器仍有零星 gauge 误检（mot17-04 等 4 段共 73 个框），但没有变成 operating |
+
+`refuel-equipment-strict.json` 正例 2/4/0 不变，反例同样 6 段 → 0。
+`refuel.json`（只有 ROI、没有检测框）不受影响，仍是 6/8 段误报——它只适合固定机位演示；
+部署/换机位请用 fail-closed 的检测器档，或按新机位重画 ROI。
+
+代码：`web/js/params.js`（nearEquipment.equipmentFallbackRoi）、`web/js/signals.js`
+（nearEquipment 用独立开关）；回归用例在 `web/test/operating-test.mjs` §[3b]。
 
 **播放间差异必须先排除**：同一份代码 + 同一个 `refuel.json`，旧导出
 （`eval-data/refuel/refuel-operating.jsonl`）回放是 5/1/3（R0.833/P0.625），新播放导出是 3/3/3。
