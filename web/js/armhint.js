@@ -55,6 +55,11 @@ export const ARM_NOTES = {
     need: '腕到鼻尖 <0.55 躯干长、不明显低于肩、方位角 ≤60°，保持 1000ms',
     caveat: '和「手在头部」的区别只有「手在身前」+ 更长的保持窗；没有 3D 时退化成纯距离判据，摸头/扶眼镜也会命中；单手举瓶、双手捧瓶都能判，但手在身体侧后方看样瓶会漏判',
   },
+  drain_sample: {
+    basis: '双手低于肩 + 两腕靠拢 + 半蹲/前倾（膝角 60–140°）',
+    need: '双侧抬臂角 ≥100°（手在肩下）、两腕距离 ≤1.3 躯干长、膝角 60°–140° 或上半身前倾，保持 1000ms',
+    caveat: '深蹲/跪坐（膝角 <60°）不算——同场景里那是针管取样/清洗；蹲下系鞋带、低处搬东西仍可能命中；膝完全不可见且躯干直立时不判',
+  },
   reach: {
     basis: '手臂伸出 + 手部模型判为「张开」',
     need: '腕-肩 >1.25 躯干长、抬臂角 >30°，且该侧手被判为「张开」(open)，保持 250ms',
@@ -106,7 +111,7 @@ const WORLD_ACTIONS = new Set(['point']);
 // 同时亮多个动作时，提示优先给「可信度最低」的那个：
 // 指向/持物只有弱证据，静态动作放最后。只列面板上看得见的动作——
 // 已下线/隐藏的动作即使引擎判出，也不该在提示行里出现。
-const ACTIVE_PRIORITY = ['point', 'carry', 'operating', 'oil_sample', 'near_equipment', 'reach', 'arm_raised'];
+const ACTIVE_PRIORITY = ['point', 'carry', 'operating', 'oil_sample', 'drain_sample', 'near_equipment', 'reach', 'arm_raised'];
 
 // 单手动作的逐侧 flag。提示行用它把「举手」说成「左手举手」，
 // 而不是只给一个左右不分的聚合标签。双侧同时成立时不加前缀。
@@ -117,6 +122,7 @@ const SIDE_FLAGS = {
   carry: ['carryingL', 'carryingR'],
   operating: ['operatingL', 'operatingR'],
   oil_sample: ['oilSampleL', 'oilSampleR'],
+  drain_sample: ['drainSampleL', 'drainSampleR'],
 };
 
 export const DEFAULT_HINT = '悬停动作名：查看判定条件与已知误判';

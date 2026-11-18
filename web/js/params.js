@@ -73,6 +73,15 @@ export const DEFAULT_PARAMS = {
       // 没有 3D 时方位角是 NaN，退回纯距离判据（与 hand_head 同口径）——宁可少一层
       // 区分度，也不要把动作整段判掉。maxHeadDist 单位同 head.maxDist（腕-鼻尖 / 躯干长）。
       sampling: { maxHeadDist: 0.55, maxAzimuth: 60 },
+      // 放油取样（drain_sample）：蹲/跪在放油阀旁，双手在阀口与接油盆之间。
+      // 与 oil_sample 的区别是「手低 + 双手靠拢 + 屈膝」，不是「手举到眼前」。
+      // minElev：抬臂角 0°=手在肩上方、90°=水平、180°=自然下垂；取 100° 表示双手低于肩。
+      // maxHandsClose：两腕距离 / 躯干长；阀口到接油盆约一个躯干长以内。
+      // minKnee/maxKnee：屈膝区间。下限 60° 来自 2026-11-18 的现场标定——同场景里
+      //   深蹲/跪坐（膝角 27–50°）是「针管取样/清洗」，不是阀口接油；半蹲接油在 74–160°。
+      //   如果现场确实有人以深跪姿势接油，把 minKnee 降到 0–40。
+      // 膝不可用时退回「上半身前倾」（uprightness ≤ maxUpright）。
+      drain: { minElev: 100, maxHandsClose: 1.3, minKnee: 60, maxKnee: 140, maxUpright: 0.2 },
       // 3D 抬臂角（相对躯干）：0°=手在躯干延长线上（举起），90°=水平，180°=沿身体下垂
       elevTorso: { raised: 75 },
       // 手臂伸出：腕到肩距离 / scale。自然下垂实测 ≈0.84，前伸约 1.5+
@@ -377,6 +386,11 @@ export const DEFAULT_PARAMS = {
       // 100~500ms）。和 operatingMaxGap 同一套理由：短暂掉帧不重新计时。
       // 不能更大——两段独立动作（看一次、放下、再看）之间的间隔通常 >1s，粘连就失去意义。
       oilSampleMaxGap: 500,
+      // 放油取样：蹲下、双手在阀口与接油盆之间通常持续 2s 以上，取 1s；
+      // 手被油盆/阀门挡住时会断续（实测单侧腕点经常整段消失），允许 900ms 的掉帧。
+      // 900ms 仍小于「取样—起身—再蹲下」的间隔，不会把两次动作粘成一次。
+      drainSample: 1000,
+      drainSampleMaxGap: 900,
       // 前/侧平举原本是瞬时布尔：走路摆臂会被 3D 方位角的噪声凑成「前平举」，
       // 实测 45 帧里断续命中 41 帧、最长一段仅 250ms。加保持窗把瞬时误报滤掉。
       front: 300, side: 300,

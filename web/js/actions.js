@@ -21,6 +21,7 @@ const EMPTY_FLAGS = {
   operating: false, operatingL: false, operatingR: false,
   nearEquipment: false,
   oilSample: false, oilSampleL: false, oilSampleR: false,
+  drainSample: false, drainSampleL: false, drainSampleR: false,
 };
 
 /**
@@ -92,6 +93,8 @@ export class ActionEngine {
     this.headHold = new Hold(this.cfg.holds.handFace);
     // 油样取样：举瓶到眼前「持续在看」，1s 才成立（见 params.actions.holds.oilSample）
     this.sampleHold = new Hold(this.cfg.holds.oilSample, this.cfg.holds.oilSampleMaxGap);
+    // 放油取样：蹲/跪 + 双手在阀口与接油盆之间，双手通常停留 2s 以上；同样允许短暂遮挡。
+    this.drainHold = new Hold(this.cfg.holds.drainSample, this.cfg.holds.drainSampleMaxGap);
     this.reachHold = new Hold(this.cfg.holds.reach);
     this.carryHold = new Hold(this.cfg.holds.carry);
     this.pointHold = new Hold(this.cfg.holds.point);
@@ -127,6 +130,7 @@ export class ActionEngine {
     this.upHold.reset();
     this.headHold.reset();
     this.sampleHold.reset();
+    this.drainHold.reset();
     this.reachHold.reset();
     this.carryHold.reset();
     this.pointHold.reset();
@@ -235,6 +239,8 @@ export class ActionEngine {
     const handAtHead = this.headHold.update(s.arm.head_near_L || s.arm.head_near_R, ts);
     // 油样取样：手举到眼前看样瓶（信号层已含「手在身体前方」这道门），保持 1s
     const oilSample = this.sampleHold.update(!!(s.arm.sample_L || s.arm.sample_R), ts);
+    // 放油取样：信号层已要求「双手低于肩 + 两腕靠拢 + 屈膝/前倾」，这里只加 1s 保持窗。
+    const drainSample = this.drainHold.update(!!s.arm.drain_sample, ts);
 
     // —— 伸手 / 指向 / 持物 / 拿取
     // 这些判定需要「手是张开还是握紧」，而姿态层只有腕的位置。
@@ -312,6 +318,7 @@ export class ActionEngine {
       flags: {
         armRaised, waving, crossed, onHips, armsOpen, bothHandsUp, handAtHead,
         oilSample,
+        drainSample,
         reaching, carrying, pointing, armFront, armSide,
         // 逐侧粒度：界面用它说「左手举手」，导出也能按手拆准确率
         armRaisedL: armRaised && raisedL,
@@ -326,6 +333,8 @@ export class ActionEngine {
         handAtHeadR: handAtHead && !!s.arm.head_near_R,
         oilSampleL: oilSample && !!s.arm.sample_L,
         oilSampleR: oilSample && !!s.arm.sample_R,
+        drainSampleL: drainSample && !!s.arm.drain_low_L,
+        drainSampleR: drainSample && !!s.arm.drain_low_R,
         carryingL: carrying && closedL,
         carryingR: carrying && closedR,
         operating,
@@ -377,6 +386,9 @@ export const ARM_ACTIONS = [
   // 机场加油特有：取样瓶/取样管举到眼前对光检查。判据见 signals.arm.sampling，
   // 与 hand_head 的区别是多了「手在身体前方」这道门 + 1s 保持窗。
   { id: 'oil_sample', name: '油样取样', flag: 'oilSample' },
+  // 变压器/设备放油取样：蹲或跪在放油阀旁，双手在阀口与接油盆之间。
+  // 与 oil_sample（举瓶到眼前对光看）是两种不同流程，判据见 signals.arm.drain。
+  { id: 'drain_sample', name: '放油取样', flag: 'drainSample' },
   { id: 'reach', name: '伸手', flag: 'reaching' },
   { id: 'carry', name: '持物', flag: 'carrying' },
   { id: 'point', name: '指向', flag: 'pointing' },

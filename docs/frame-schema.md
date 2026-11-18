@@ -76,6 +76,7 @@
     "flags": {
       "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
       "onHips": false, "armsOpen": false, "handAtHead": false, "oilSample": false,
+      "drainSample": false,
       "reaching": false, "carrying": false, "operating": false, "pointing": false,
       "armFront": false, "armSide": false,
       // 逐侧粒度：单手动作额外给出是哪只手；聚合 flag 保持旧语义
@@ -85,6 +86,7 @@
       "pointingL": false, "pointingR": false,
       "handAtHeadL": false, "handAtHeadR": false,
       "oilSampleL": false, "oilSampleR": false,
+      "drainSampleL": false, "drainSampleR": false,
       "carryingL": false, "carryingR": false,
       "operatingL": false, "operatingR": false,
       "nearEquipment": false
