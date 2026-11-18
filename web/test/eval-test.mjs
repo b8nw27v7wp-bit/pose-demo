@@ -14,7 +14,7 @@ import {
   fitToParams, resampleFrames, FIT_MIN_SAMPLES,
   objectsInfo, objectModelChange, formatObject,
 } from './evaluate.mjs';
-import { DEFAULT_PARAMS, mergeParams, profileParams, profileName, paramsHash } from '../js/params.js';
+import { DEFAULT_PARAMS, mergeParams, profileParams, profileName, paramsHash, validateParams } from '../js/params.js';
 import { SignalEngine } from '../js/signals.js';
 import { ActionEngine } from '../js/actions.js';
 import { videoTimeMonotonic } from './frame-io.mjs';
@@ -1802,6 +1802,32 @@ console.log('\n[29] 多人评估口径');
   check('离线 grip：远离腕点的手不归属给这个人（与页面 assignHands 一致）',
     farGrip[0].sig.arm.operating_any === false && farGrip[0].sig.arm.operating_grip_L === null,
     `gate=${farGrip[0].sig.arm.operating_gate} gripL=${farGrip[0].sig.arm.operating_grip_L}`);
+}
+
+// —— 30. 放油取样参数校验 ——
+// profile 把 minKnee/maxKnee 写反、maxHandsClose 写成 0 时，drainCrouched/drainHandsClose
+// 会对所有帧恒 false，动作静默失效；validateParams 必须在加载/评估器读取时直接抛错。
+console.log('\n[30] 放油取样参数校验');
+{
+  const errOf = (over) => {
+    try { validateParams(over); return ''; } catch (e) { return e.message; }
+  };
+  check('合法覆盖不报错',
+    errOf({ signals: { arm: { drain: { minKnee: 40, maxKnee: 150 } } } }) === '');
+  const inverted = errOf({ signals: { arm: { drain: { minKnee: 150, maxKnee: 100 } } } });
+  check('minKnee > maxKnee 报错',
+    inverted.includes('minKnee') && inverted.includes('maxKnee'), inverted);
+  check('maxHandsClose=0 报错',
+    errOf({ signals: { arm: { drain: { maxHandsClose: 0 } } } }).includes('maxHandsClose'));
+  check('minElev=200 报错',
+    errOf({ signals: { arm: { drain: { minElev: 200 } } } }).includes('minElev'));
+  check('minKnee=-1 报错',
+    errOf({ signals: { arm: { drain: { minKnee: -1 } } } }).includes('minKnee'));
+  check('非数值覆盖报错',
+    errOf({ signals: { arm: { drain: { maxHandsClose: '1.3' } } } }).includes('maxHandsClose'));
+  check('drain 写成 null 报错',
+    errOf({ signals: { arm: { drain: null } } }).includes('signals.arm.drain'));
+  check('默认参数通过校验', !!validateParams({}).signals.arm.drain);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

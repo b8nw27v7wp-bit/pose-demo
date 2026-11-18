@@ -73,6 +73,23 @@ export const DEFAULT_PARAMS = {
       // 没有 3D 时方位角是 NaN，退回纯距离判据（与 hand_head 同口径）——宁可少一层
       // 区分度，也不要把动作整段判掉。maxHeadDist 单位同 head.maxDist（腕-鼻尖 / 躯干长）。
       sampling: { maxHeadDist: 0.55, maxAzimuth: 60 },
+      // 放油取样（drain_sample）：半蹲在放油阀旁，双手在阀口与接油盆之间。
+      // 与 oil_sample 的区别是「手低 + 双手靠拢 + 屈膝」，不是「手举到眼前」。
+      // minElev：抬臂角 0°=手在肩上方、90°=水平、180°=自然下垂；取 100° 表示双手低于肩。
+      // maxHandsClose：两腕距离 / 躯干长；阀口到接油盆约一个躯干长以内。
+      // minKnee/maxKnee：屈膝区间。下限 60° 来自 2026-11-18 的现场标定——同场景里
+      //   深蹲/跪坐（膝角 27–55°）是「针管取样/清洗」，不是阀口接油；半蹲接油在 74–160°。
+      //   上限取 120°：膝角越大越接近站立，140° 会放行「站立微屈膝拎低桶」，
+      //   收紧到 120 在 7 个标注窗口上事件指标不变（3/3，0 FP）。
+      //   判定取「任一条腿」落在区间内，不按可见度选腿：单膝跪地时按支撑腿判，
+      //   跪腿本身（约 45–52°）低于下限、不算蹲证据。只支持深跪接油时把 minKnee 降到 0–40。
+      // weakKneeFrom/maxLeanUpright：膝角 110–120° 只是弱证据，还要上半身前倾
+      //   （uprightness ≤0.8）；站姿躯干直立（≈0.9），不会仅因微屈膝命中。
+      // 膝完全不可用时退回「明显前倾」（uprightness ≤ maxUpright）。
+      drain: {
+        minElev: 100, maxHandsClose: 1.3, minKnee: 60, maxKnee: 120,
+        weakKneeFrom: 110, maxLeanUpright: 0.8, maxUpright: 0.2,
+      },
       // 3D 抬臂角（相对躯干）：0°=手在躯干延长线上（举起），90°=水平，180°=沿身体下垂
       elevTorso: { raised: 75 },
       // 手臂伸出：腕到肩距离 / scale。自然下垂实测 ≈0.84，前伸约 1.5+
@@ -377,6 +394,11 @@ export const DEFAULT_PARAMS = {
       // 100~500ms）。和 operatingMaxGap 同一套理由：短暂掉帧不重新计时。
       // 不能更大——两段独立动作（看一次、放下、再看）之间的间隔通常 >1s，粘连就失去意义。
       oilSampleMaxGap: 500,
+      // 放油取样：蹲下、双手在阀口与接油盆之间通常持续 2s 以上，取 1s；
+      // 手被油盆/阀门挡住时会断续（实测单侧腕点经常整段消失），允许 900ms 的掉帧。
+      // 900ms 仍小于「取样—起身—再蹲下」的间隔，不会把两次动作粘成一次。
+      drainSample: 1000,
+      drainSampleMaxGap: 900,
       // 前/侧平举原本是瞬时布尔：走路摆臂会被 3D 方位角的噪声凑成「前平举」，
       // 实测 45 帧里断续命中 41 帧、最长一段仅 250ms。加保持窗把瞬时误报滤掉。
       front: 300, side: 300,
@@ -410,9 +432,70 @@ export function resolveParams(overrides = {}) {
 export const BOX_MAX_AGE_MARGIN_MS = 300;
 
 /**
+ * 放油取样（`signals.arm.drain`）的值域校验。
+ *
+ * 这些阈值写错不会报错、只会让 `drainCrouched` 恒 false（例如 `minKnee > maxKnee`、
+ * `maxHandsClose=0`），动作静默失效；所以在加载 profile / 评估器读取时直接抛错。
+ * 允许 profile 用更窄或更宽的区间，但必须是有限数值且范围合法。
+ *
+ * @param {object} drain 已合并默认值的 drain 配置
+ * @throws {Error} 任一值非法时
+ */
+function validateDrainParams(drain = null) {
+  // profile 把 drain 写成 null/数字时 deepMerge 会整段替换掉默认对象；
+  // 这里给出明确报错，而不是在后面 signals.js 里抛 TypeError。
+  if (!isPlain(drain)) {
+    throw new Error(
+      `参数组合非法：signals.arm.drain=${JSON.stringify(drain)} 必须是对象。`,
+    );
+  }
+  const num = (key) => {
+    const v = drain[key];
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(
+        `参数组合非法：signals.arm.drain.${key}=${JSON.stringify(v)} 必须是有限数值。`,
+      );
+    }
+    return v;
+  };
+  const range = (key, v, lo, hi) => {
+    if (v < lo || v > hi) {
+      throw new Error(
+        `参数组合非法：signals.arm.drain.${key}=${v} 必须在 ${lo}–${hi} 之间。`,
+      );
+    }
+  };
+  const minKnee = num('minKnee');
+  const maxKnee = num('maxKnee');
+  range('minKnee', minKnee, 0, 180);
+  range('maxKnee', maxKnee, 0, 180);
+  if (minKnee > maxKnee) {
+    throw new Error(
+      `参数组合非法：signals.arm.drain.minKnee=${minKnee} 必须 <= maxKnee=${maxKnee}。`
+      + ' 区间反了时 drainCrouched 对所有帧恒 false，放油取样会静默失效。',
+    );
+  }
+  range('weakKneeFrom', num('weakKneeFrom'), 0, 180);
+  range('minElev', num('minElev'), 0, 180);
+  const maxHandsClose = num('maxHandsClose');
+  if (maxHandsClose <= 0) {
+    throw new Error(
+      `参数组合非法：signals.arm.drain.maxHandsClose=${maxHandsClose} 必须 > 0，`
+      + ' 否则两腕靠拢条件永远不成立。',
+    );
+  }
+  range('maxUpright', num('maxUpright'), -1, 1);
+  range('maxLeanUpright', num('maxLeanUpright'), -1, 1);
+}
+
+/**
  * 参数一致性校验：非法组合在**加载时**报错，而不是让判定静默失效。
  *
- * 目前只有一条硬约束——设备框的时序确认要求框的有效期覆盖检测间隔：
+ * 硬约束：
+ *   1. 放油取样（`signals.arm.drain`）：`minKnee <= maxKnee`（区间反了时 `drainCrouched`
+ *      对所有帧恒 false）、`maxHandsClose > 0`、膝角/抬臂角都在 0–180、直立度在 −1–1。
+ *      这些值写错时动作会静默失效，排查只能逐帧看信号，所以在加载/评估器读取时就拦住。
+ *   2. 设备框的时序确认要求框的有效期覆盖检测间隔：
  *   `equipmentLabels` 非空 且 `boxMinHits > 1` 时，`boxMaxAgeMs >= objects.intervalMs + 300`。
  * 违反时，两次检测之间的普通帧会先把轨迹过期，下一次检测又从 hits=1 开始，框永远累计不到
  * `minHits`，operating 会整段丢掉设备证据（审查实测 intervalMs=1000：确认态 328/366 → 4/30）。
@@ -426,6 +509,7 @@ export const BOX_MAX_AGE_MARGIN_MS = 300;
  */
 export function validateParams(overrides = {}) {
   const resolved = resolveParams(overrides);
+  validateDrainParams(resolved.signals?.arm?.drain);
   const op = resolved.signals?.arm?.operating || {};
   const labels = Array.isArray(op.equipmentLabels) ? op.equipmentLabels : [];
   const minHits = Number(op.boxMinHits);

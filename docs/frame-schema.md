@@ -76,6 +76,7 @@
     "flags": {
       "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
       "onHips": false, "armsOpen": false, "handAtHead": false, "oilSample": false,
+      "drainSample": false,
       "reaching": false, "carrying": false, "operating": false, "pointing": false,
       "armFront": false, "armSide": false,
       // 逐侧粒度：单手动作额外给出是哪只手；聚合 flag 保持旧语义
@@ -85,6 +86,9 @@
       "pointingL": false, "pointingR": false,
       "handAtHeadL": false, "handAtHeadR": false,
       "oilSampleL": false, "oilSampleR": false,
+      // drainSample 是双侧动作：L/R 只是「该侧腕当时低于肩」的诊断量，
+      // 遮挡会让一侧为 false 而动作仍成立，不要拿它们拼「左手/右手放油取样」
+      "drainSampleL": false, "drainSampleR": false,
       "carryingL": false, "carryingR": false,
       "operatingL": false, "operatingR": false,
       "nearEquipment": false
