@@ -97,7 +97,7 @@ construction-ppe (337 图)
 | 换机位/换人群是否退化 | 两份 MIT 源交叉 | 能（两份分布不同） |
 
 一句话：**素材是"尺子的底片"，不是"准确率"**。没有动作标注、没有你自己的机位，
-它只证明链路能跑，产不出那 10 个动作的 recall/precision。
+它只证明链路能跑，产不出当前动作注册表里那些姿态/手臂动作的 recall/precision。
 
 ---
 
@@ -243,7 +243,7 @@ npm run eval:mot17 -- --profile http://127.0.0.1:8765/web/profiles/safety.json
      b) **Ultralytics YOLO** 训练 + 导出 TFLite——**注意：Ultralytics 的 TFLite 没有 Tasks metadata，
         `objects.js` 加载不了**，需要在 JS 里自己写解码/NMS，或放到服务端。
    - 训完别忘了改 profile 的 `signals.ppe.classes`，并在自己机位上重测。
-3. **动作数据（唯一能产出那 10 个动作准确率的路）**：现有开源素材都没有动作标注。
+3. **动作数据（唯一能产出当前动作注册表准确率的路）**：现有开源素材都没有动作标注。
    自己按 `docs/data-collection.md` 每个动作拍 20~30 次、正/侧两个机位，Demo 导出 → 自动标注草稿 →
    人工补反例 → `npm run accuracy`，页面上的「准确率」才会从「未评估」变成实测值。
-   Kinetics/UCF101/HMDB51 只有**片段级**标签（而且类目对不上这 10 个动作），要接也得先做帧级标注，成本不比自拍低。
+   Kinetics/UCF101/HMDB51 只有**片段级**标签（而且类目对不上当前动作集），要接也得先做帧级标注，成本不比自拍低。

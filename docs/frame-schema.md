@@ -47,7 +47,8 @@
     "angle_source": { "knee_L": "3d", "knee_R": "3d", "elbow_L": "2d", "...": "..." },
     "extrapolated": [],             // 本帧按最后速度外推的点
     "bones_ok": { "foreArm_L": true, "thigh_R": false, "...": true },
-    // 操作设备：ROI 是否配置 + 手/肘判据的逐侧原始布尔（动作层的 operating 还要过 800ms 保持窗）
+    // 操作设备：ROI 是否配置 + 手/肘判据的逐侧原始布尔（动作层的 operating 还要过 800ms 保持窗；
+    // refuel profile 覆盖为 1500ms）
     "operating_roi": true,
     "operating_L": false, "operating_R": true,
     "operating_elbow_L": false, "operating_elbow_R": false,
@@ -97,8 +98,11 @@
   },
   "hands": [                        // 手部（可选，独立模型）
     {
-      "handedness": "Left",         // 被识别者自己的左右手；腕部 ROI 补检时由腕点所在侧决定
-                                    // （MediaPipe 的 handedness 假设自拍镜像输入，普通视频会反过来）
+      "handedness": "Left",         // 被识别者自己的左右手。整帧与 ROI 补检都由姿态腕点纠正：
+                                    // 检出腕点离该人哪只姿态腕点近就是哪侧；两侧腕点都不可见时
+                                    // 保留 MediaPipe 原始输出（它假设自拍镜像，普通视频会反过来）
+      "handedness_raw": "Right",    // 可选：模型原始输出；被纠正时才写，便于审计镜像标反
+      "side_from": "wrist",         // 可选：wrist=按姿态腕点纠正；roi=腕部补检时确定
       "shape": "open",              // 稳定后的手势（见 handshape.js）：
                                     // fist|open|victory|pointing|thumbs_up|ok|gun|rock|unknown
       "shape_raw": "open",          // 本帧原始分类，未过 HandShapeStabilizer
@@ -128,12 +132,12 @@
                     "alert": "violation", // none|suspect|violation（missing 持续 ≥ minMs 才升级）
                     "streak_ms": 3200,    // 连续 missing 的累计时长；unknown 时暂停不清零
                     "reason": "未戴",      // 可选：人可读原因（旧版就有）
-                    "reason_code": "config_mismatch", // 可选：no_positive|config_mismatch|occluded
+                    "reason_code": "config_mismatch", // 可选：no_positive|config_mismatch|occluded|no_hand
                     "source": "face",      // 可选：face|nose|bbox（头部区域来源）
                     "box": [200, 80, 280, 160] }, // 可选：头部区域像素框
         "glove":  { "state": "unknown", "alert": "none", "streak_ms": 0,
                     "reason_code": "occluded",
-                    // 可选：逐侧几何诊断；没有手时 source=wrist
+                    // 可选：逐侧几何诊断；没有手时 source=wrist（fallbackWrist=false 时为 none/no_hand）
                     "L": { "state": "worn", "alert": "none", "streak_ms": 0,
                            "source": "hand", "side_from": "slot", "box": [90, 200, 130, 240] },
                     "R": { "state": "unknown", "alert": "none", "streak_ms": 0,
@@ -153,12 +157,16 @@
 > 该 track 自己的 L/R/U 稳定器，避免 A 的连续手势把 B 的候选计数带满（R12-2）。
 > 单人道固定用 track 0，结果与旧版逐位一致；多人时未归属到任何人的手只有 `shape_raw`，
 > `shape` 不做去抖（它们不进任何人的动作层）。
-> `unknown` 表示判不出来，不是「张开」——但动作层目前只区分「闭合/非闭合」，这一点见已知限制。
+> `unknown` 表示判不出来，不是「张开」。动作层按 `signals.hand.openShapes` /
+> `pointShapes` / `closedShapes` 分组判定：伸手只认 `open`，指向只认 `pointing` / `gun`，
+> 持物与拿取只认 `fist` / `ok`；判不出或侧对镜头时这些动作弃权，不拿旧结果硬判。
 > 离线评估器的手势指标（`action:"gesture"`）读的也是 `shape`；`orient.facing === "edge"`（手掌侧对）
 > 的帧会被当作弃权，不计入手势 recall 的分母（`docs/eval.md`）。
 >
 > 全身/远景构图里整帧检不到手时，页面会用姿态腕点裁图补检（`web/js/handroi.js`）；
-> 这类结果的 `handedness` 由腕点所在侧决定，不采信模型在「自拍镜像输入」假设下的输出。
+> 这类结果的 `handedness` 由腕点所在侧决定。**整帧结果也走同一判据**：归属到人之后
+> 按检出腕点到该人左右姿态腕点的距离纠正，原始模型值写 `handedness_raw`，来源写
+> `side_from`（`wrist` / `roi`）。这样逐侧 flag、手势稳定器与离线回放不会各用一套左右侧。
 > 多人时补检按面积给前 `min(perception.multi.maxPersons, signals.hand.roi.maxPersonsPerFrame)`
 > 人做（主目标优先），`scale < signals.hand.roi.minScalePx` 的人跳过；每条补检结果在内部带
 > `owner_track_id`，只归属给裁出它的那个人（不进导出），同一 ROI 结果不会被两个人各用一次。
@@ -278,6 +286,9 @@
 
 ## 多人记录的口径
 
+- 导出前会先过 `perception.personGate`（人物有效性门，默认开）：几何上不可能的「人」
+  （细长条/躯干比框高/整块身体落在同一只手框里）不会进入 `persons[]` / `verdicts[]`。
+  缺字段时 fail-open；口径与阈值见 `docs/signals.md` §三·八·五。
 - `meta.export_mode = "multi"` 时 `persons[]` 是**全部判定人员**（不是只有主目标）；
   `signals` / `actions` 仍只描述主目标，逐人结果看 `verdicts[]`。
 - 几何（`kp` / `kp_head` / `kp_world` / `scale` / `score`）**只在 `persons[]` 里存一份**；

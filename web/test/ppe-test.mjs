@@ -304,6 +304,19 @@ console.log('\n[6] 手套 hand 区域');
   const noHand = gloveRegion(p, 'L', cfg, null);
   check('无手 → wrist 兜底', noHand.source === 'wrist' && noHand.visible === true);
 
+  const noHandStrict = gloveRegion(p, 'L',
+    { ...cfg, gloveHand: { ...cfg.gloveHand, fallbackWrist: false } }, null);
+  check('fallbackWrist=false → 不退回腕点方框，报 no_hand',
+    noHandStrict.no_hand === true && noHandStrict.source === 'none' && noHandStrict.box === null,
+    `${noHandStrict.source}/${noHandStrict.no_hand}`);
+
+  const ppeNoHand = assessPpe(p, [],
+    { ...cfg, gloveHand: { ...cfg.gloveHand, fallbackWrist: false } },
+    { sawClasses: { helmet: false, glove: true } });
+  check('fallbackWrist=false → 手套 unknown/no_hand（不拿腕点区判 missing）',
+    ppeNoHand.glove.L.state === 'unknown' && ppeNoHand.glove.L.reason_code === 'no_hand',
+    `${ppeNoHand.glove.L.state}/${ppeNoHand.glove.L.reason_code}`);
+
   const handR = mkHand(p.kp[6][0], p.kp[6][1], 'Right');
   const flat = gloveRegion(p, 'L', cfg, [handR, hand]);
   check('扁平列表按最近姿态腕点归属（不信任 handedness）',

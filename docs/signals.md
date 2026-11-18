@@ -115,7 +115,7 @@
 `Hold` 只知道「持续了多久」，不知道「先后顺序」；`RepCounter` 只知道「上下穿越」，不知道中间要多一步合手。
 「拿取东西」恰恰是**有序多阶段**：伸手 → 合手 → （可选）抬起。
 
-`PhaseSequence(phases, {minPhaseMs, maxPhaseMs, completeAt})`：
+`PhaseSequence(phases, {minPhaseMs, maxPhaseMs, completeAt, releaseMs})`：
 
 - 只有观察到**当前阶段**，才允许前进到下一阶段（`started` 标志）——
   没有这道判断，「手本来就是握着的」会直接凑满阶段
@@ -123,6 +123,8 @@
 - 每阶段最长 `maxPhaseMs`，超时回到第一阶段 —— 否则「伸了手但一直没合手」会永久卡在中间
 - 走到 `completeAt` 计一次，然后**闭锁**：必须重新观察到第一阶段才允许下一次计数，
   否则握着手不动会逐帧累加
+- `releaseMs`：闭锁解除前，第一阶段要**连续**观察到这么久（默认 0 = 单帧即可，保持旧行为）。
+  拿取用它防「松开一瞬又合上」多计一次（`signals.grasp.releaseMs=200`）。
 
 **为什么不用两个 Hold 串联**：Hold 之间没有先后关系，也没有「完成一次后闭锁」的概念，
 拼出来的计数一定会在持续动作上连发。
@@ -342,6 +344,7 @@ near_equipment 3/3/2），证明多边形接线没有改变旧语义；`refuel-s
 - **伸手 `reaching`**：臂伸出 **且该侧手判为「张开」**（`openShapes`）；
   握拳/OK、指方向、剪刀手都不算伸手。手的状态必须来自**伸出的那条臂**——另一侧手张开不能替它成立。
 - **拿取 `grasp`**：`PhaseSequence(['reach','grasp'])`，先伸手（open）再合手（fist/OK）才计一次（见 §二）。
+  完成后要连续张开 `signals.grasp.releaseMs`（默认 200ms）才允许下一次，抖动不会多计。
 
 手型分组在 `params.signals.hand`：`openShapes` / `pointShapes` / `closedShapes`。
 判不出手型（`unknown`、侧对镜头）时这些动作弃权，不拿旧结果硬判。
@@ -350,8 +353,8 @@ near_equipment 3/3/2），证明多边形接线没有改变旧语义；`refuel-s
 这是刻意的降级：**宁可漏判，不要拿姿态去猜手的开合**。
 
 动作输出同时给**聚合 flag** 和**逐侧 flag**（`reachingL/R`、`pointingL/R`、`armRaisedL/R`、
-`wavingL/R`、`handAtHeadL/R`、`carryingL/R`）。聚合 flag 保持旧语义，评估器/标签不受影响；
-逐侧 flag 供界面说明「是哪只手」，也为后续按手拆准确率留好导出字段。
+`wavingL/R`、`handAtHeadL/R`、`carryingL/R`、`oilSampleL/R`、`operatingL/R`）。聚合 flag
+保持旧语义，评估器/标签不受影响；逐侧 flag 供界面说明「是哪只手」，也为后续按手拆准确率留好导出字段。
 
 这些条件与已知误判会显示在 Demo 的「动作与手势」面板：悬停动作名看 tooltip，面板下方一行
 按当前帧提示能力缺失（手部模型/3D/髋/单帧）或当前动作最可能错在哪（`web/js/armhint.js`）。
@@ -426,7 +429,30 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 而是输出 **`upper_upright` 上半身直立**（`uprightness > 0.75`）或 **`upper_lean` 上半身前倾**
 （`0 < uprightness ≤ 0.75`）；页面标「仅上半身可见 · 推断」。髋也不可见时 `posture` 保持 `null`，
 页面显示「上半身 · 下半身不可见（出画/遮挡），站/坐无法判定」——这是信息不足，不是识别失败。
-手臂动作（操作设备/伸手/持物/指向/举手）和拿取计数照常工作；已下线动作的底层信号仍在，见 §六·五。
+手臂动作（操作设备 / 油样取样 / 伸手 / 持物 / 指向 / 举手）和拿取计数照常工作；已下线动作的底层信号仍在，见 §六·五。
+
+## 三·八·五、人物有效性门（personGate）
+
+低清晰度/近景特写里 MediaPipe 会把「手 + 取样管/瓶子」补成一个完整的人，随后进入信号层
+（上半身直立、operating 等）造成误报。`perception.personGate` 在**信号层之前**做两道
+几何门，默认开启：
+
+| 门 | 判据 | 参数 |
+|---|---|---|
+| 姿态几何 | bbox 宽/高 < `minAspect`（细长条）、躯干长/框高 > `maxTorsoHeight`、平均置信 < `minScore`、双肩+双髋最低可见性 < `minAnchorVis` | `perception.personGate.*` |
+| 手部包含 | 鼻/双肩/双髋至少 `minAnchors` 个落在同一只手框（外扩 `expand`）内，或手框面积 ≥ 人体框 `maxHandAreaRatio` | `perception.personGate.hand.*` |
+
+- 缺 bbox/kp/手数据时 **fail-open**：旧导出和测试夹具不会因为少字段被剔除。
+- 被剔除的人不进入 `persons[]` / `verdicts[]` / 动作判定；带 `owner_track_id` 的手会
+  一并过滤，未归属的整帧手部原始检出仍可能留在帧级 `hands[]` 里（不再归属给被剔除的人）。
+- 单人道里腕点被取样管挡住时 `assignHands` 会放弃归属；手部包含门会退而用**整帧手**
+  判定，否则「手+取样管」正好漏掉。多人只用手部归属到该 track 的结果，避免拿别人的手误杀。
+- 阈值来自 4 段真实人物 + light_tube 误检的对比（真实人物 0% 误杀），**换机位必须用
+  自己的素材复核**；profile 可写 `perception.personGate.enabled=false` 关闭。
+- 这是误报护栏，不提高小目标/遮挡的召回；单张图片路径只做姿态几何门，不做手部包含门。
+- **残余**：既没有手部检出、几何又像人的特写仍可能通过（light_tube 225 帧里 2 帧）。
+  仅凭姿态无法区分，要彻底消除需要物体检测的 `person` 证据或分割 mask；当前只在
+  采样窗口里短暂出现，不参与 `operating`。
 
 ## 三·九、判定不可靠的原因（误差识别）
 
@@ -472,6 +498,7 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 | 关节角突变 | > 1500°/s 且间隔 ≤ 250 ms | 33 ms 内跳 110°≈3333°/s（坏点）；100 ms 内跳 100°=1000°/s（真实下蹲） | `signals.angleJump.maxRate` / `maxDtMs` |
 | 左右侧滞回 | 0.15 | 另一侧可见性要高出 0.15 才换侧，防两侧抖动 | `signals.sideHysteresis` |
 | 上半身尺度换算 | 肩宽 × 1.4 | 髋不可信时用肩宽估躯干长；实测肩宽/躯干长 ≈1.25~1.55 | `signals.shoulderToTorso` |
+| 人物有效性门 | bbox 宽/高 ≥0.12、躯干/框高 ≤1.4、锚点可见性 ≥0.4、手框覆盖全身 | 低清晰度特写里「手+取样管」被补成人的几何特征；真实人物 0% 误杀（4 段本机素材） | `perception.personGate.*` |
 | 前/侧平举保持 | 300 ms | 走路摆臂的瞬时命中只持续 ~250 ms | `actions.holds.front` / `side` |
 | 前/侧平举伸直度 | 3D 腕-肩距离 / 躯干长 > 0.85 | 弯臂横在胸前约 0.5~0.8，必须基本伸直才算平举 | `signals.arm.azimuth.minReach` |
 | 腕部 ROI | 1.8 × 躯干长（64~480 px） | 全身构图手只有几十像素，放大后再检；中心归属另行判定 | `signals.hand.roi.mul` / `minPx` / `maxPx` |
@@ -545,6 +572,9 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 
 - **侧别**：ROI 结果的 handedness 由「裁的是哪只腕」决定，不采信 MediaPipe 的 handedness
   （它假设输入是自拍镜像，普通视频会反过来）。裁右腕却检出左手时，按「检出腕点离哪个姿态腕点最近」丢弃。
+  **整帧结果同样纠正**：归属到某个人后，按检出腕点到该人左右姿态腕点的距离填 `L/R`；
+  原始模型值留在 `handedness_raw`，导出里带 `side_from`（`wrist` / `roi`）。两侧腕点都不可见时保留模型输出，不猜。
+  这样逐侧 flag、手势稳定器和离线回放看到的是同一套左右侧。
 - **多人**：整帧检出的手按「腕点离哪个人的姿态腕点最近（按躯干长归一化）」归属到各 track
   （`multi.js` 的 `assignHands`，阈值 0.8×scale），每人只拿自己的手；两人靠得很近时仍可能归属错。
   腕部 ROI 补检按预算给面积最大的前 `min(perception.multi.maxPersons, signals.hand.roi.maxPersonsPerFrame)`
@@ -588,7 +618,9 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 `classifyHand()` 是逐帧的纯函数，结果会在阈值附近闪（「张开→剪刀手」来回跳）。
 `HandShapeStabilizer` 要求同一手势**连续命中 3 帧**才切换，并且判不出来时保留上一次结果 250ms。
 
-- 左右手各一个实例，互不影响（`app.js` 的 `shapeStable.L/R/U`）
+- 每个 `track_id` 各一套 L/R/U 稳定器（`TrackShapeStabilizers`）；单人道固定用 track 0，
+  多人时**先归属、再分类**，A 的连续手势不会推进 B 的候选计数。`app.js` 里的
+  `shapeStable` 就是这个映射，不是全局的 `L/R/U` 三个实例。
 - 首帧不切换：冷启动时先显示「—」正确，而不是把第 1 帧的噪声当成手势
 - 单帧异常不会打掉已稳定的手势
 
@@ -635,7 +667,8 @@ node web/test/signal-compare.mjs --a front.frames.json --b side.frames.json --ac
   此时 `state` 判为不成立（宁可漏判）。≤300ms 的外推只用于**保持连续性**，不用于计数。
 - 手部精细动作（拧、插、拔）不在本层能力范围，需要手部关键点模型。
 - **腕部 ROI 补检（§六·五）解决的是「看不见手」，不保证手型准确**：远景/侧对时手势仍会退化为
-  `unknown`；ROI 结果的左右侧由姿态腕点决定，不采信 MediaPipe 在「自拍镜像输入」假设下的 handedness。
+  `unknown`；左手/右手由姿态腕点纠正在 ROI 与整帧两条路径上统一执行，不采信 MediaPipe 在
+  「自拍镜像输入」假设下的 handedness（原始值见 `handedness_raw`）。
 - **单张图片没有时间窗**：页面把同一帧重复喂 12 次让 Hold/streak 收敛，姿态、手臂动作、手势可用；
   计数这类需要运动的动作在单帧上不成立（也不应假装成立）。
 - **只有上半身**时站/坐/蹲/躺都缺少膝、踝证据，`posture` 不猜站/坐；肩+髋可见时只输出

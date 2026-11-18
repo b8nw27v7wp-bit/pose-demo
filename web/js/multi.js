@@ -102,6 +102,49 @@ export class TrackShapeStabilizers {
 const handSideKey = (hd) => (hd?.handedness === 'Left' ? 'L' : hd?.handedness === 'Right' ? 'R' : 'U');
 
 /**
+ * 检出腕点属于该人的哪一侧：比较到左右姿态腕点的距离，不可见腕点不参与。
+ *
+ * MediaPipe 的 handedness 假设输入是自拍镜像，普通视频会反过来（hands.js 头注释）。
+ * 腕部 ROI 补检已经用姿态腕点纠正；整帧路径也必须用同一判据，否则逐侧 flag
+ * （reachingL/R、operatingL/R…）和手势卡片的左右会互换。
+ *
+ * @returns {'L'|'R'|null} 两侧腕点都不可见时返回 null（保留模型输出）
+ */
+export function wristSideFor(hd, person) {
+  const w = hd?.kp?.[0];
+  if (!w || !person?.kp) return null;
+  const [hx, hy] = w;
+  let side = null;
+  let bestD = Infinity;
+  for (const [s, wi] of [['L', 5], ['R', 6]]) {
+    const q = person.kp[wi];
+    if (!q || !(q[2] >= 0.3)) continue;
+    const d = Math.hypot(q[0] - hx, q[1] - hy);
+    if (d < bestD) { bestD = d; side = s; }
+  }
+  return side;
+}
+
+/**
+ * 把「这个人 + 这只手」的侧别写回手对象。
+ * ROI 结果采信裁剪时用的腕点侧（side_from='roi'）；整帧结果按最近可见腕点。
+ * 原始 handedness 留在 handedness_raw，导出后可审计模型是否标反。
+ */
+function applyHandSide(hd, person) {
+  const side = hd?.side_from === 'roi'
+    ? (hd.handedness === 'Left' ? 'L' : hd.handedness === 'Right' ? 'R' : null)
+    : wristSideFor(hd, person);
+  if (!side) return;
+  const want = side === 'L' ? 'Left' : 'Right';
+  if (hd.handedness !== want) {
+    if (hd.handedness_raw == null) hd.handedness_raw = hd.handedness;
+    hd.handedness = want;
+  }
+  hd.side = side;
+  if (!hd.side_from) hd.side_from = 'wrist';
+}
+
+/**
  * 整帧手部的手势分类 + 按 track 去抖。**必须在 assignHands() 之后调用**：
  * 不先归属就无法知道每只手该推进谁的稳定器。
  *
@@ -187,13 +230,19 @@ export function pickRoiPersons(persons, target, {
  *   2) 最近与次近人的归一化距离差必须 ≥ minMargin（默认 0.15）。
  * ROI 补检结果带 owner_track_id 时直接归给 owner，不受这两道门影响。
  * 单人（有效 persons == 1）完全走旧逻辑，输出与改动前一致。
+ *
+ * 侧别不再直接采信 MediaPipe handedness：归属确定后，整帧手按「检出腕点到该人
+ * 左右姿态腕点的距离」纠正 L/R（普通视频的 handedness 会反过来）。ROI 结果保持
+ * 裁图时确定的侧别。纠正记录在 handedness_raw / side_from。
  */
 export function assignHands(persons, hands, { maxDist = 0.8, minMargin = 0.15 } = {}) {
   const out = new Map();
   const valid = [];
+  const byId = new Map();
   for (const p of persons || []) {
     if (!p || !p.kp || !(p.scale > 0)) continue;
     valid.push(p);
+    byId.set(p.track_id, p);
     out.set(p.track_id, { L: null, R: null, list: [] });
   }
   if (!Array.isArray(hands)) return out;
@@ -210,7 +259,11 @@ export function assignHands(persons, hands, { maxDist = 0.8, minMargin = 0.15 } 
     const owner = hd.owner_track_id;
     if (owner != null) {
       const slot = out.get(owner);
-      if (slot) slot.list.push(hd);
+      if (slot) {
+        const p = byId.get(owner);
+        if (p) applyHandSide(hd, p);
+        slot.list.push(hd);
+      }
       continue;
     }
 
@@ -251,6 +304,7 @@ export function assignHands(persons, hands, { maxDist = 0.8, minMargin = 0.15 } 
 
     const slot = out.get(best.track_id);
     if (!slot) continue;
+    applyHandSide(hd, best.person);
     slot.list.push(hd);
   }
 

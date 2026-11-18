@@ -6,7 +6,7 @@
 
 import { Tracker, iou, area, optimalAssign } from '../js/track.js';
 import {
-  PersonPipelines, assignHands, logLimitFor, LOG_LIMITS,
+  PersonPipelines, assignHands, logLimitFor, LOG_LIMITS, wristSideFor,
   TrackShapeStabilizers, classifyHandsByTrack, bindClassifiedHands, pickRoiPersons,
 } from '../js/multi.js';
 import { readFile } from 'node:fs/promises';
@@ -402,18 +402,72 @@ console.log('\n[6c] 单人归属回归');
   hands.push({ handedness: 'Left', score: 0.9, kp: [[p.kp[5][0], p.kp[5][1]]] });
   hands.push({ handedness: 'Right', score: 0.9, kp: [[p.kp[6][0], p.kp[6][1]]] });
 
+  // 旧算法只看 handedness，而且 assignHands 会就地纠正侧别：先跑副本，再跑新实现。
+  const old = legacyAssign([p], hands.map((h) => ({ ...h })));
   const now = assignHands([p], hands);
-  const old = legacyAssign([p], hands);
-  const sameSlot = (a, b) => {
+  const sameList = (a, b) => {
     const sa = a.get(0);
     const sb = b.get(0);
     if (!sa || !sb) return !sa && !sb;
-    return sa.L === sb.L && sa.R === sb.R
-      && sa.list.length === sb.list.length
-      && sa.list.every((h, i) => h === sb.list[i]);
+    return sa.list.length === sb.list.length
+      && sa.list.every((h, i) => h.kp[0][0] === sb.list[i].kp[0][0]
+        && h.kp[0][1] === sb.list[i].kp[0][1]);
   };
-  check('单人归属与旧算法逐只手一致', sameSlot(now, old),
+  // 人员归属与手列表顺序必须不变；槽位左右侧现在由腕点决定（见 [6f]），
+  // 所以不再要求 L/R 与「只看 handedness」的旧算法逐位一致。
+  check('单人归属（人与手列表）与旧算法一致', sameList(now, old),
     `new=${now.get(0)?.list.length} old=${old.get(0)?.list.length}`);
+}
+
+// —— 6f. 整帧手部左右侧按腕点纠正 ——
+console.log('\n[6f] 手部侧别按姿态腕点纠正');
+{
+  const p = mkPerson({ id: 1, cx: 320 });
+  const mkHand = (x, y, handedness = 'Right', extra = {}) => ({
+    handedness, score: 0.9, kp: [[x, y]], ...extra,
+  });
+
+  // 模型说右手，但检出腕点贴着这个人的左腕 → 左槽
+  const nearL = mkHand(p.kp[5][0], p.kp[5][1], 'Right');
+  const mL = assignHands([p], [nearL]);
+  check('模型 handedness 标反 → 归到左槽',
+    mL.get(1).L === nearL && mL.get(1).R === null);
+  check('handedness 被纠正、原始值保留',
+    nearL.handedness === 'Left' && nearL.handedness_raw === 'Right'
+    && nearL.side === 'L' && nearL.side_from === 'wrist',
+    `${nearL.handedness_raw}→${nearL.handedness}/${nearL.side_from}`);
+
+  // 反向：模型说左手，检出腕点贴右腕 → 右槽
+  const nearR = mkHand(p.kp[6][0], p.kp[6][1], 'Left');
+  const mR = assignHands([p], [nearR]);
+  check('反向标错 → 归到右槽',
+    mR.get(1).R === nearR && nearR.handedness === 'Right' && nearR.handedness_raw === 'Left');
+
+  // 两侧腕点都不可见：判不出侧别，不猜
+  const blind = mkPerson({ id: 2, cx: 320 });
+  blind.kp[5][2] = 0;
+  blind.kp[6][2] = 0;
+  check('双腕不可见 → wristSideFor 返回 null', wristSideFor(nearL, blind) === null);
+
+  // 多人：侧别按「归属到的那个人」的腕点算，不按画面里全局最近的腕点。
+  // B 的左手腕故意贴到 A 的右手腕旁，但手框中心在 A 框内、不在 B 框内 → 归 A。
+  const A = mkPerson({ id: 1, cx: 300 });
+  const B = mkPerson({ id: 2, cx: 500 });
+  A.bbox = [0, 0, 420, 700];
+  B.bbox = [440, 0, 800, 700];
+  B.kp[5] = [356, 188, 0.9];
+  const multiHand = mkHand(356, 188, 'Left', { bbox: [346, 178, 366, 198] });
+  const mm = assignHands([A, B], [multiHand]);
+  check('多人：侧别按归属人的腕点（A 的右手，不是 B 的左手）',
+    mm.get(1).R === multiHand && mm.get(1).L === null && multiHand.handedness === 'Right',
+    `L=${!!mm.get(1).L} R=${!!mm.get(1).R} handedness=${multiHand.handedness}`);
+  check('多人纠偏保留原始 handedness', multiHand.handedness_raw === 'Left');
+
+  // ROI 补检结果采信裁图时的侧别，不按最近腕点覆盖
+  const roi = mkHand(p.kp[6][0], p.kp[6][1], 'Left', { side_from: 'roi', owner_track_id: 1 });
+  const mr = assignHands([p], [roi]);
+  check('ROI 结果保持裁图侧别（不被最近腕点覆盖）',
+    mr.get(1).L === roi && roi.handedness === 'Left' && roi.side_from === 'roi');
 }
 
 // —— 6d. 手势稳定器按 track 隔离 ——

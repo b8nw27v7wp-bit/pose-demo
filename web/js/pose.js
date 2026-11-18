@@ -6,18 +6,32 @@ import { FilesetResolver, PoseLandmarker } from '../vendor/vision_bundle.mjs';
 import { KPT, MP_INDEX, POSE_CONNECTIONS, IDX } from './kpt.js';
 import { headPointsFromRaw } from './geometry.js';
 import { tileRects, mergeTiledPoses } from './tiles.js';
+import { EstimatorSlot, isSuperseded } from './slot.js';
 
 // 关键点格式定义在 kpt.js（纯数据，可被 Node 单测导入），这里只做转出
 export { KPT, MP_INDEX, POSE_CONNECTIONS };
+export { isSuperseded };
 
 let vision = null;
-let landmarker = null;
-let currentKey = '';
+let visionPromise = null;
+const poseSlot = new EstimatorSlot({ supersededMessage: '姿态模型加载被新的请求取代' });
 
 const asset = (p) => new URL(p, import.meta.url).href;
 
+/** wasm 运行时只建一次；并发调用共享同一个 Promise，失败后允许下次重试 */
+async function getVision() {
+  if (vision) return vision;
+  if (!visionPromise) {
+    visionPromise = FilesetResolver.forVisionTasks(asset('../vendor/wasm'))
+      .then((v) => { vision = v; return v; })
+      .finally(() => { visionPromise = null; });
+  }
+  return visionPromise;
+}
+
 /**
  * 创建/切换姿态估计器。模型或 delegate 变化时会重建实例。
+ * 并发创建由 EstimatorSlot 的代次保护：被新请求取代的那份会自我释放并报 superseded。
  * @param {{model?: 'full'|'heavy'|'lite', delegate?: 'GPU'|'CPU', runningMode?: 'VIDEO'|'IMAGE', numPoses?: number}} opts
  */
 export async function createEstimator(opts = {}) {
@@ -31,52 +45,39 @@ export async function createEstimator(opts = {}) {
     trackingConf = 0.5,
   } = opts;
   const key = `${model}|${delegate}|${runningMode}|${numPoses}|${detConf}|${presenceConf}|${trackingConf}`;
-  if (landmarker && key === currentKey) return landmarker;
-
-  if (!vision) {
-    vision = await FilesetResolver.forVisionTasks(asset('../vendor/wasm'));
-  }
-  if (landmarker) {
-    try { landmarker.close(); } catch { /* ignore */ }
-    landmarker = null;
-  }
-
-  landmarker = await PoseLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath: asset(`../models/pose_landmarker_${model}.task`),
-      delegate,
-    },
-    runningMode,
-    numPoses,
-    minPoseDetectionConfidence: detConf,
-    minPosePresenceConfidence: presenceConf,
-    minTrackingConfidence: trackingConf,
+  return poseSlot.acquire(key, async () => {
+    const v = await getVision();
+    return PoseLandmarker.createFromOptions(v, {
+      baseOptions: {
+        modelAssetPath: asset(`../models/pose_landmarker_${model}.task`),
+        delegate,
+      },
+      runningMode,
+      numPoses,
+      minPoseDetectionConfidence: detConf,
+      minPosePresenceConfidence: presenceConf,
+      minTrackingConfidence: trackingConf,
+    });
   });
-  currentKey = key;
-  return landmarker;
 }
 
 export function estimatorInfo() {
-  return { ready: !!landmarker, key: currentKey };
+  return { ready: poseSlot.ready, key: poseSlot.key };
 }
 
-/** 释放 GPU/内存：停止输入或切模型前调用 */
+/** 释放 GPU/内存：停止输入或切模型前调用（在途创建会被作废并自我释放） */
 export function closeEstimator() {
-  if (landmarker) {
-    try { landmarker.close(); } catch { /* ignore */ }
-    landmarker = null;
-  }
-  currentKey = '';
+  poseSlot.close();
 }
 
 export function detectVideo(video, tsMs) {
-  if (!landmarker) throw new Error('estimator not ready');
-  return landmarker.detectForVideo(video, tsMs);
+  if (!poseSlot.current) throw new Error('estimator not ready');
+  return poseSlot.current.detectForVideo(video, tsMs);
 }
 
 export function detectImage(image) {
-  if (!landmarker) throw new Error('estimator not ready');
-  return landmarker.detect(image);
+  if (!poseSlot.current) throw new Error('estimator not ready');
+  return poseSlot.current.detect(image);
 }
 
 // —— 多人估计器（IMAGE 模式）—— -------------------------------------------------
@@ -84,8 +85,7 @@ export function detectImage(image) {
 // max_persons 恒为 1），多人必须走 IMAGE 模式逐帧独立推理 —— 代价是丢掉模型内部的
 // 帧间跟踪，所以 track_id 由我们自己维护（track.js）。两个实例共用同一份 wasm 运行时，
 // 不会重复下载。
-let multiLandmarker = null;
-let multiKey = '';
+const multiSlot = new EstimatorSlot({ supersededMessage: '多人姿态模型加载被新的请求取代' });
 
 export async function createMultiEstimator(opts = {}) {
   const {
@@ -95,38 +95,30 @@ export async function createMultiEstimator(opts = {}) {
     detConf = 0.3, presenceConf = 0.3,
   } = opts;
   const key = `${model}|${delegate}|${numPoses}|${detConf}|${presenceConf}`;
-  if (multiLandmarker && key === multiKey) return multiLandmarker;
-
-  if (!vision) vision = await FilesetResolver.forVisionTasks(asset('../vendor/wasm'));
-  closeMultiEstimator();
-
-  multiLandmarker = await PoseLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: asset(`../models/pose_landmarker_${model}.task`), delegate },
-    runningMode: 'IMAGE',   // 关键：IMAGE 模式才会返回多个人
-    numPoses: Math.max(1, Math.min(4, numPoses | 0)),
-    minPoseDetectionConfidence: detConf,
-    minPosePresenceConfidence: presenceConf,
+  return multiSlot.acquire(key, async () => {
+    const v = await getVision();
+    return PoseLandmarker.createFromOptions(v, {
+      baseOptions: { modelAssetPath: asset(`../models/pose_landmarker_${model}.task`), delegate },
+      runningMode: 'IMAGE',   // 关键：IMAGE 模式才会返回多个人
+      numPoses: Math.max(1, Math.min(4, numPoses | 0)),
+      minPoseDetectionConfidence: detConf,
+      minPosePresenceConfidence: presenceConf,
+    });
   });
-  multiKey = key;
-  return multiLandmarker;
 }
 
 export function multiEstimatorInfo() {
-  return { ready: !!multiLandmarker, key: multiKey };
+  return { ready: multiSlot.ready, key: multiSlot.key };
 }
 
 export function closeMultiEstimator() {
-  if (multiLandmarker) {
-    try { multiLandmarker.close(); } catch { /* ignore */ }
-    multiLandmarker = null;
-  }
-  multiKey = '';
+  multiSlot.close();
 }
 
 /** IMAGE 模式下 detect() 可以直接吃 HTMLVideoElement / canvas / ImageBitmap，取当前帧 */
 export function detectMultiImage(source) {
-  if (!multiLandmarker) throw new Error('multi estimator not ready');
-  return multiLandmarker.detect(source);
+  if (!multiSlot.current) throw new Error('multi estimator not ready');
+  return multiSlot.current.detect(source);
 }
 
 /**
@@ -135,9 +127,9 @@ export function detectMultiImage(source) {
  * 切块/去重几何在 tiles.js（纯函数，Node 可单测）。
  */
 export function detectMultiTiled(source, w, h, { tiles = 2, overlap = 0.2, maxPoses = 3 } = {}) {
-  if (!multiLandmarker) throw new Error('multi estimator not ready');
+  if (!multiSlot.current) throw new Error('multi estimator not ready');
   const rects = tileRects(w, h, tiles, overlap);
-  if (rects.length === 1) return multiLandmarker.detect(source);
+  if (rects.length === 1) return multiSlot.current.detect(source);
 
   let canvas = tiledCanvas;
   if (!canvas) canvas = tiledCanvas = document.createElement('canvas');
@@ -150,7 +142,7 @@ export function detectMultiTiled(source, w, h, { tiles = 2, overlap = 0.2, maxPo
     canvas.width = tw;
     canvas.height = th;
     ctx.drawImage(source, r.x, r.y, r.w, r.h, 0, 0, tw, th);
-    const res = multiLandmarker.detect(canvas);
+    const res = multiSlot.current.detect(canvas);
     const lms = res?.landmarks || [];
     for (let i = 0; i < lms.length; i++) {
       const lm = lms[i];

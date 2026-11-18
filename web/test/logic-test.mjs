@@ -1026,6 +1026,19 @@ console.log('\n[22] 拿取与手臂扩展');
   check('无手部数据 → 不判持物', r8.flags.carrying === false);
   check('无手部数据 → 不判拿取', r8.reps.grasp === 0);
 
+  // 拿取完成后松开一瞬又合上：signals.grasp.releaseMs=200 内不能多计一次
+  const aeG = new ActionEngine();
+  let tG = 0; let rG;
+  for (let i = 0; i < 6; i++) rG = aeG.update(mkSig(), tG += 100, hands('open', null));
+  for (let i = 0; i < 6; i++) rG = aeG.update(mkSig(), tG += 100, hands('fist', null));
+  check('拿取计数建立', rG.reps.grasp === 1, `grasp=${rG.reps.grasp}`);
+  rG = aeG.update(mkSig(), tG += 100, hands('open', null));    // 只松开 1 帧
+  for (let i = 0; i < 3; i++) rG = aeG.update(mkSig(), tG += 100, hands('fist', null));
+  check('松开不足 releaseMs 就合上 → 不计第二次', rG.reps.grasp === 1, `grasp=${rG.reps.grasp}`);
+  for (let i = 0; i < 3; i++) rG = aeG.update(mkSig(), tG += 100, hands('open', null)); // 持续张开
+  for (let i = 0; i < 3; i++) rG = aeG.update(mkSig(), tG += 100, hands('fist', null));
+  check('持续张开满 releaseMs 后再合手 → 计第二次', rG.reps.grasp === 2, `grasp=${rG.reps.grasp}`);
+
   // 手必须和伸出的那条臂对应：左臂伸出但左手未检出，右手在身侧张开，
   // 不能拿右手的状态去判「伸手」/「指向」。
   const ae8b = new ActionEngine();
@@ -1081,6 +1094,49 @@ console.log('\n[23] PhaseSequence');
   seq3.update('reach', 0);
   const d = seq3.update(null, 100);
   check('观察到 null 不前进', d.count === 0);
+
+  // releaseMs：完成后必须连续看到第一阶段足够久才解除闭锁（防松开一瞬又合上多计）
+  const seq4 = new PhaseSequence(['reach', 'grasp'], {
+    minPhaseMs: 0, maxPhaseMs: 5000, completeAt: 'grasp', releaseMs: 200,
+  });
+  seq4.update('reach', 0);
+  const e1 = seq4.update('grasp', 100);
+  check('releaseMs 前：先完成一次', e1.count === 1);
+  seq4.update('reach', 200);                    // 张开 1 帧
+  const e2 = seq4.update('grasp', 300);         // 又合上：不能算下一次
+  check('releaseMs 内重新合手 → 不计数', e2.count === 1, `count=${e2.count}`);
+  seq4.update('reach', 400);                    // 重新张开
+  seq4.update('reach', 500);                    // 只过了 100ms
+  const e3 = seq4.update('grasp', 600);
+  check('连续张开不足 releaseMs → 仍不计数', e3.count === 1, `count=${e3.count}`);
+  seq4.update('reach', 700);                    // 重新开始计时
+  seq4.update('reach', 800);
+  seq4.update('reach', 900);                    // 700→900 连续张开 200ms ≥ releaseMs
+  const e4 = seq4.update('grasp', 1000);
+  check('连续张开满 releaseMs → 允许下一次', e4.count === 2, `count=${e4.count}`);
+
+  // 时间基从 0 开始：releaseSince 不能用 0 当「未开始」的哨兵
+  const seq0 = new PhaseSequence(['reach', 'grasp'], {
+    minPhaseMs: 0, maxPhaseMs: 5000, completeAt: 'grasp', releaseMs: 200,
+  });
+  seq0.update('reach', 0);
+  seq0.update('grasp', 100);
+  seq0.update('reach', 200);
+  const g0 = seq0.update('grasp', 250);
+  check('ts 从 0 起也不把 releaseSince=0 当已满', g0.count === 1, `count=${g0.count}`);
+  seq0.update('reach', 300);
+  seq0.update('reach', 400);
+  seq0.update('reach', 500);
+  const g1 = seq0.update('grasp', 600);
+  check('ts 从 0 起连续张开满 releaseMs 仍能再计', g1.count === 2, `count=${g1.count}`);
+
+  // 默认 releaseMs=0：单帧张开即可重新开始（旧行为逐位不变）
+  const seq5 = new PhaseSequence(['reach', 'grasp'], { minPhaseMs: 0, maxPhaseMs: 5000, completeAt: 'grasp' });
+  seq5.update('reach', 0);
+  seq5.update('grasp', 100);
+  seq5.update('reach', 200);
+  const f = seq5.update('grasp', 300);
+  check('releaseMs=0 保持旧行为：张开 1 帧即可再计', f.count === 2, `count=${f.count}`);
 }
 
 // —— 24. 前平举 / 侧平举：方位角必须配「手臂接近水平」——

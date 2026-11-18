@@ -139,11 +139,14 @@ export function detectHandsNearWrists(source, wrists, cfg, frame, allWrists = wr
     const side = nearestWristSide(box.x + best.kp[0][0], box.y + best.kp[0][1], allWrists);
     if (side !== w.side) continue;
 
+    const want = w.side === 'L' ? 'Left' : 'Right';
     out.push({
       ...offsetHand(best, box.x, box.y),
       // 侧别采信姿态腕点：MediaPipe 的 handedness 假设自拍镜像输入，
       // 上传的普通视频会被反过来，用腕点归一化后就不受这条约定影响。
-      handedness: w.side === 'L' ? 'Left' : 'Right',
+      handedness: want,
+      // 模型原始输出留档（与整帧路径的 handedness_raw 同口径），便于审计镜像标反
+      ...(best.handedness && best.handedness !== want ? { handedness_raw: best.handedness } : {}),
       side_from: 'roi',
     });
   }

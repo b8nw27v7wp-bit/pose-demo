@@ -79,7 +79,8 @@ export class ActionEngine {
     this.openShapes = new Set(cfg.signals.hand.openShapes);
     this.pointShapes = new Set(cfg.signals.hand.pointShapes);
     this.carryCfg = cfg.signals.arm.carry;
-    // 姿态只有站/坐；计数只剩鼓掌（深蹲/俯卧撑已下线，见 buildPostures 的说明）。
+    // 姿态只有站/坐/两个上半身推断；在用计数只剩拿取（grasp），鼓掌已 retired，
+    // 深蹲/俯卧撑已下线（见 buildPostures 的说明）。
     this.postures = buildPostures(this.cfg);
     this.postureHolds = new Map(this.postures.map((p) => [p.id, new Hold(p.minMs)]));
     this.streaks = new Map(this.postures.map((p) => [p.id, 0]));
@@ -106,6 +107,8 @@ export class ActionEngine {
       minPhaseMs: this.graspCfg.minPhaseMs,
       maxPhaseMs: this.graspCfg.reachToGraspMs,
       completeAt: 'grasp',
+      // 张手后要连续保持多久才算「放下」并允许下一次拿取（防松开一瞬又合上多计）
+      releaseMs: this.graspCfg.releaseMs,
     });
     this.graspCount = 0;
     this.graspPhase = 'idle';

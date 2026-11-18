@@ -327,6 +327,113 @@ export function personBoxValidity(bbox, frameW, frameH, visShoulder, visTorso, c
   return out;
 }
 
+const PERSON_ANCHORS_HEAD = [0, 1, 2, 7, 8]; // 鼻尖 + 双肩 + 双髋（手部包含门）
+
+/**
+ * 姿态人物有效性门（perception.personGate）。
+ *
+ * 低清晰度特写里 MediaPipe 会把「手 + 取样管」补成一个人：鼻子/双肩/双髋可见度都很高，
+ * 但 bbox 可能是 62×599 的细长条，躯干比 bbox 还长。真人不会出现这些几何。
+ * 判定只使用姿态本身（不依赖手部模型），缺 bbox/kp 时 fail-open——旧数据/测试夹具
+ * 不因为少字段被判掉。
+ */
+export function personPlausibility(person, frameW, frameH, cfg = {}) {
+  const enabled = cfg?.enabled !== false;
+  const out = {
+    enabled, ok: true, known: false, reasons: [],
+    aspect: null, torso_h: null, anchor_vis: null, score: null,
+  };
+  if (!enabled) return out;
+
+  const bbox = person?.bbox;
+  if (!Array.isArray(bbox) || bbox.length < 4 || !bbox.slice(0, 4).every(isNum)) return out;
+  const bw = bbox[2] - bbox[0];
+  const bh = bbox[3] - bbox[1];
+  if (!(bw > 0 && bh > 0)) return out;
+  const kp = person?.kp;
+  if (!Array.isArray(kp) || kp.length < 9) return out;
+  const shL = kp[1], shR = kp[2], hipL = kp[7], hipR = kp[8];
+  if (![shL, shR, hipL, hipR].every((p) => Array.isArray(p) && isNum(p[0]) && isNum(p[1]))) return out;
+
+  out.known = true;
+  out.score = isNum(person.score) ? person.score : null;
+  out.aspect = bw / bh;
+  const shMid = [(shL[0] + shR[0]) / 2, (shL[1] + shR[1]) / 2];
+  const hipMid = [(hipL[0] + hipR[0]) / 2, (hipL[1] + hipR[1]) / 2];
+  const torso = Math.hypot(shMid[0] - hipMid[0], shMid[1] - hipMid[1]);
+  out.torso_h = torso / bh;
+  const vis = [shL[2], shR[2], hipL[2], hipR[2]].filter(isNum);
+  out.anchor_vis = vis.length ? Math.min(...vis) : null;
+
+  if (out.score != null && Number.isFinite(cfg.minScore) && out.score < cfg.minScore) {
+    out.reasons.push('low_score');
+  }
+  if (out.anchor_vis != null && Number.isFinite(cfg.minAnchorVis) && out.anchor_vis < cfg.minAnchorVis) {
+    out.reasons.push('low_anchor_vis');
+  }
+  if (Number.isFinite(cfg.minAspect) && out.aspect < cfg.minAspect) out.reasons.push('bbox_too_narrow');
+  if (Number.isFinite(cfg.maxAspect) && out.aspect > cfg.maxAspect) out.reasons.push('bbox_too_wide');
+  if (Number.isFinite(cfg.maxTorsoHeight) && out.torso_h > cfg.maxTorsoHeight) {
+    out.reasons.push('torso_too_long');
+  }
+  out.ok = out.reasons.length === 0;
+  return out;
+}
+
+/**
+ * 手部包含门：真人整块身体（鼻/肩/髋）不会落在同一只手的 bbox 里。
+ * 低清晰度特写里「手 + 取样管」被补成的人会满足下面任一条：
+ *   - 至少 minAnchors 个锚点落在手框（外扩 expand）内；
+ *   - 手框面积 ≥ 人体框的 maxHandAreaRatio；
+ *   - 全部关键点几乎都在手框里（minAllKp）。
+ * 没有手数据/缺字段时不做判定（fail-open）。
+ */
+export function personCoveredByHand(person, hands, cfg = {}) {
+  const out = { enabled: cfg?.enabled !== false, covered: false, known: false, reasons: [],
+    anchors_inside: null, hand_area_ratio: null, kp_inside: null };
+  if (!out.enabled) return out;
+  const bbox = person?.bbox;
+  const kp = person?.kp;
+  if (!Array.isArray(bbox) || bbox.length < 4 || !Array.isArray(kp) || kp.length < 9) return out;
+  if (!Array.isArray(hands) || !hands.length) return out;
+
+  const bw = bbox[2] - bbox[0];
+  const bh = bbox[3] - bbox[1];
+  if (!(bw > 0 && bh > 0)) return out;
+  const personArea = bw * bh;
+  const expand = Number.isFinite(cfg.expand) ? cfg.expand : 0.15;
+  const minAnchors = Number.isFinite(cfg.minAnchors) ? cfg.minAnchors : 4;
+  const maxRatio = Number.isFinite(cfg.maxHandAreaRatio) ? cfg.maxHandAreaRatio : 0.5;
+  const minAllKp = Number.isFinite(cfg.minAllKp) ? cfg.minAllKp : 9;
+
+  out.known = true;
+  out.anchors_inside = 0;
+  out.hand_area_ratio = 0;
+  out.kp_inside = 0;
+  for (const hand of hands) {
+    const hb = hand?.bbox;
+    if (!Array.isArray(hb) || hb.length < 4 || !hb.slice(0, 4).every(isNum)) continue;
+    const hw = hb[2] - hb[0];
+    const hh = hb[3] - hb[1];
+    if (!(hw > 0 && hh > 0)) continue;
+    const box = [hb[0] - hw * expand, hb[1] - hh * expand, hb[2] + hw * expand, hb[3] + hh * expand];
+    const inside = (p) => Array.isArray(p) && isNum(p[0]) && isNum(p[1])
+      && p[0] >= box[0] && p[0] <= box[2] && p[1] >= box[1] && p[1] <= box[3];
+    const anchors = PERSON_ANCHORS_HEAD.filter((i) => inside(kp[i])).length;
+    const all = kp.filter((p) => inside(p)).length;
+    const ratio = (hw * hh) / personArea;
+    out.anchors_inside = Math.max(out.anchors_inside, anchors);
+    out.kp_inside = Math.max(out.kp_inside, all);
+    out.hand_area_ratio = Math.max(out.hand_area_ratio, ratio);
+    if (anchors >= minAnchors) out.reasons.push('anchors_in_hand');
+    if (ratio >= maxRatio) out.reasons.push('hand_covers_body');
+    if (all >= minAllKp) out.reasons.push('all_kp_in_hand');
+  }
+  out.reasons = [...new Set(out.reasons)];
+  out.covered = out.reasons.length > 0;
+  return out;
+}
+
 /** MediaPipe 33 点 raw → 9 个头部点（像素 + visibility）；数据不足返回 null。 */
 export function headPointsFromRaw(raw33, frameW, frameH) {
   const fw = Number(frameW);

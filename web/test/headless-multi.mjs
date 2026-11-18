@@ -138,6 +138,24 @@ try {
       ppe.length > 0 && ppe.every((x) => x === 'unknown' || x === 'no-ppe'), ppe.join(','));
   }
 
+  console.log('\n[3b] 录完关掉物体检测：导出 meta 仍保留模型指纹');
+  const metaOn = await cdp.eval('window.__pose.exportMeta');
+  const failed = await cdp.eval('window.__pose.failObjectDetectionForTest()');
+  const metaOff = await cdp.eval('window.__pose.exportMeta');
+  check('模拟运行中失败后开关已关', !!(failed && failed.objectOn === false));
+  check('exportMeta.objects 没有变成 null', !!(metaOff && metaOff.objects), JSON.stringify(metaOff && metaOff.objects));
+  check('后端/模型/输入尺寸与记录时一致',
+    !!(metaOn?.objects && metaOff?.objects
+      && metaOff.objects.backend === metaOn.objects.backend
+      && metaOff.objects.model === metaOn.objects.model
+      && metaOff.objects.inputSize === metaOn.objects.inputSize),
+    `${metaOn?.objects?.backend}/${metaOn?.objects?.model}`);
+  check('模型/类别指纹没有丢',
+    !!(metaOn?.objects && metaOff?.objects
+      && metaOff.objects.modelHash === metaOn.objects.modelHash
+      && metaOff.objects.labelsHash === metaOn.objects.labelsHash
+      && metaOff.objects.manifestOk === metaOn.objects.manifestOk));
+
   console.log('\n[4] 恢复单人');
   await cdp.eval(`(() => {
     const el = document.getElementById('chkMulti');

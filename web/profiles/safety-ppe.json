@@ -1,7 +1,7 @@
 {
   "name": "safety-ppe",
   "model": "full",
-  "note": "PPE 冒烟 profile：物体检测走自训 YOLOv8n→ONNX（onnxruntime-web），不是 MediaPipe。labels 的顺序必须与训练时 eval-data/ppe-yolo/data.yaml 的 names 完全一致；换模型时一起改。冒烟模型只有 623 张训练图，精度只够验证链路，不能当作考核指标。",
+  "note": "PPE 冒烟 profile：物体检测走自训 YOLOv8n→ONNX（onnxruntime-web），不是 MediaPipe。labels 的顺序必须与训练时 eval-data/ppe-yolo/data.yaml 的 names 完全一致；换模型时一起改。冒烟模型只有 623 张训练图，精度只够验证链路，不能当作考核指标。maxLostMs=2000 的理由同 safety.json（MOT17 慢放两轮：ID 切换 67~73/782~787 vs 1500 的 80~87/799~808）。",
   "params": {
     "perception": {
       "multi": { "enabled": true, "maxPersons": 3 },

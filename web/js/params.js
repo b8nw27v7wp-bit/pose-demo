@@ -264,6 +264,8 @@ export const DEFAULT_PARAMS = {
         halfMul: 1.0,        // × headBoxScale
       },
       // 手套区域优先用手部 21 点 bbox；手没检出/没归属时退回腕点方框。
+      // fallbackWrist=false 时不退回腕点（避免拿腕点方框冒充手套区域），
+      // 该侧直接报 unknown/no_hand。
       gloveHand: {
         enabled: true,
         pad: 0.15,           // × hand bbox 长边
@@ -273,9 +275,6 @@ export const DEFAULT_PARAMS = {
       },
       // 本场从未检出过该类正例 → 只报 unknown。模型类别名写错时防止满屏误报。
       requirePositive: true,
-      // R13-5：物体框归属给人的方式（预留，物体线尚未接线，本轮只加键）。
-      // 目标：'center' = 物体框中心落在人的头/腕区域；'exclusive' = 一人一物约束。
-      assignment: 'center',
       // R13-10：「本场有正例」的收紧口径。0 = 旧行为（整场 sticky）；
       // >0 时只看最近 positiveWindowMs 内是否至少出现 minPositive 次正例。
       positiveWindowMs: 0,
@@ -300,9 +299,6 @@ export const DEFAULT_PARAMS = {
     multi: {
       enabled: false, maxPersons: 3, detConf: 0.3, presenceConf: 0.3,
       tiles: 1, tileOverlap: 0.2,
-      // R12-3：平铺策略。'off' = 只看 tiles；'always' = 每帧平铺；
-      // 'auto' 预留给「连续 N 帧检出 <1 人时启用平铺一段」的自适应逻辑（本轮只加键）。
-      tileMode: 'off',
     },
     // 单人道漏检补救：VIDEO 模式没检出人时，用 IMAGE 模式（detConf 0.3）在同一帧补检一次。
     // VIDEO 模式的模型内跟踪在正常帧上更稳，所以只在漏检帧付这次推理，不替换主路径。
@@ -315,6 +311,29 @@ export const DEFAULT_PARAMS = {
       // 近景/特写里「面积最大的人」可能是被凑成人的手和设备；换机位前不要凭感觉改。
       target: 'largest',
       targetMinAspect: 0.9,
+    },
+
+    // 人物有效性门：低清晰度特写里 MediaPipe 会把「手 + 取样管/瓶子」补成一个完整的人
+    // （2026-11-17 light_tube 实测：鼻子/双肩/双髋可见性都接近 1，但 bbox 是 62×599 的
+    // 细长条，躯干比 bbox 还长；UI 显示「上半身直立」并触发 operating）。
+    // 这里只剔除**几何上不可能**的「人」，再用已归属的手做第二道门：
+    // 真人的鼻/肩/髋不会整体落在同一只手框里。
+    // 阈值来自本机 4 段真实人物素材（b787/transformer/a320/走路）+ light_tube 误检的对比：
+    // 保守值在 real-good 上 0% 误杀。拿不到 bbox/kp/手时 fail-open。
+    personGate: {
+      enabled: true,
+      minScore: 0.55,          // 低置信「人」直接不判（real-good P1 0.60）
+      minAnchorVis: 0.4,       // 双肩+双髋最低可见性（real-good P1 0.58）
+      minAspect: 0.12,         // bbox 宽/高；细长条（取样管）通常 <0.12
+      maxAspect: null,         // 宽/高上限，默认关：手臂张开/出画会让 bbox 变宽，先不误杀
+      maxTorsoHeight: 1.4,     // 躯干长/bbox 高；>1.4 说明 bbox 不可能装下这个躯干
+      hand: {
+        enabled: true,
+        expand: 0.15,          // 手框外扩比例（手部 bbox 比 21 点紧）
+        minAnchors: 4,         // 鼻/双肩/双髋至少 4 个落在手框里
+        maxHandAreaRatio: 0.5, // 手框面积 ≥ 人体框 50%
+        minAllKp: 9,           // 或 13 点里至少 9 个在手框里
+      },
     },
 
     objects: {
@@ -340,10 +359,6 @@ export const DEFAULT_PARAMS = {
       // R13-1：没有模型清单（类别顺序/输入尺寸/许可）时拒绝加载自训权重，
       // 避免「权重换了、类别顺序没换」静默产出错误标签。物体线读这个键。
       requireManifest: true,
-      // R13-3：只在物体 ROI 内推理（预留，物体线尚未接线，本轮只加键）。
-      // source：'head'|'person'；expand 为 bbox 外扩倍数；minPx 是 ROI 最小边长
-      // （太小就退回整帧），maxPerFrame 限制每帧 ROI 数（成本上限）。
-      roi: { enabled: false, source: 'head', expand: 1.5, minPx: 96, maxPerFrame: 4 },
     },
   },
 
@@ -360,7 +375,7 @@ export const DEFAULT_PARAMS = {
     },
     holds: {
       arm: 300, wave: 150, crossed: 400, hips: 400, open: 400,
-      handFace: 350, handChest: 350, bothHandsUp: 350,
+      handFace: 350, bothHandsUp: 350,
       reach: 250, carry: 300, point: 250,
       // 操作设备是「持续在做」的事件：800ms 才成立，单帧伸手不计。
       // operatingMaxGap：允许 300ms 内的短暂掉帧/遮挡不重置计时（手腕常被面板挡住）。

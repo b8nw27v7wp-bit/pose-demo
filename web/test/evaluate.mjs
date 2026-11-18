@@ -840,6 +840,7 @@ const SIGNAL_GETTERS = {
   azimuth_L: (s) => s.armPose.azimuth_L,
   azimuth_R: (s) => s.armPose.azimuth_R,
   hands_close: (s) => s.armPose.hands_close,
+  near_equipment_overlap: (s) => s.arm.near_equipment_overlap,
   wave_flips: (s) => Math.max(s.wave.L, s.wave.R),
   wave_amp: (s) => s.wave.amp,
 };
@@ -848,6 +849,9 @@ const SIGNAL_GETTERS = {
 const SIGNALS_FOR = {
   stand: ['uprightness', 'knee', 'leg_vertical'],
   sit: ['knee', 'uprightness', 'leg_vertical'],
+  // 上半身姿态只凭躯干朝向判；没有腿证据，所以只看 uprightness。
+  upper_upright: ['uprightness'],
+  upper_lean: ['uprightness'],
   armRaised: ['elev_L', 'elev_R', 'elev_torso_L', 'elev_torso_R'],
   bothHandsUp: ['elev_L', 'elev_R', 'elev_torso_L', 'elev_torso_R', 'reach_L', 'reach_R'],
   waving: ['elev_L', 'elev_R', 'wave_flips', 'wave_amp'],
@@ -855,6 +859,8 @@ const SIGNALS_FOR = {
   onHips: ['reach_L', 'reach_R', 'hands_close'],
   armsOpen: ['elev_L', 'elev_R', 'reach_L', 'reach_R'],
   handAtHead: ['reach_head_L', 'reach_head_R'],
+  // 油样取样：腕-鼻距离 + 3D 方位角（无 3D 时方位角为 NaN，退化成纯距离）
+  oilSample: ['reach_head_L', 'reach_head_R', 'azimuth_L', 'azimuth_R'],
   // §12.7：这 5 个动作靠「臂是否伸出 + 抬臂角/方位角」判定；手部开合状态不在信号层，
   // 但漏判时看这几列仍能判断是信号没到阈值还是手部没检出。
   reaching: ['reach_L', 'reach_R', 'elev_L', 'elev_R'],
@@ -862,6 +868,11 @@ const SIGNALS_FOR = {
   pointing: ['reach_L', 'reach_R', 'elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
   armFront: ['elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
   armSide: ['elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
+  // 操作设备：ROI/设备框命中不是标量信号，失败时先用 reach/elev 判断「手是否伸出/抬高」；
+  // 具体 gate（not_near/no_grip/...）仍在导出帧的 signals.operating_gate* 里。
+  operating: ['reach_L', 'reach_R', 'elev_L', 'elev_R'],
+  // 上下文事件：人体框与设备区域的重叠比例直接决定成立与否。
+  nearEquipment: ['near_equipment_overlap'],
   grasp: ['reach_L', 'reach_R', 'elev_L', 'elev_R'],
   clap: ['hands_close'],
   [NO_ARM]: ['elev_L', 'elev_R', 'hands_close', 'reach_L', 'reach_R'],

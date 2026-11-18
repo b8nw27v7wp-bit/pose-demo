@@ -1,7 +1,7 @@
 {
   "name": "safety",
   "model": "full",
-  "note": "工业/工地安全场景示例 profile：多人 + 物体检测 + PPE。只写与默认值不同的键。类别名必须与检测模型的 label map 对上；换成自训的 helmet/glove 模型后按实际类别名改。数值是量级参考，必须用本项目实拍素材校准后再用于考核。",
+  "note": "工业/工地安全场景示例 profile：多人 + 物体检测 + PPE。只写与默认值不同的键。类别名必须与检测模型的 label map 对上；换成自训的 helmet/glove 模型后按实际类别名改。数值是量级参考，必须用本项目实拍素材校准后再用于考核。maxLostMs=2000：MOT17 慢放 0.4x A/B（2026-11-17，两轮）ID 切换 67~73/782~787 vs 1500 的 80~87/799~808，TopK 召回约 19.1%~19.2% vs 19.3%~19.4%（基本不变），用于减少遮挡后换 id 导致的 PPE 计时重置。",
   "params": {
     "perception": {
       "multi": { "enabled": true, "maxPersons": 3 },

@@ -232,18 +232,22 @@ export class RepCounter {
  * 用多个独立 Hold 拼不出来——Hold 不知道「先后顺序」，也不会在超时后复位。
  *
  * @param {string[]} phases 阶段名，按期望顺序
- * @param {{minPhaseMs?:number, maxPhaseMs?:number, completeAt?:string}} opts
+ * @param {{minPhaseMs?:number, maxPhaseMs?:number, completeAt?:string, releaseMs?:number}} opts
  *   minPhaseMs：每阶段最短持续，滤单帧抖动
  *   maxPhaseMs：每阶段最长持续时间，超时回到第一阶段（防止卡死在中间阶段）
  *   completeAt：走到这个阶段就算完成一次并回到第一阶段
+ *   releaseMs：完成后要连续看到第一阶段多久才解除闭锁（0 = 旧行为，单帧即可）
  */
 export class PhaseSequence {
-  constructor(phases, { minPhaseMs = 120, maxPhaseMs = 1500, completeAt = null } = {}) {
+  constructor(phases, {
+    minPhaseMs = 120, maxPhaseMs = 1500, completeAt = null, releaseMs = 0,
+  } = {}) {
     if (!phases || !phases.length) throw new Error('PhaseSequence 需要至少一个阶段');
     this.phases = phases;
     this.minPhaseMs = minPhaseMs;
     this.maxPhaseMs = maxPhaseMs;
     this.completeAt = completeAt || phases[phases.length - 1];
+    this.releaseMs = Math.max(0, Number(releaseMs) || 0);
     this.reset();
   }
 
@@ -255,6 +259,9 @@ export class PhaseSequence {
     this.started = false;
     // done：刚完成一次，必须回到第一阶段才能再次计数，否则握着手不动会逐帧累加。
     this.done = false;
+    // done 后连续看到第一阶段的起点（releaseMs 用；中途掉帧要重新计时）
+    // 用 null 而不是 0：确定性回放的 ts 可能从 0 开始，0 不能当「未开始」
+    this.releaseSince = null;
   }
 
   /** 当前阶段名 */
@@ -275,11 +282,18 @@ export class PhaseSequence {
     }
 
     if (this.done) {
-      // 闭锁：要重新看到第一阶段（例如手重新张开再伸）才允许下一次
+      // 闭锁：要重新看到第一阶段（例如手重新张开再伸）并持续 releaseMs 才允许下一次。
+      // releaseMs 治「松开一瞬间又合上」——单帧张开就把 done 清掉会让抖动多计一次。
       if (observed === this.phases[0]) {
-        this.done = false;
-        this.started = true;
-        this.enteredAt = ts;
+        if (this.releaseSince == null) this.releaseSince = ts;
+        if (ts - this.releaseSince >= this.releaseMs) {
+          this.done = false;
+          this.started = true;
+          this.enteredAt = ts;
+          this.releaseSince = null;
+        }
+      } else {
+        this.releaseSince = null;
       }
       return { phase: this.phase, count: this.count, completed: false };
     }
@@ -300,6 +314,7 @@ export class PhaseSequence {
         this.index = 0;
         this.started = false;
         this.done = true;
+        this.releaseSince = null;
       }
     }
 
@@ -583,7 +598,12 @@ export class SignalEngine {
       this.lastScale = scale;
     }
     scale = this.scaleWin.push(scale);
-    if (!(scale > 5)) scale = Math.max(person.scale, 1);
+    // 旧导出/手搓数据可能没有 scale：不能把 undefined 传进 Math.max（结果是 NaN，
+    // 后面所有距离比值都会变成 NaN）。没有可用尺度时退回 1，至少保证信号是有限数。
+    if (!(scale > 5)) {
+      const fallback = Number(person.scale);
+      scale = Number.isFinite(fallback) && fallback > 0 ? Math.max(fallback, 1) : 1;
+    }
 
     // —— worldLandmarks（米制 3D）：有则优先，无则逐信号退回 2D ——
     const w3 = WC.enabled && person.kp_world && person.kp_world.length >= 33

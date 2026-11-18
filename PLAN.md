@@ -1,6 +1,6 @@
 # 通用人体姿态识别 —— 感知 Demo + 动作识别引擎 落地计划
 
-版本 v1.2 ｜ 2026-11-05 ｜ 状态：P1 已交付；§12.3 的参数层与评估器已落地；§13 的 R0~R7 工具链已落地；**§16–§18 是审核后的两线补全与优化计划（姿态 / 物体·PPE）**
+版本 v1.2 ｜ 2026-11-05 ｜ 状态：P1 已交付；§12.3 的参数层与评估器已落地；§13 的 R0~R7 工具链已落地；**§16–§18 是审核后的两线补全与优化计划（姿态 / 物体·PPE）；§19 是 2026-11-17 的现状快照与 11-09~11-17 落地记录**
 （计划里的 v0.1 为「机场加油车作业合规识别」专用版，已废弃，本文件取代它；
 当前仓库的**初始版**是 `package.json` 0.1.0，只交付浏览器 Demo + 评估/采集工具链）
 
@@ -1189,6 +1189,9 @@ fps 3.7~5.2 是无头环境 + 三种模型同开的结果，真机需自测。
 
 ### 16.2 现状与缺口
 
+> 本节是 **2026-11-05 审核快照**；动作集、测试数与部分落地项在 11-09 ~ 11-17 已变化，
+> 当前值见 §19。本表保留原样，用于追溯当时的判断依据。
+
 | 能力 | 已验证 | 缺口 | 证据 |
 |---|---|---|---|
 | 单人姿态 33 点 + worldLandmarks | 无头页面、样例视频、上半身裁图 60/60 `ok=true` | 没有实拍动作准确率 | `README.md:142,416`；`web/js/pose.js:191-230` |
@@ -1644,6 +1647,86 @@ fps 3.7~5.2 是无头环境 + 三种模型同开的结果，真机需自测。
 
 **仍未开工**：R2/R4/R7（需实拍）、R11-2（640 + 头部 ROI）、R13-4~R13-9、R12-3~R12-7。实拍与全量数据下载仍是两条线共同的阻塞项。
 R12-2 的遗留：ROI 预算按「人数」而非推理次数计（2 人各缺两侧最多 4 次/帧，PLAN 的 ≤2 次/帧与 fps 指标未实测）；margin 门对并肩/交叉会弃权偏多。
+
+---
+
+## 19. 2026-11-17 现状快照（全量代码审核时补记）
+
+> §16/§17 是 2026-11-05 的计划与审核快照，之后又合入了 11-09 ~ 11-17 的改动。
+> 本节只记录**当前代码实际状态**，避免把旧计划里的动作数/测试数当成现状。
+
+### 19.1 动作注册表与测试
+
+| 项 | 当前值（来源） |
+|---|---|
+| 姿态 | 4 个：`stand` / `sit` / `upper_upright` / `upper_lean`（`web/js/actions.js` 的 `ACTION_CATALOG`） |
+| 手臂 | 15 个 `ARM_ACTIONS`：面板 6（operating / oil_sample / reach / carry / point / arm_raised）+ 上下文 1（near_equipment）+ 隐藏可标注 3（arms_open / both_up / hand_head）+ 已下线 5（wave / crossed / hips / arm_front / arm_side） |
+| 计数 | 2 个 `REP_ACTIONS`：grasp 在用；clap 已 retired（仅历史数据评估） |
+| 手势 | 8 种 + unknown 弃权（`web/js/handshape.js` 的 `SHAPE_LABELS`） |
+| 回归 | `npm test` **1152 项全绿**（16 个套件，2026-11-17 接手轮实测；分项见 README「验证」） |
+| 页面级 | `headless-check` / `headless-multi`（23 项）/ `headless-pose-switch`（11 项）需要 serve.py；`runs/`、`eval-data/`、`web/models/` 不进 git |
+
+### 19.2 11-09 ~ 11-17 已落地
+
+- **多人逐 track 评估**：`evaluate.mjs` 的 `replayMulti`、`label.track`（uid 优先）、
+  手势按 track 归属；导出 `persons[]` 全量、`verdicts[]` 带 `hands` / `track_uid`。
+- **PPE 事件评估**：独立 `web/test/ppe-eval.mjs`（多 track、unknown 弃权、误报/小时、
+  `track_uid` 绑定），没有并进 `evaluate.mjs` 主报告；`requirePositive` 窗口化
+  （`positiveWindowMs` / `minPositive`）已落地。
+- **设备检测器**：panel/valve/gauge ONNX 接入 `operating`；`equipment.js` 做框的时序确认
+  （`boxMinHits` / `boxMaxAgeMs`）、`boxRequireInRoi`、`validateParams()` 校验
+  `boxMaxAgeMs >= intervalMs + 300`；训练/导出/验收见 `docs/equipment-detector.md`。
+- **fail-closed 默认档（2026-11-16）**：`refuel-equipment.json` /
+  `refuel-equipment-strict.json` 设 `equipmentFallbackRoi=false`；8 段硬负例
+  `operating` 误报从 6/8 段降到 0/8。`refuel-equipment-oilsample.json` 仍保留 fallback=true
+  （同集演示用），换机位部署前应改 false。
+- **油样取样 `oil_sample`**：信号层 `signals.arm.sampling` + 1s 保持窗；公开近景素材上召回 0/4，
+  原因与限制见 `docs/signals.md` §三·六。
+- **确定性回放**：`scripts/deterministic-replay.mjs`（`?det=1` + 媒体时间 ts + 固定 seek），
+  同一素材两次回放逐帧 sha256 一致；`confirmRate` 口径改为 `confirmedWithRawFrames/rawFrames`。
+- **切片与整段识别**：`scripts/slice-video.py`、`scripts/clip-recognition.mjs`、
+  `scripts/pose-screenshots.mjs`；R1–R11 审查修复已合入（报告在 `docs/code-review-2026-11-12.md`）。
+- **新素材接入文档**：`docs/annotation-kit.md`（ROI 重画、接触表、operating/near_equipment 标注口径）。
+- **人物有效性门（2026-11-17 工作区改动）**：`perception.personGate` 默认开。低清晰度特写里
+  「手 + 取样管」被 MediaPipe 补成「人」时，用两道几何门剔除：bbox 过窄/躯干长超过框高/
+  锚点可见性不足；以及鼻肩髋整体落在同一只手框里。缺 bbox/kp/手数据时 fail-open。
+  阈值来自 4 段真实人物 + light_tube 误检的对比，换机位需复核；profile 可写
+  `perception.personGate.enabled=false` 关闭。纯函数单测在 `geometry-test` [10]。
+- **接手轮（2026-11-17 晚）**：
+  - 整帧手部左右侧改由姿态腕点决定（`assignHands` / `completeHands`），原始值留
+    `handedness_raw`，导出带 `side_from`；真实素材 95 只手中有 44 只的 MediaPipe
+    handedness 与最近腕点相反（22 只左右腕距离差 <10px，属歧义区）。同一份 563 帧
+    refuel 素材改前/改后 operating、nearEquipment 指标逐项不变。
+  - 姿态估计器加创建代次（`slot.js`）：并发切模型时旧实例自我释放并报 superseded，
+    `initEstimator` 不再把「被新请求取代」当加载失败；新增页面级
+    `headless-pose-switch`（11 项）与纯函数 `slot-test`（22 项）。
+  - 导出 meta 保留本段记录用过的物体检测器指纹（`lastObjectMeta`），检测器自动失败/
+    关闭后不再丢 `modelHash` / `labelsHash`；`headless-multi` 新增断言。
+  - `signals.grasp.releaseMs` 落地为 `PhaseSequence` 的闭锁解除时长（默认 200ms）；
+    `signals.ppe.gloveHand.fallbackWrist=false` 落地为「不拿腕点方框冒充手套区域，
+    报告 unknown/no_hand」；删除无消费方的 `actions.holds.handChest`。
+  - 删除预留键 `perception.objects.roi.*`、`perception.multi.tileMode`、
+    `signals.ppe.assignment`：没有消费方的配置项比报错更难查，等实现时再加回并补测试。
+  - `safety.json` / `safety-ppe.json` 的 `maxLostMs=2000` 完成 MOT17 慢放 A/B
+    （0.4x、15fps、六序列 1324 帧）：ID 切换 73/787 vs 1500 的 87/808，
+    TopK 召回 19.1% vs 19.4%，保留 2000 并在 profile note 写明理由。
+
+### 19.3 仍然是阻塞项（没有实拍数字）
+
+- 动作/手势的实拍 recall/precision：仍为 0 个数字；采集要求见 `docs/data-collection.md`。
+- R4 的 `--fit-out` / `--loso` / `--resample` 只有工具，没有实拍拟合结果。
+- R11-2（640 + 头部 ROI）、R13-4~R13-9、R12-3~R12-7 未开工。
+- 多人 + PPE 事件的主报告合并、`linkAcrossIds`（跨 `track_id` 继承 PPE 计时）未实现。
+- 无消费方的参数键与预留键已在接手轮清理（`handChest` 删除；`releaseMs` / `fallbackWrist`
+  实现；`objects.roi` / `tileMode` / `ppe.assignment` 删除）。profile 若仍写这些键不会再生效，
+  需要时按实现补回并配测试。
+- `headless-ppe-onnx` 仍受本机缺 `eval-data/ppe-yolo/images/val` 阻塞；`npm run shots` 与
+  `mot17-eval` 在接手轮各跑过（mot17 仅用于 maxLostMs A/B，结果见 §19.2）。
+
+### 19.4 本轮配套
+
+- 代码审核报告：`docs/code-review-2026-11-17.md`
+- 接手轮（C3~C8）记录：`docs/round2-2026-11-17.md`
 
 ---
 

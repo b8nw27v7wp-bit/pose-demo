@@ -199,6 +199,11 @@ const handList = (hands) => {
 export function gloveRegion(person, side, cfg = {}, hands = null, used = null) {
   const h = cfg.gloveHand || {};
   const fallback = () => ({ ...wristBox(person, side, cfg), side_from: 'pose' });
+  // fallbackWrist=false：没检出/没归属到手时不要拿腕点方框冒充手套区域，
+  // 直接报 unknown（no_hand）。默认 true 保留旧行为。
+  const noHand = () => (h.fallbackWrist === false
+    ? { box: null, source: 'none', side_from: null, visible: false, no_hand: true }
+    : fallback());
   if (h.enabled === false) return fallback();
 
   const taken = used || new Set();
@@ -245,7 +250,7 @@ export function gloveRegion(person, side, cfg = {}, hands = null, used = null) {
       return { ...gb, side_from: sideFrom };
     }
   }
-  return fallback();
+  return noHand();
 }
 
 /** 该区域里分最高的匹配框（中心点落区 + 分数门槛） */
@@ -311,6 +316,11 @@ export function assessPpe(person, objects, cfg = {}, ctx = {}) {
     if (!gloveLabels.length) {
       glove[side] = {
         state: 'unknown', reason: '未配置手套类别', reason_code: 'config_mismatch',
+        box: wb.box, source: wb.source, side_from: wb.side_from,
+      };
+    } else if (wb.no_hand) {
+      glove[side] = {
+        state: 'unknown', reason: '该侧手未检出（已禁用腕点兜底）', reason_code: 'no_hand',
         box: wb.box, source: wb.source, side_from: wb.side_from,
       };
     } else if (!wb.visible) {

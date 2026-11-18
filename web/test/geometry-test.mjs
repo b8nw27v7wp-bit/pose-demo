@@ -6,6 +6,7 @@ import {
   polygonBBox, polygonArea, pointInPolygon, pointInAnyZone,
   clipPolygonToRect, rectPolygonIntersectionArea, rectPolygonOverlapRatio,
   maxZoneOverlap, resolveRegions, personBoxValidity, headPointsFromRaw,
+  personPlausibility, personCoveredByHand,
 } from '../js/geometry.js';
 
 let pass = 0;
@@ -187,6 +188,56 @@ console.log('\n[9] 头部关键点');
   check('9 点像素换算', h.length === 9 && near(h[7][0], 50) && near(h[7][1], 20) && near(h[7][2], 0.9));
   check('短数组 → null', headPointsFromRaw(raw.slice(0, 10), 200, 100) === null);
   check('缺帧尺寸 → null', headPointsFromRaw(raw, 0, 100) === null);
+}
+
+console.log('\n[10] 人物有效性门（personGate）');
+{
+  // 2026-11-17 light_tube 实测误检：手+取样管被补成「人」。bbox 62×599，躯干 183px
+  const fake = {
+    bbox: [382.2, 47.7, 444.4, 646.4], score: 0.64,
+    kp: [
+      [413, 60, 0.90], [393, 250, 1.00], [415, 250, 0.98], [400, 300, 0.96],
+      [410, 320, 0.04], [405, 400, 0.67], [418, 420, 0.02], [400, 433, 1.00],
+      [406, 433, 0.99], [402, 480, 0.71], [408, 500, 0.15], [401, 540, 0.66],
+      [407, 560, 0.18],
+    ],
+  };
+  const cfg = { enabled: true, minScore: 0.55, minAnchorVis: 0.4, minAspect: 0.12, maxTorsoHeight: 1.4 };
+  const fp = personPlausibility(fake, 480, 853, cfg);
+  check('细长取样管 → bbox_too_narrow', !fp.ok && fp.reasons.includes('bbox_too_narrow'),
+    `aspect=${fp.aspect.toFixed(3)}`);
+  check('躯干/框高指标导出', near(fp.torso_h, 0.306, 0.01), String(fp.torso_h));
+
+  // 同一份数据在不启用门时逐位放行（profile 可关闭）
+  check('enabled=false 时放行', personPlausibility(fake, 480, 853, { ...cfg, enabled: false }).ok);
+
+  // 真实人物（b787 346.9s，1920×1080）：593×1596，肩宽 380，躯干约 522
+  const real = {
+    bbox: [1473.4, 359.2, 2052.7, 1955.4], score: 0.84,
+    kp: [
+      [1821.7, 412.9, 1.00], [1908.4, 575.2, 1.00], [1531.2, 617.4, 1.00],
+      [2052.7, 806.1, 0.73], [1473.4, 921.3, 0.58], [1935.4, 854.4, 0.65],
+      [1671.9, 945.7, 0.61], [1883.7, 1107.4, 0.85], [1637.4, 1124.0, 0.87],
+      [1843.4, 1394.1, 0.49], [1642.7, 1349.2, 0.32], [1835.8, 1824.1, 0.31],
+      [1640.7, 1818.4, 0.22],
+    ],
+  };
+  const rp = personPlausibility(real, 1920, 1080, cfg);
+  check('真实人物放行', rp.ok, rp.reasons.join(','));
+
+  // 缺 bbox/kp → fail-open（旧数据/测试夹具不因少字段被剔除）
+  check('缺 bbox/kp fail-open', personPlausibility({ score: 0.2 }, 100, 100, cfg).ok
+    && personPlausibility({ bbox: [0, 0, 10, 10], score: 0.2 }, 100, 100, cfg).ok);
+
+  // 手部包含：整块身体落在手框里 → covered；真人的小范围手框 → 不 covered
+  const handCfg = { enabled: true, expand: 0.15, minAnchors: 4, maxHandAreaRatio: 0.5, minAllKp: 9 };
+  const covered = personCoveredByHand(fake, [{ bbox: [370, 35, 455, 655] }], handCfg);
+  check('手框覆盖全身 → covered', covered.covered && covered.reasons.includes('anchors_in_hand'),
+    JSON.stringify(covered.reasons));
+  const notCovered = personCoveredByHand(real, [{ bbox: [1735.3, 853.8, 1880.7, 977.2] }], handCfg);
+  check('真人手框小 → 不 covered', !notCovered.covered, JSON.stringify(notCovered));
+  check('没有手数据 fail-open', !personCoveredByHand(fake, [], handCfg).covered
+    && !personCoveredByHand(fake, null, handCfg).covered);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

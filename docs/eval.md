@@ -158,20 +158,24 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 不做 gap 重置，指标与段判定与之前逐位一致。多人导出的帧数上限是 **6000**（单人 20000），
 评估长素材时要按 6000 帧切片。
 
+> 导出前会先过 `perception.personGate`（默认开）：几何上不可能的「人」被剔除后不会出现在
+> `persons[]`/`verdicts[]`。标注按画面里的真实人物写，不要因为导出少了一个误检的「人」
+> 就改标签；要复现被门剔除的帧，在 profile 里设 `perception.personGate.enabled=false`。
+
 ### action 取值
 
 | 类别 | 取值 |
 |---|---|
 | 姿态 | `stand` / `sit` / `upper_upright` / `upper_lean`（`squat_static` / `lying` 已下线，写了会被 `parseSegment` 拒绝）。后两个只用于上半身构图，标注时按「躯干直立/前倾」标，不要拿它们当站/坐 |
-| 手臂 | `armRaised` / `bothHandsUp` / `waving` / `crossed` / `onHips` / `armsOpen` / `handAtHead` / `reaching` / `carrying` / `operating` / `near_equipment` / `pointing` / `armFront` / `armSide` |
+| 手臂 | `armRaised` / `bothHandsUp` / `waving` / `crossed` / `onHips` / `armsOpen` / `handAtHead` / `oilSample` / `reaching` / `carrying` / `operating` / `near_equipment` / `pointing` / `armFront` / `armSide` |
 | 上下文 | `near_equipment` 是上下文事件（人在设备旁），**不能**和 `operating` 互相替代 |
-| 计数 | `clap` / `grasp`（`squat` / `pushup` 已下线）|
+| 计数 | `grasp`（`clap` 仅用于历史数据/旧标签；`squat` / `pushup` 已下线）|
 | 手势 | `gesture` —— 另给 `hand`（`L` / `R` / `any`）与 `shape`（`fist` / `open` / `victory` / `pointing` / `thumbs_up` / `ok` / `gun` / `rock`） |
 | 复合反例 | `none` —— 姿态和手臂都不得出现（人不在场 / 完全无动作） |
 | 手臂反例 | `noArm` —— 姿态不限，但不得出现任何手臂动作 |
 | 单动作反例 | `!动作` 或 `expect:false` —— 只要求这一个动作不出现 |
 
-动作名也接受 `ARM_ACTIONS` 里的 id（`arm_raised` / `reach` / `carry` / `point` …），
+动作名也接受 `ARM_ACTIONS` 里的 id（`arm_raised` / `oil_sample` / `reach` / `carry` / `point` …），
 两种写法等价，评估器内部会归一。
 
 > **`operating` 的离线回放**：设备 ROI 是归一化画面坐标，信号层需要 `persons[].frame_w/frame_h`
@@ -186,8 +190,8 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 > 不同播放之间的姿势/手部检出差异足以把 5/1/3 变成 3/3/3（见 `docs/equipment-detector.md` §6）。
 
 **逐侧粒度**：导出帧的 `actions.flags` 现在带 `armRaisedL/R`、`wavingL/R`、`reachingL/R`、
-`pointingL/R`、`handAtHeadL/R`、`carryingL/R`，界面也会显示「左手举手」这类粒度；
-但 labels 还没有 `side` 字段，评估器仍按聚合动作统计。要按左手/右手分别报
+`pointingL/R`、`handAtHeadL/R`、`carryingL/R`、`oilSampleL/R`、`operatingL/R`，界面也会显示
+「左手举手」这类粒度；但 labels 还没有 `side` 字段，评估器仍按聚合动作统计。要按左手/右手分别报
 recall/precision，下一步给段加 `"side":"L"` 并让 `evaluate.mjs` 读逐侧 flag——
 在那之前不要把逐侧 flag 当成已经评估过的指标。
 
@@ -315,7 +319,8 @@ labels 里写 `camera` / `subject`，报告会分别给出：
 | 误报的 `falseAlarms` | `!动作` 只记该动作（不牵连同时成立的 stand）；`noArm` 记抢占的手臂 flag；`none` 记所有在跳的姿态/flag。汇总时 FP 记到它们头上 |
 
 关键信号按动作选：姿态看 `uprightness / knee / leg_vertical`，抬臂看 `elev_* / elev_torso_*`，
-举手看 `elev_*`，操作设备/伸手/持物/指向看 `reach_*`。完整映射见 `evaluate.mjs` 的 `SIGNALS_FOR`。
+举手看 `elev_*`，油样取样看 `reach_head_* / azimuth_*`，操作设备/伸手/持物/指向看 `reach_*`，
+在设备旁看 `near_equipment_overlap`。完整映射见 `evaluate.mjs` 的 `SIGNALS_FOR`。
 
 > 导出帧的 `actions.unreliable` 记录逐帧弃权原因（低置信 / 外推 / 骨骼异常 / 角度坏点，
 > 见 `docs/signals.md` §三·九）。**报告不按它筛选**——报告比的是「规则最终判定 vs 标注」。

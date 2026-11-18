@@ -1,6 +1,6 @@
 // app.js — 组装层：输入源 → 感知（姿态 + 手部）→ 信号 → 动作 → 可视化/导出
 import {
-  createEstimator, detectVideo, toPersons, closeEstimator,
+  createEstimator, detectVideo, toPersons, closeEstimator, isSuperseded,
   createMultiEstimator, detectMultiImage, detectMultiTiled, closeMultiEstimator, multiEstimatorInfo,
 } from './pose.js';
 import { createHandEstimator, detectHandsVideo, detectHandsNearWrists, toHands, handsReady, closeHandEstimator } from './hands.js';
@@ -15,14 +15,14 @@ import { loadAccuracyReport, accuracyFor, formatAccuracy, accuracyStale } from '
 import {
   resolveParams, validateParams, profileParams, profileName as profileNameOf, paramsHash,
 } from './params.js';
-import { hasRegionConfig } from './geometry.js';
+import { hasRegionConfig, personPlausibility, personCoveredByHand } from './geometry.js';
 import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS, HARDCASE_BEFORE_MS } from './hardcase.js';
 import { drawSkeleton, drawHand, drawBoxes, drawTrackLabel, clearCanvas } from './draw.js';
 import { Tracker, area } from './track.js';
 import {
   PersonPipelines, assignHands, logLimitFor,
   TrackShapeStabilizers, classifyHandsByTrack, bindClassifiedHands, pickRoiPersons,
-  pickSingleTarget,
+  pickSingleTarget, wristSideFor,
 } from './multi.js';
 import { PpeMonitor } from './ppe.js';
 import {
@@ -101,6 +101,8 @@ let ppeMonitor = new PpeMonitor(resolveParams(activeParams).signals.ppe);
 let multiCfg = resolveParams(activeParams).perception.multi;
 // 单人道漏检补救参数（见 params.js perception.single）
 let singleCfg = resolveParams(activeParams).perception.single;
+// 人物有效性门（见 params.js perception.personGate）：低清晰度特写里的「手+取样管」误检
+let personGateCfg = resolveParams(activeParams).perception.personGate;
 // operating 的 profile 配置：ROI 是静态配置，没有画面时也要能告诉用户不可用，
 // 阈值/保持窗也要进 tooltip，不能写死默认值（refuel 覆盖了 1500ms 与肘兜底阈值）。
 let operatingCfg = resolveParams(activeParams).signals.arm.operating;
@@ -120,6 +122,9 @@ let multiCfgKey = '';   // 建多人估计器时用的 numPoses|detConf|presence
 let objectError = null;
 let multiError = null;
 let objectBusy = false;   // ONNX 后端同一时刻只允许一帧在推理（见 loop()）
+// 当前这段记录实际用过的物体检测器指纹：录完关掉/自动失败后仍保留，导出 meta 不能丢。
+// 与 activeModel/activeHandModel 同一理由；resetRuntime 开新一段记录时清空。
+let lastObjectMeta = null;
 // 确定性回放时在每帧末尾 await 这次推理：否则「框什么时候回来」取决于 CPU 快慢，
 // 同一份素材两次回放会得到不同的 objects 序列（详见 detReplay）。
 let objectInflight = null;
@@ -160,6 +165,7 @@ function applyParams(params, name = 'default') {
   ppeMonitor = new PpeMonitor(resolved.signals.ppe);
   multiCfg = resolved.perception.multi;
   singleCfg = resolved.perception.single;
+  personGateCfg = resolved.perception.personGate;
   operatingCfg = resolved.signals.arm.operating;
   operatingHolds = resolved.actions.holds;
   nearEquipmentCfg = resolved.signals.arm.nearEquipment;
@@ -508,6 +514,9 @@ async function initEstimator() {
         }
         return true;
       } catch (e) {
+        // 创建期间用户又切了模型/后端：这不是加载失败，新请求会接手。
+        // 不能落到下面的 CPU 兜底——那会用旧档位再发一次创建，把新请求顶掉。
+        if (isSuperseded(e)) return false;
         lastErr = e;
       }
     }
@@ -599,6 +608,7 @@ async function ensureMultiEstimator({ quiet = false } = {}) {
           return true;
         }
       } catch (e) {
+        if (isSuperseded(e)) return false;
         multiError = e.message;
       }
     }
@@ -675,7 +685,12 @@ async function ensureObjectDetector() {
         return 'superseded';
       }
       objectReady = objectInfo().ready;
-      if (objectReady) { objectError = null; return true; }
+      if (objectReady) {
+        objectError = null;
+        // 记录这段数据实际用的检测器指纹；之后关掉/自动失败也不丢（C5）
+        lastObjectMeta = objectMetaSnapshot();
+        return true;
+      }
     } catch (e) {
       if (gen !== objectGen) return 'superseded';   // 旧代次的失败不影响新配置
       objectError = e.message;
@@ -698,6 +713,8 @@ function resetRuntime() {
   frameLog = [];
   lastVideoTime = -1;
   lastObjectTs = 0;
+  // 新的一段记录：没有重新启用物体检测就不该继承上一段的模型指纹
+  lastObjectMeta = null;
   for (const k of Object.keys(stageMs)) stageMs[k] = 0;
   lastLogVideoTime = -1;
   videoWrapDetected = false;
@@ -1188,8 +1205,10 @@ function completeHands(fullHands, target, source, w, h, ownerTrackId = null) {
   if (!target || !handsReady('IMAGE')) return fullHands;
   // 注意 handedness 是 'Left'/'Right'，腕点侧是 'L'/'R'，必须换算后再比较，
   // 否则每一侧都会被当成「没检出」而重复补检（多人画面上会多出两只手）。
+  // 更关键的是：整帧 handedness 在普通视频里可能是反的，所以按检出腕点离该人
+  // 左右姿态腕点的距离判断，与 assignHands 的最终槽位同一判据。
   const have = new Set(fullHands
-    .map((x) => (x.handedness === 'Left' ? 'L' : x.handedness === 'Right' ? 'R' : ''))
+    .map((hd) => wristSideFor(hd, target))
     .filter(Boolean));
   const wrists = [
     { side: 'L', x: target.kp[5][0], y: target.kp[5][1], vis: target.kp[5][2], scale: target.scale },
@@ -1229,6 +1248,43 @@ function completeHandsMulti(fullHands, judged, target, source, w, h) {
   return fullHands;
 }
 
+/**
+ * 人物有效性门（见 params.js perception.personGate）。两层：
+ * 1) 姿态几何：低清晰度特写被补成「细长条/躯干比框还长/锚点不可见」的人；
+ * 2) 手部包含：真人不会整块身体落在同一只手框里。
+ * 拿不到手部数据时只走第 1 层；缺字段时都不判（fail-open）。
+ */
+function gatePersonsByPose(persons, w, h) {
+  if (!personGateCfg?.enabled || !persons?.length) return persons;
+  return persons.filter((p) => personPlausibility(p, w, h, personGateCfg).ok);
+}
+
+function gatePersonsByHand(persons, hands, handsByTrack, single = false) {
+  const rejected = new Set();
+  if (!personGateCfg?.enabled || personGateCfg?.hand?.enabled === false || !persons?.length) {
+    return { persons, hands, rejected };
+  }
+  for (const p of persons) {
+    // handsByTrack 的值是槽位 {L,R,list}，不是数组；取 list，旧路径才直接给数组。
+    const slot = handsByTrack?.get?.(p.track_id);
+    const slotHands = slot
+      ? (Array.isArray(slot.list) && slot.list.length ? slot.list : [slot.L, slot.R].filter(Boolean))
+      : [];
+    // 单人道：没有明确归属的手也可能就是目标人的手（腕点不可见/被取样管挡住时
+    // assignHands 会放弃归属）。这时拿整帧的手来判，否则「手+取样管」刚好漏掉。
+    const hs = slotHands.length ? slotHands
+      : (single ? (hands || []) : (hands || []).filter((hd) => hd.owner_track_id === p.track_id));
+    if (!hs.length) continue;
+    if (personCoveredByHand(p, hs, personGateCfg.hand).covered) rejected.add(p.track_id);
+  }
+  if (!rejected.size) return { persons, hands, rejected };
+  return {
+    persons: persons.filter((p) => !rejected.has(p.track_id)),
+    hands: (hands || []).filter((hd) => hd.owner_track_id == null || !rejected.has(hd.owner_track_id)),
+    rejected,
+  };
+}
+
 /** 单张图片：推理一次，然后在信号/动作层收敛后绘制 */
 async function analyzeStill(img) {
   const w = img.naturalWidth;
@@ -1246,8 +1302,9 @@ async function analyzeStill(img) {
       })
       : detectMultiImage(img))
     : detectVideo(img, ts);
-  const persons = toPersons(multiRes, w, h)
+  let persons = toPersons(multiRes, w, h)
     .map((p, i) => ({ ...p, track_id: i, track_age_ms: 0 }));
+  persons = gatePersonsByPose(persons, w, h);
   let target = null;
   if (persons.length) {
     // 与视频单人道同一套主目标规则（profile 可换 torso/upright）
@@ -1623,6 +1680,8 @@ async function loop() {
     // 单人道保持旧语义：不做跟踪，track_id 用帧内序号，只判面积最大的那个人
     persons = personsRaw.map((p, i) => ({ ...p, track_id: i, track_age_ms: 0 }));
   }
+  // 姿态几何先在「判谁」之前剔除：瘦长条/躯干比框还长的「人」不该参与主目标选择
+  persons = gatePersonsByPose(persons, w, h);
 
   // 判谁：单人道只判主目标（其余人只画骨架），多人道所有人都判
   let judged = persons;
@@ -1633,7 +1692,7 @@ async function loop() {
     if (main) main.track_id = 0;
     judged = main ? [main] : [];
   }
-  const target = judged.slice().sort((a, b) => area(b.bbox) - area(a.bbox))[0] || null;
+  let target = judged.slice().sort((a, b) => area(b.bbox) - area(a.bbox))[0] || null;
 
   // 物体检测：PPE 的前提。失败就关掉开关，别每帧抛异常拖慢主循环。
   // ONNX 后端是异步的（wasm 推理），这里**不能 await**：loop() 是 rAF 回调，await 会
@@ -1725,6 +1784,22 @@ async function loop() {
     const cls = classifyAndBind(hands, ts, assigned, !multi);
     hands = cls.hands;
     handsByTrack = cls.handsByTrack;
+  }
+  // 第二道人物门：手部数据已经归属到人，用「整块身体是否落在同一只手框里」再剔一次。
+  // 低清晰度取样管特写里手框常常覆盖整个人（anchors_in_hand），而真人 0% 命中。
+  const handGate = gatePersonsByHand(judged, hands, handsByTrack, !multi);
+  if (handGate.rejected.size) {
+    persons = persons.filter((p) => !handGate.rejected.has(p.track_id));
+    hands = handGate.hands;
+    for (const id of handGate.rejected) handsByTrack?.delete(id);
+    if (multi) {
+      judged = persons;
+    } else {
+      const main = pickSingleTarget(persons, singleCfg.target, { minAspect: singleCfg.targetMinAspect });
+      if (main) main.track_id = 0;
+      judged = main ? [main] : [];
+    }
+    target = judged.slice().sort((a, b) => area(b.bbox) - area(a.bbox))[0] || null;
   }
   const handsMs = performance.now() - tHands;
 
@@ -1856,6 +1931,10 @@ function countFps(ts) {
 function exportHand(hd) {
   return {
     handedness: hd.handedness,
+    // 侧别来源：'wrist' = 归属后按姿态腕点纠正；'roi' = 腕部补检时确定；
+    // 旧数据没有这两个字段。handedness_raw 保留模型原始输出，便于审计镜像标反。
+    ...(hd.handedness_raw ? { handedness_raw: hd.handedness_raw } : {}),
+    ...(hd.side_from ? { side_from: hd.side_from } : {}),
     shape: hd.cls?.shape ?? hd.shape ?? null,
     shape_raw: hd.cls?.raw ?? hd.shape_raw ?? null,
     score: r2(hd.score),
@@ -1899,6 +1978,9 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
   // 这一帧走的是多人判定路径就锁定为 multi（录制中切换也只升不降，
   // 保证 meta 与按 6000 截断的 frameLog 一致）
   if (exportMulti()) logMode = 'multi';
+  // 物体检测器已就绪但还没在 ensure 里快照过（例如 resetRuntime 之后继续用同一实例）：
+  // 在真正写帧时补一份，保证 meta 与这段记录一致。
+  if (objectOn && objectReady && !lastObjectMeta) lastObjectMeta = objectMetaSnapshot();
   const logPersons = extra?.persons || (p ? [p] : []);
   frameLog.push({
     ts: Math.round(ts),
@@ -2063,11 +2145,28 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
  * 按块生成 Blob 分片，浏览器自己拼装，主线程只处理小块。
  * 格式与 evaluate.mjs 的 JSONL 输入兼容（首行是 meta，后续每行一帧）。
  */
+/**
+ * 物体检测器的导出指纹。**必须在检测器使用时快照**，不能导出时现取：
+ * 录完关掉物体检测（或检测器自动失败）后 objectInfo() 仍是「关掉后」的状态，
+ * 事后无法证明这份数据用的是哪个模型/哪套类别顺序。
+ */
+function objectMetaSnapshot(oi = objectInfo()) {
+  return {
+    backend: objectCfg.backend ?? null,
+    model: objectCfg.model ?? null,
+    inputSize: objectCfg.inputSize ?? null,
+    modelHash: oi?.modelHash ?? null,
+    // 类别顺序错了比模型错了更难查：把顺序本身也指纹化（evaluate 的 baseline 校验会用）
+    labelsHash: Array.isArray(objectCfg.labels) && objectCfg.labels.length
+      ? paramsHash({ labels: objectCfg.labels }) : null,
+    manifestOk: oi?.manifest?.ok ?? null,
+  };
+}
+
 /** 常规导出与难例导出共用的 meta 基底 */
 function baseExportMeta() {
-  // 物体模型指纹（PLAN §17 R13-3）：PPE 指标跨模型不可比，baseline 用它拒绝跨模型比较。
-  // 关闭物体检测时为 null；MediaPipe 后端没有 sidecar，modelHash 为 null。
-  const oi = objectOn ? objectInfo() : null;
+  // 优先用记录期间快照的指纹；当前还开着且从未记录过时退回实时信息。
+  const objectsMeta = lastObjectMeta || (objectOn ? objectMetaSnapshot() : null);
   return {
     exported_at: new Date().toISOString(),
     schema: 'frame.jsonl v0',
@@ -2092,16 +2191,8 @@ function baseExportMeta() {
     // 评估器据此判断「帧被截断」是否正常：多人 6000 是为了控制体积，不是数据丢失。
     log_limit: logLimit(),
     export_mode: logMode,
-    objects: oi ? {
-      backend: objectCfg.backend ?? null,
-      model: objectCfg.model ?? null,
-      inputSize: objectCfg.inputSize ?? null,
-      modelHash: oi.modelHash ?? null,
-      // 类别顺序错了比模型错了更难查：把顺序本身也指纹化（evaluate 的 baseline 校验会用）
-      labelsHash: Array.isArray(objectCfg.labels) && objectCfg.labels.length
-        ? paramsHash({ labels: objectCfg.labels }) : null,
-      manifestOk: oi.manifest?.ok ?? null,
-    } : null,
+    // 关闭物体检测后仍写记录期间用过的模型指纹（见 objectMetaSnapshot 的说明）
+    objects: objectsMeta,
   };
 }
 
@@ -2526,7 +2617,7 @@ function updateUI() {
   $('armHint').textContent = hintLine;
   $('armHint').title = hintLine;
 
-  // 手部：按 handedness 取（镜像只影响画面，不影响模型输出的左右手）
+  // 手部：handedness 已在 assignHands 里按姿态腕点纠正（模型原始值见 handedness_raw）
   const pick = (side) => (hands || []).find((h) => h.handedness === side);
   const hl = pick('Left');
   const hr = pick('Right');
@@ -2898,6 +2989,8 @@ window.__pose = {
     };
   },
   get lastFrame() { return frameLog[frameLog.length - 1] || null; },
+  // 导出 meta 的只读快照（无头检查断言用）：验证「关掉物体检测后仍保留模型指纹」
+  get exportMeta() { return baseExportMeta(); },
   // 离线评估用：只导出评估需要的轻量字段（video_time + 每人框/flags），
   // 不带 kp/signals 等大字段。MOT17 gt 只需要框；flags 用来统计动作触发率
   // （没有动作标注，只能发现明显误报）。web/test/mot17-eval.mjs 读它。
@@ -2929,6 +3022,20 @@ window.__pose = {
       contextActions: [...document.querySelectorAll('#ctxActions .act')].map((el) => ({ id: el.dataset.id, on: el.classList.contains('on') })),
       armActions: [...document.querySelectorAll('#armGrid .act')].map((el) => ({ id: el.dataset.id, on: el.classList.contains('on') })),
     };
+  },
+  /**
+   * 无头回归专用：模拟「录完一段带物体检测的数据后，检测器在运行中失败」的最终状态。
+   * 真实的自动失败路径（loop 里的 fail / ensure 失败）只关开关、不 resetRuntime，
+   * 所以 frameLog 与 lastObjectMeta 必须保留。这里复刻同一状态，避免测试去制造一次
+   * 真实的推理异常（那需要故意改坏模型/画布，代价高且不稳定）。
+   */
+  failObjectDetectionForTest() {
+    objectOn = false;
+    objectReady = false;
+    $('chkObjects').checked = false;
+    lastObjects = [];
+    lastObjectsTs = null;
+    return { objectOn, objectReady };
   },
   initEstimator,
   startCamera,
