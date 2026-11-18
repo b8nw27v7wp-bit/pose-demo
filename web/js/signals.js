@@ -870,6 +870,35 @@ export class SignalEngine {
     const wristHipL = pickRatio(wristHip3dL, wristHip2dL);
     const wristHipR = pickRatio(wristHip3dR, wristHip2dR);
 
+    // —— 放油取样（drain_sample）——
+    // 半蹲在放油阀旁，双手在阀口与接油盆之间：
+    //   1) 双手都低于肩（抬臂角 ≥minElev，100° 约等于腕低于肩一个躯干长的 17%）；
+    //   2) 两腕靠拢（hands_close ≤maxHandsClose），说明双手在同一作业点附近；
+    //   3) 任一条腿的膝角落在 minKnee..maxKnee；膝角接近站立端时还要上半身前倾；
+    //      膝完全不可用时退回上半身前倾（uprightness ≤maxUpright）。
+    // 不做「手在身体前方」：蹲姿+俯拍下 3D 方位角会把双手在体前判成侧向（实测 70–90s
+    // 窗口 front-both=0），加了会整段漏判。先按可用信号出规则版，准确率靠标注再验。
+    const drainCfg = C.arm.drain;
+    const drainLowL = armUsableL && Number.isFinite(elevL) && elevL >= drainCfg.minElev;
+    const drainLowR = armUsableR && Number.isFinite(elevR) && elevR >= drainCfg.minElev;
+    const drainHandsClose = Number.isFinite(handsClose) && handsClose <= drainCfg.maxHandsClose;
+    // 蹲姿证据不能复用 kneePick：它按三点可见度挑腿，单膝跪地时跪腿（≈45–52°）和
+    // 支撑腿（≈80–160°）会被遮挡轮换着选中，同一姿势在检出/漏检之间跳。
+    // 这里改成「任一 available 腿的膝角落在区间内」——只要两条腿都可见，结果就与
+    // 哪条腿可见度更高无关（单膝跪地按支撑腿判；跪腿低于 minKnee，不算蹲证据）。
+    // 膝角在「接近站立」的弱证据段（>weakKneeFrom）时，还要求上半身前倾：
+    // 站立微屈膝（≈130°）双手拎低桶时躯干直立，不该算蹲。
+    const drainLean = Number.isFinite(uprightness) && uprightness <= drainCfg.maxLeanUpright;
+    const drainKneeOk = (k) => Number.isFinite(k)
+      && k >= drainCfg.minKnee && k <= drainCfg.maxKnee
+      && (k <= drainCfg.weakKneeFrom || drainLean);
+    const kneesSeen = Number.isFinite(angles.knee_L) || Number.isFinite(angles.knee_R);
+    // 下限排除「深蹲/跪坐」（同场景里那是针管取样/清洗），上限排除站立时的膝角噪声。
+    const drainCrouched = kneesSeen
+      ? (drainKneeOk(angles.knee_L) || drainKneeOk(angles.knee_R))
+      : (Number.isFinite(uprightness) && uprightness <= drainCfg.maxUpright);
+    const drainSample = drainLowL && drainLowR && drainHandsClose && drainCrouched;
+
     // —— 3D 信号（worldLandmarks，米制）：抗机位俯仰
     // 2D 抬臂角把「俯拍时的前伸」和「真实抬臂」混在一起；3D 相对躯干就分得开。
     const sub3 = v3sub;
@@ -1380,6 +1409,13 @@ export class SignalEngine {
         // 与 head_near 的区别是多了「手在身体前方」这道门，见 C.arm.sampling。
         sample_L: sampleL,
         sample_R: sampleR,
+        // 放油取样：蹲/跪 + 双手低于肩 + 两腕靠拢（瞬时布尔，动作层再加保持窗）。
+        // 逐侧字段只表示「该侧腕低于肩」，动作要求两侧同时成立。
+        drain_sample: drainSample,
+        drain_low_L: drainLowL,
+        drain_low_R: drainLowR,
+        drain_hands_close: drainHandsClose,
+        drain_crouched: drainCrouched,
         // 操作设备：手在设备 ROI 内，或肘在 ROI 内（手被设备挡住时的兜底）
         operating_L: operatingL,
         operating_R: operatingR,

@@ -173,5 +173,168 @@ console.log('\n[9] 动作字典与提示覆盖');
   check('flag 在 ARM_FLAG_IDS 里', ARM_FLAG_IDS.includes('oilSample'));
 }
 
+// —— 放油取样（drain_sample）：半蹲在放油阀旁，双手在阀口与接油盆之间 ——
+// 双腿屈膝（膝角约 104°）、双手在肩下并拢。scale=100。
+const DRAIN = {
+  5: [120, 220, 1], 6: [120, 220, 1],       // 两腕靠拢、明显低于肩
+  9: [175, 290, 1], 10: [215, 290, 1],      // 膝向前
+  11: [110, 380, 1], 12: [150, 380, 1],     // 踝回到髋下方，形成屈膝
+};
+const DRAIN_FAR = {
+  ...DRAIN,
+  5: [40, 220, 1], 6: [200, 220, 1],         // 双手分开 1.6 躯干长
+};
+const DRAIN_HIGH = {
+  ...DRAIN,
+  5: [80, 80, 1], 6: [160, 80, 1],           // 双手抬到肩上方
+};
+const DRAIN_STAND = {
+  ...DRAIN,
+  9: [100, 300, 1], 10: [140, 300, 1],
+  11: [100, 380, 1], 12: [140, 380, 1],      // 膝伸直（180°）
+};
+
+console.log('\n[10] 放油取样：蹲姿 + 双手低于肩并靠拢，保持 1s → drain_sample 成立');
+{
+  const { feed } = makeEngines();
+  let out = null;
+  for (let ts = 1000; ts <= 2000; ts += 100) out = feed(mkPerson(DRAIN), ts);
+  check('保持 1000ms → drainSample=true', out.flags.drainSample === true);
+  check('逐侧 flag 两侧都成立', out.flags.drainSampleL === true && out.flags.drainSampleR === true);
+  check('不会误报 oil_sample', out.flags.oilSample === false);
+}
+
+console.log('\n[11] 放油取样：保持不足 1s → 不成立');
+{
+  const { feed } = makeEngines();
+  let out = null;
+  for (let ts = 1000; ts <= 1500; ts += 100) out = feed(mkPerson(DRAIN), ts);
+  check('保持 500ms → drainSample=false', out.flags.drainSample === false);
+}
+
+console.log('\n[12] 放油取样边界：手分开 / 手抬高 / 不屈膝 → 不成立');
+{
+  const run = (over) => {
+    const { feed } = makeEngines();
+    let out = null;
+    for (let ts = 1000; ts <= 2500; ts += 100) out = feed(mkPerson(over), ts);
+    return out;
+  };
+  check('双手分开 1.6 躯干长 → 不成立', run(DRAIN_FAR).flags.drainSample === false);
+  check('双手抬到肩上方 → 不成立', run(DRAIN_HIGH).flags.drainSample === false);
+  check('膝伸直（站姿）→ 不成立', run(DRAIN_STAND).flags.drainSample === false);
+  check('举瓶到眼前（油样取样姿势）→ 不会命中放油取样',
+    (() => {
+      const { feed } = makeEngines();
+      let out = null;
+      for (let ts = 1000; ts <= 2500; ts += 100) out = feed(mkPerson(AT_EYE), ts);
+      return out.flags.drainSample === false;
+    })());
+}
+
+console.log('\n[13] 放油取样：阈值来自参数（profile 可覆盖）');
+{
+  const fast = makeEngines({ actions: { holds: { drainSample: 300 } } });
+  let out = null;
+  for (let ts = 1000; ts <= 1500; ts += 100) out = fast.feed(mkPerson(DRAIN), ts);
+  check('holds.drainSample=300 → 500ms 即成立', out.flags.drainSample === true);
+
+  const tightKnee = makeEngines({ signals: { arm: { drain: { maxKnee: 90 } } } });
+  let out2 = null;
+  for (let ts = 1000; ts <= 2500; ts += 100) out2 = tightKnee.feed(mkPerson(DRAIN), ts);
+  check('drain.maxKnee=90 → 104° 屈膝不成立', out2.flags.drainSample === false);
+
+  const kneeFloor = makeEngines({ signals: { arm: { drain: { minKnee: 120 } } } });
+  let out5 = null;
+  for (let ts = 1000; ts <= 2500; ts += 100) out5 = kneeFloor.feed(mkPerson(DRAIN), ts);
+  check('drain.minKnee=120 → 104° 低于下限，不成立', out5.flags.drainSample === false);
+
+  const tightHands = makeEngines({ signals: { arm: { drain: { maxHandsClose: 0.1 } } } });
+  let out3 = null;
+  for (let ts = 1000; ts <= 2500; ts += 100) out3 = tightHands.feed(mkPerson({ ...DRAIN, 5: [118, 220, 1] }), ts);
+  check('drain.maxHandsClose=0.1 → 两腕相距 2px 仍成立', out3.flags.drainSample === true);
+
+  const dry = makeEngines({ actions: { holds: { drainSample: 3000 } } });
+  let out4 = null;
+  for (let ts = 1000; ts <= 2500; ts += 100) out4 = dry.feed(mkPerson(DRAIN), ts);
+  check('holds.drainSample=3000 → 1.5s 保持不成立', out4.flags.drainSample === false);
+}
+
+console.log('\n[14] 动作字典与提示覆盖（drain_sample）');
+{
+  const { ARM_ACTIONS, ARM_FLAG_IDS } = await import('../js/actions.js');
+  const a = ARM_ACTIONS.find((x) => x.id === 'drain_sample');
+  check('drain_sample 已登记，flag=drainSample', !!a && a.flag === 'drainSample');
+  check('flag 在 ARM_FLAG_IDS 里', ARM_FLAG_IDS.includes('drainSample'));
+}
+
+console.log('\n[15] 单膝跪地：判定不随 kneePick 换腿而翻转');
+{
+  // 跪腿 L 膝角约 45°、支撑腿 R 约 100°，两条腿都可见——只换两侧可见度高低。
+  const kneelVis = (lv, rv) => ({
+    5: [120, 220, 1], 6: [120, 220, 1],
+    7: [100, 200, lv], 9: [100, 290, lv], 11: [160, 230, lv],
+    8: [140, 200, rv], 10: [215, 290, rv], 12: [140, 380, rv],
+  });
+  const runSig = (over) => {
+    const se = new SignalEngine({});
+    let sig = null;
+    for (let ts = 1000; ts <= 1600; ts += 100) sig = se.update(mkPerson(over), ts, [], null, null);
+    return sig;
+  };
+  const lHigh = runSig(kneelVis(0.95, 0.5));
+  const rHigh = runSig(kneelVis(0.5, 0.95));
+  check('两条腿可见度互换，放油取样都成立',
+    lHigh.arm.drain_sample === true && rHigh.arm.drain_sample === true);
+  check('kneePick 确实换了腿（跪腿 45° ↔ 支撑腿 100°）',
+    lHigh.knee_pick < 60 && rHigh.knee_pick > 60,
+    `pick ${lHigh.knee_pick?.toFixed(0)} / ${rHigh.knee_pick?.toFixed(0)}`);
+  check('drain_crouched 与可见度无关（按任一条腿判）',
+    lHigh.arm.drain_crouched === true && rHigh.arm.drain_crouched === true);
+}
+
+console.log('\n[16] 保持期间一侧腕被挡：聚合动作不被拆成单手');
+{
+  const { feed } = makeEngines();
+  let out = null;
+  for (let ts = 1000; ts <= 2000; ts += 100) out = feed(mkPerson(DRAIN), ts);
+  check('先建立 1s hold', out.flags.drainSample === true);
+  const OCC = { ...DRAIN, 6: [120, 220, 0] };   // 右腕被盆/阀门挡住
+  for (let ts = 2100; ts <= 2600; ts += 100) out = feed(mkPerson(OCC), ts);
+  check('遮挡 500ms 内动作仍成立（900ms 掉帧容忍）', out.flags.drainSample === true);
+  check('逐侧字段一侧为 false（诊断用；界面不据此加左右手前缀）',
+    out.flags.drainSampleL === true && out.flags.drainSampleR === false);
+}
+
+console.log('\n[17] 膝角接近站立端：只靠膝角不算蹲');
+{
+  // 膝角约 117°（弱证据段 110–120°）、躯干直立（uprightness=1）。
+  const WEAK = {
+    5: [120, 220, 1], 6: [120, 220, 1],
+    9: [160, 290, 1], 10: [160, 290, 1],
+    11: [110, 380, 1], 12: [110, 380, 1],
+  };
+  const still = makeEngines();
+  let o1 = null;
+  for (let ts = 1000; ts <= 2500; ts += 100) o1 = still.feed(mkPerson(WEAK), ts);
+  check('膝角 117° + 躯干直立 → 不算蹲', o1.flags.drainSample === false);
+
+  const leanOk = makeEngines({ signals: { arm: { drain: { maxLeanUpright: 1.0 } } } });
+  let o2 = null;
+  for (let ts = 1000; ts <= 2500; ts += 100) o2 = leanOk.feed(mkPerson(WEAK), ts);
+  check('放宽前倾门后同一姿势成立（证明弱证据段要看 uprightness）', o2.flags.drainSample === true);
+
+  // 膝角约 127° = 站立微屈膝，超出 maxKnee=120（旧默认 140 会放行）。
+  const STANDISH = {
+    5: [120, 220, 1], 6: [120, 220, 1],
+    9: [150, 290, 1], 10: [150, 290, 1],
+    11: [110, 380, 1], 12: [110, 380, 1],
+  };
+  const stand = makeEngines();
+  let o3 = null;
+  for (let ts = 1000; ts <= 2500; ts += 100) o3 = stand.feed(mkPerson(STANDISH), ts);
+  check('膝角 127°（站立微屈膝）→ 超出上限，不成立', o3.flags.drainSample === false);
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

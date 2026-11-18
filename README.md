@@ -205,17 +205,16 @@ MediaPipe 会把「手 + 取样管/瓶子」补成一个完整的人（鼻/肩/�
 ## 验证
 
 ```bash
-npm test                            # 22 槽位 + 58 几何 + 26 设备框 + 34 operating + 15 油样取样 + 310 逻辑 + 44 动作提示 + 37 准确率 + 301 评估器 + 46 难例 + 19 自动标注 + 23 清单 + 113 多人 + 31 ONNX + 54 PPE + 19 PPE 评估；合计 1152 项
+npm test                            # 22 槽位 + 58 几何 + 26 设备框 + 34 operating + 39 油样/放油取样 + 310 逻辑 + 45 动作提示 + 37 准确率 + 310 评估器 + 46 难例 + 19 自动标注 + 23 清单 + 113 多人 + 31 ONNX + 54 PPE + 19 PPE 评估；合计 1186 项
 node web/test/slot-test.mjs         # 22 项：估计器槽位的同 key 复用、换 key 重建、并发创建先后完成都不覆盖、close 作废在途创建、失败不污染槽位、superseded 标记
 node web/test/geometry-test.mjs     # 58 项：旧矩形规整、多边形配置/点内测试/面积/矩形裁剪、多 zone 最大重叠、resolveRegions 优先级与 fail-closed、人框有效性、头部 9 点换算、人物有效性门（细长条/躯干过长/锚点不可见、整块身体落在手框里、缺字段 fail-open）
 node web/test/logic-test.mjs        # 310 项：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立 vs 上半身直立/前倾）/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/统计/拿取阶段机（含 releaseMs 闭锁）/注册表 flag 一致/上半身构图/腕部 ROI/手归属/平举物理门/换侧滞回/角度突变剔除/不可靠原因/手-臂对应/手型与左右侧绑定/操作设备掉帧容忍（含引擎漏调用的大间隔）/设备框与 ROI 的 union/fail-closed/多边形 ROI/人框有效性/operating 不成立时不报 zone
-node web/test/armhint-test.mjs      # 44 项：15 个动作的提示覆盖、手部关闭/未加载/未检出、无 3D/配置关闭、置信不足、多动作提示优先级、准确率文案（提示行与 tooltip）、左右手粒度、无画面时按 profile 标 ROI/检测框不可用（detector-only 还要求物体检测已开且就绪）、人框有效性文案
-node web/test/accuracy-test.mjs     # 37 项：flag→id 映射、n/95%CI 保留、样本不足不报百分比（含段数与 TP/FN/FP）、未评估、合成来源标记、profile/数据源目录透传、档位边界、报告加载容错、参数指纹过期检测、多 track 池化
-node web/test/eval-test.mjs         # 301 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样、多人逐 track 与 label.track/uid、旧单人回归、物体模型指纹与跨模型 baseline 拒绝、多 track baseline/sweep/A-B、逐 track 抖动与姿态混淆矩阵、帧尺寸透传、objects 接线与 operating 离线回放、上下文事件不计入 noArm/none、kp_head/多边形回放）
+node web/test/armhint-test.mjs      # 44 项：15 个动作的提示覆盖、手部关闭/未加载/未检出、无 3D/配置关闭、置信不足、多动作提示优先级、准确率文案（提示行与 tooltip）、左右手粒度、无画面时按 profile 标 ROI/检测框不可用（detector-only 还要求物体检测已开且就绪）、人框有效性文案node web/test/accuracy-test.mjs     # 37 项：flag→id 映射、n/95%CI 保留、样本不足不报百分比（含段数与 TP/FN/FP）、未评估、合成来源标记、profile/数据源目录透传、档位边界、报告加载容错、参数指纹过期检测、多 track 池化
+node web/test/eval-test.mjs         # 310 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样、多人逐 track 与 label.track/uid、旧单人回归、物体模型指纹与跨模型 baseline 拒绝、多 track baseline/sweep/A-B、逐 track 抖动与姿态混淆矩阵、帧尺寸透传、objects 接线与 operating 离线回放、上下文事件不计入 noArm/none、kp_head/多边形回放、放油取样参数值域校验）
 node web/test/hardcase-test.mjs     # 46 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口、!动作/noArm 反例导出、尾部锚点（区分播完与暂停）
 node web/test/equipment-test.mjs    # 26 项：设备框时序确认/过期/重帧去重、线段到框距离、单人道主目标选择
 node web/test/operating-test.mjs    # 34 项：operating 的 gate 诊断、框时序、ROI 约束、前臂/握持/人形门、nearEquipment 独立兜底开关
-node web/test/sampling-test.mjs     # 15 项：油样取样（oil_sample）与「手在头部」的边界、3D 方位角门、保持窗
+node web/test/sampling-test.mjs     # 39 项：油样取样（oil_sample）与「手在头部」的边界、3D 方位角门、保持窗；放油取样（drain_sample）的蹲姿/双手靠拢/膝角上下限/单膝跪地不随可见度翻转/遮挡期间不拆成单手/接近站立需前倾
 node web/test/autolabel-test.mjs    # 19 项：区间合并/丢弃、计数周期、草稿内容与自评全通过、注册表覆盖
 node web/test/manifest-test.mjs     # 23 项：清单字段与文件校验（含 heavy 档位）、覆盖度、计数与反例、动作 id/flag 等价、清单骨架、注册表覆盖
 node web/test/multi-test.mjs        # 113 项：跟踪 id 稳定/防换 id/超时换 id、每人独立状态机与 gap 重置、手部归属（bbox 内/腕部外扩 + 次近人 margin + 整帧左右侧按腕点纠正）、逐 track 手势去抖隔离、ROI 预算与 minScalePx、PPE 标签/几何/unknown 语义/持续门槛、平铺几何、运动/外观/最优分配、物体框坐标（像素/归一化）、导出上限与 meta 接线、face/hand 区域

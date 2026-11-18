@@ -2014,6 +2014,12 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       reach_head_R: r2(sig.armPose.reach_head_R),
       has_world: !!sig.armPose.has_world,
       hands_close: r2(sig.armPose.hands_close),
+      // 放油取样（drain_sample）：瞬时判据拆开导出，便于按窗口核对触发点
+      drain_sample: !!sig.arm.drain_sample,
+      drain_low_L: !!sig.arm.drain_low_L,
+      drain_low_R: !!sig.arm.drain_low_R,
+      drain_hands_close: !!sig.arm.drain_hands_close,
+      drain_crouched: !!sig.arm.drain_crouched,
       // 拿取相关：伸出程度与水平方位角，拟合 extend/azimuth 阈值要靠这两列
       reach_L: r2(sig.armPose.reach_L),
       reach_R: r2(sig.armPose.reach_R),

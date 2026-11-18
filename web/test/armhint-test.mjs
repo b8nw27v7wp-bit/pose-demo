@@ -201,6 +201,15 @@ check('指向提示写明要指方向/手枪', pt.line.includes('指方向/手�
 const side = explainArmActions(allReady({ act: act({ pointing: true, pointingL: true }) }));
 check('提示行带左右手粒度', side.line.startsWith('左手指向：'), side.line);
 
+// 放油取样要求双手同时成立；遮挡会让一侧 drainSampleL/R 瞬时变 false，
+// 但提示行不能因此把它说成「左手/右手放油取样」。
+const drainSide = explainArmActions(allReady({
+  act: act({ drainSample: true, drainSampleL: true, drainSampleR: false }),
+}));
+check('双侧动作不按逐侧 flag 加左右手前缀',
+  drainSide.line.startsWith('放油取样：') && !drainSide.line.includes('左手'),
+  drainSide.line);
+
 const withAcc = explainArmActions(allReady({
   act: act({ armRaised: true }),
   accuracyById: { arm_raised: { short: '召95% · 精90%', long: '召回 95%（95%CI 88–98%，n=120）' } },
