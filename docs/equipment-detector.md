@@ -319,8 +319,11 @@ node web/test/headless-multi.mjs
   `objects_ts` 相同的重复帧不重复计数；超过 `boxMaxAgeMs`（默认 600ms）没再看到就过期。
   过期过滤在匹配**之前**：超龄轨迹不会因为这一次检测匹配上就续命到 hits=2
   （`update()` 只在有人的帧调用，漏检期间的旧轨迹以前正是这样绕过 `boxMinHits` 的）。
-  与检测间隔的关系由 `validateParams()` 校验：配了 `equipmentLabels` 且 `boxMinHits>1` 时要求
+  与检测间隔的关系由 `validateParams()` 校验：配了 `equipmentLabels` 且
+  （`boxMinHits>1` **或** fail-closed `equipmentFallbackRoi=false`）时要求
   `boxMaxAgeMs >= perception.objects.intervalMs + 300`，非法组合在加载时报错。
+  `boxMinHits=1` 也不等于不消费时间：fail-closed 下两次检测之间没有框证据，
+  operating Hold 每个检测周期都被清零，动作永不成立（面板必须标「不可用」而不是可用）。
 - **ROI 约束**（`boxRequireInRoi`）：框必须与本工位 ROI 相交，挡背景里别人的阀门。
   refuel 的 159 个框里 105 个中心在 ROI 外，但绝大多数与 ROI 有重叠，所以用相交而不是中心在内。
 - **人形门**（`requireUprightBox` / `requireValidity`）：横着的人体框（手/油枪特写被凑成躯干）

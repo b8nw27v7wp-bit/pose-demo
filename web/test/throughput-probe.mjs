@@ -158,7 +158,10 @@ async function main() {
       errors: errors.filter((e) => !/favicon|Failed to load resource/i.test(e)).slice(0, 2),
     };
     console.log(JSON.stringify(out));
-    exitCode = out.errors.length ? 1 : 0;
+    // 一帧都没采到（素材 404/被过滤/视频没播）时不能 exit 0：那份 fps/耗时是空的，
+    // 上层会把「没测」当成「测了且正常」。
+    if (!out.samples) console.error('没有采到任何帧：检查素材 URL、视频是否在播放、页面是否有错误');
+    exitCode = (out.errors.length || !out.samples) ? 1 : 0;
   } finally {
     await close();
   }

@@ -10,6 +10,7 @@ import {
   segmentBoxDistance, pointBoxDistance,
 } from './geometry.js';
 import { EquipmentBoxTracker } from './equipment.js';
+import { headPose, headDirection, headDirWord, DirectionHold } from './headpose.js';
 
 // MediaPipe worldLandmarks：米制、原点在髋中心、**y 向下为正**（docs/signals.md §一·五）。
 // 重力方向向量因此是 [0,1,0]；「竖直向上」是 [0,-1,0]。
@@ -110,10 +111,15 @@ export class Hold {
    * @param {number} minMs 条件需连续成立的时长
    * @param {number} maxGapMs 允许的掉帧/遮挡间隔（默认 0 = 任一帧不成立就重计时）。
    *   只给「持续事件」用（如操作设备）：手腕被设备挡住一两帧不该让计时归零。
+   * @param {number} maxCallGapMs 只针对「引擎根本没被调用」的断档（默认 0 = 不检查）。
+   *   遮挡期间 track 没丢、但该 track 连续几帧没有判定时，中间没有 cond=false 的帧；
+   *   不检查调用间隔的话，遮挡 900ms 回来后未满的 Hold 会直接成立（拿取可凭空 +1）。
+   *   与 maxGapMs 分开：不改变「cond=false 立即重置」的旧语义。
    */
-  constructor(minMs = 300, maxGapMs = 0) {
+  constructor(minMs = 300, maxGapMs = 0, maxCallGapMs = 0) {
     this.minMs = minMs;
     this.maxGapMs = maxGapMs;
+    this.maxCallGapMs = maxCallGapMs;
     this.since = null;
     this.lastTrueTs = null;
     this.active = false;
@@ -125,11 +131,14 @@ export class Hold {
     if (cond) {
       // maxGap 也要管「两次调用之间隔了多久」：人短暂丢失/引擎根本没被调用时，
       // 中间没有任何 cond=false 的帧，只在 false 分支检查 maxGap 会白续计时。
-      // maxGapMs=0 时保持旧语义（不能每帧真值都重置）。
-      if (this.maxGapMs > 0 && this.lastTrueTs !== null
-        && ts - this.lastTrueTs > this.maxGapMs) {
-        this.since = null;
-        this.active = false;
+      // maxGapMs=0 时保持旧语义（不能每帧真值都重置）；只有显式配置了
+      // maxCallGapMs 才在「真值帧之间」检查断档。
+      if (this.lastTrueTs !== null) {
+        const limit = this.maxGapMs > 0 ? this.maxGapMs : this.maxCallGapMs;
+        if (limit > 0 && ts - this.lastTrueTs > limit) {
+          this.since = null;
+          this.active = false;
+        }
       }
       this.lastTrueTs = ts;
       if (this.since === null) this.since = ts;
@@ -483,6 +492,13 @@ export class SignalEngine {
     this.minScore = p.minScore;
     this.visMin = p.visMin;
     this.minTorsoVis = p.minTorsoVis;
+    // 头部朝向：与躯干/髋无关，只吃 persons[].kp_head + kp_world。
+    // 平滑/坏点剔除复用 _smoothAngle（keys: head:yaw / head:pitch / head:roll，
+    // record=false——头部坏点不进动作层 angleRejected），不再单独维护一套 OneEuro——
+    // 否则头部角度漏掉角速度坏点门。
+    this.headCfg = p.head || {};
+    this.headPrev = { yawDir: null, pitchDir: null };
+    this.headDirHold = new DirectionHold();
   }
 
   reset() {
@@ -504,9 +520,17 @@ export class SignalEngine {
     this.velState = {};
     this.wristHist = { L: [], R: [] };
     this.boneGuard.reset();
+    this.headPrev = { yawDir: null, pitchDir: null };
+    this.headDirHold.reset();
   }
 
-  _smoothAngle(name, value, tSec) {
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.record=true] 坏点是否进本帧的动作层清单（angleRejected）。
+   *   头部角度用 false：没有动作依赖它，混进清单会让整帧被标 unreliable=angle_outlier。
+   *   诊断计数器 angleOutliers 两种情况都记。
+   */
+  _smoothAngle(name, value, tSec, { record = true } = {}) {
     if (!this.angleFilters[name]) this.angleFilters[name] = new OneEuro(this.angleOpts);
     // 单帧坏点剔除：挡住/漂移的关键点会让角度瞬间跳几十度。
     // 与上次**有效**值比较；超时（> maxDtMs）说明新值持续存在，接受它。
@@ -518,7 +542,7 @@ export class SignalEngine {
         const rate = Math.abs(value - st.v) / (dtMs / 1000);
         if (rate > this.angleJump.maxRate) {
           this.angleOutliers[name] = (this.angleOutliers[name] || 0) + 1;
-          this.angleRejected.push(name);
+          if (record) this.angleRejected.push(name);
           return NaN;
         }
       }
@@ -638,6 +662,71 @@ export class SignalEngine {
       }
       const aLW = Wp('ankle_L'), aRW = Wp('ankle_R');
       if (finite3(aLW) && finite3(aRW)) ankleMidW = v3mid(aLW, aRW);
+    }
+
+    // —— 头部朝向：不依赖躯干/髋，只要有头部的鼻/眼/耳就能判 ——
+    // 默认 2D；3D 只在 profile 显式 use3d 时启用。可信度门控（尺度/鼻-眼几何/
+    // 眼耳一致性/roll 上限）在 headpose.js；这里只做时间平滑 + 角速度坏点剔除。
+    let head = {
+      visible: false, disabled: !this.headCfg.enabled, points: 0, face_px: null, source: null,
+      yaw_source: null, pitch_source: null, roll_source: null,
+      confidence: 0, yaw: null, pitch: null, roll: null,
+      yaw_approx: false, pitch_approx: false, roll_approx: false,
+      reliable: { yaw: false, pitch: false, roll: false },
+      yaw_2d: null, pitch_2d: null, roll_2d: null,
+      yaw_dir: null, pitch_dir: null, dir: null, reasons: [],
+    };
+    if (this.headCfg.enabled) {
+      const hp = headPose(person.kp_head, w3, this.headCfg);
+      // 与关节角同一套坏点门：单帧 >1500°/s 的跳变不给滤波器，也不沿用旧值冒充当前。
+      const smooth = (name, v) => {
+        if (!Number.isFinite(v)) return { v: null, outlier: false };
+        // record=false：头部坏点只进 head.reasons（下面会加），不进动作层的 angleRejected——
+        // 没有动作依赖头部角度，混进去会让姿势正常的帧也被标成 unreliable。
+        const s = this._smoothAngle(`head:${name}`, v, tSec, { record: false });
+        return Number.isFinite(s) ? { v: s, outlier: false } : { v: null, outlier: true };
+      };
+      const sy = smooth('yaw', hp.yaw);
+      const sp = smooth('pitch', hp.pitch);
+      const sr = smooth('roll', hp.roll);
+      const hYaw = sy.v;
+      const hPitch = sp.v;
+      const hRoll = sr.v;
+      const reasons = [...hp.reasons];
+      if (sy.outlier || sp.outlier || sr.outlier) reasons.push('angle_outlier');
+      const rawDir = headDirection(
+        {
+          yaw: hYaw, pitch: hPitch,
+          // 坏点被剔除时不把原始值漏给方向层，否则等于绕过坏点门。
+          yaw_2d: Number.isFinite(hYaw) ? hp.yaw_2d : null,
+          pitch_2d: Number.isFinite(hPitch) ? hp.pitch_2d : null,
+          source_yaw: hp.yaw_source, source_pitch: hp.pitch_source,
+        },
+        this.headPrev, this.headCfg,
+      );
+      // 滞回后再做一层时间去抖：实拍里方向状态逐帧翻转率很高，UI 读不稳。
+      // 保留 rawDir 给下一帧滞回用，显示/导出用去抖后的 yawDir/pitchDir。
+      const holdMs = Number.isFinite(this.headCfg.dirHoldMs) ? this.headCfg.dirHoldMs : 200;
+      const yawDir = this.headDirHold.update('yaw', rawDir.yawDir, tSec, holdMs);
+      const pitchDir = this.headDirHold.update('pitch', rawDir.pitchDir, tSec, holdMs);
+      this.headPrev = { yawDir: rawDir.yawDir, pitchDir: rawDir.pitchDir };
+      head = {
+        visible: hp.visible, disabled: false, points: hp.points, face_px: hp.face_px,
+        source: hp.source,
+        yaw_source: hp.yaw_source, pitch_source: hp.pitch_source, roll_source: hp.roll_source,
+        confidence: hp.confidence, yaw: hYaw, pitch: hPitch, roll: hRoll,
+        yaw_approx: Number.isFinite(hYaw) && hp.yaw_approx === true,
+        pitch_approx: Number.isFinite(hPitch) && hp.pitch_approx === true,
+        roll_approx: Number.isFinite(hRoll) && hp.roll_approx === true,
+        reliable: {
+          yaw: hp.reliable.yaw && Number.isFinite(hYaw),
+          pitch: hp.reliable.pitch && Number.isFinite(hPitch),
+          roll: hp.reliable.roll && Number.isFinite(hRoll),
+        },
+        yaw_2d: hp.yaw_2d, pitch_2d: hp.pitch_2d, roll_2d: hp.roll_2d,
+        yaw_dir: yawDir, pitch_dir: pitchDir, dir: headDirWord(yawDir, pitchDir),
+        reasons: [...new Set(reasons)],
+      };
     }
 
     // 直立度：优先用躯干轴（髋中点→肩中点），四点都得够可见（单点飘了，中点就在乱动）。
@@ -1368,6 +1457,8 @@ export class SignalEngine {
         knee: Math.min(V('knee_L'), V('knee_R')),
         ankle: visAnkle, nose: V('nose'),
       },
+      // 头部朝向：只有头部点也能判（躯干/髋不可见时仍有效）
+      head,
       uprightness_2d: up2d,
       uprightness_3d: up3d,
       leg_vertical: legVertical,

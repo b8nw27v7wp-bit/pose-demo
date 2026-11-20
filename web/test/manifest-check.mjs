@@ -29,6 +29,9 @@ export const MODELS = ['full', 'heavy', 'lite'];
 // 在这里被漏掉，标注它们会被当成「未知动作」、覆盖度也能在零数据时报达标。
 export const POSTURES = ACTION_CATALOG.map((a) => a.id);
 export const ARM_LABEL_ACTIONS = ARM_ACTIONS.map((a) => a.flag);
+// 上下文动作（near_equipment）不是「做了什么」：none / noArm 反例不追究它，
+// 与 evaluate.mjs 的 culprits(includeContext=false) 同口径。
+const CONTEXT_ACTIONS = new Set(ARM_ACTIONS.filter((a) => a.context).map((a) => a.flag));
 export const REP_ACTIONS = REP_REGISTRY.map((r) => r.id);
 export const ACTIONS = [...POSTURES, ...ARM_LABEL_ACTIONS, ...REP_ACTIONS];
 
@@ -130,6 +133,10 @@ export async function coverageReport(manifest, baseDir, opts = {}) {
   const subjectsAll = new Set();
   const camerasAll = new Set();
   const unknownActions = new Set();
+  // labels 读取/解析失败必须报错，不能静默当作「这份 clip 没有正反例」：
+  // 截断的文件会让覆盖度凭空不足，最后以「未达标」(2) 收场，真正原因是文件坏了。
+  // 文件缺失不在这里报（validateManifest 已报「缺少 labels」）。
+  const labelErrors = [];
   const clips = (manifest && manifest.clips) || [];
 
   for (const c of clips) {
@@ -141,18 +148,25 @@ export async function coverageReport(manifest, baseDir, opts = {}) {
     let segments;
     try {
       segments = await loadLabels(path.resolve(baseDir, asString(c.labels)));
-    } catch {
+    } catch (e) {
+      if (e?.code !== 'ENOENT') {
+        labelErrors.push(`${c.clip || asString(c.labels)}：labels 读取/解析失败（${e?.message || e}）`);
+      }
       continue;   // 文件缺失已由 validateManifest 报错
     }
     for (const seg of segments) {
       const raw = asString(seg && seg.action);
       if (!raw) continue;
       if (raw === 'none') {
-        for (const row of Object.values(rows)) row.neg += 1;
+        for (const row of Object.values(rows)) {
+          if (!CONTEXT_ACTIONS.has(row.action)) row.neg += 1;
+        }
         continue;
       }
       if (raw === 'noArm') {
-        for (const a of ARM_LABEL_ACTIONS) if (rows[a]) rows[a].neg += 1;
+        for (const a of ARM_LABEL_ACTIONS) {
+          if (rows[a] && !CONTEXT_ACTIONS.has(a)) rows[a].neg += 1;
+        }
         continue;
       }
       const negated = raw.startsWith('!');
@@ -191,9 +205,11 @@ export async function coverageReport(manifest, baseDir, opts = {}) {
     };
   });
   const ok = outRows.every((r) => r.ok)
-    && subjectsAll.size >= minSubjects && camerasAll.size >= minCameras;
+    && subjectsAll.size >= minSubjects && camerasAll.size >= minCameras
+    && !labelErrors.length;
   return {
     rows: outRows,
+    labelErrors,
     totals: {
       clips: clips.length,
       subjects: [...subjectsAll].sort(),
@@ -269,6 +285,11 @@ function printReport(manifestPath, validation, coverage) {
   if (coverage.unknownActions.length) {
     lines.push(`未知动作（未参与统计）：${coverage.unknownActions.join(', ')}`);
   }
+  if (coverage.labelErrors?.length) {
+    lines.push('');
+    lines.push('## labels 读取失败（按 0 统计会得出错误结论）');
+    for (const e of coverage.labelErrors) lines.push(`- ${e}`);
+  }
   if (validation.errors.length) {
     lines.push('');
     lines.push('## 清单错误');
@@ -333,7 +354,8 @@ async function main() {
   } else {
     console.log(printReport(manifestPath, validation, coverage));
   }
-  if (validation.errors.length) process.exitCode = 1;
+  // 1 = 文件有错（清单/labels），2 = 覆盖度未达标。labels 解析失败属前者。
+  if (validation.errors.length || coverage.labelErrors?.length) process.exitCode = 1;
   else if (!coverage.ok) process.exitCode = 2;
 }
 

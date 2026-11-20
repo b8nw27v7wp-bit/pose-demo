@@ -18,6 +18,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { SignalEngine } from '../js/signals.js';
 import { profileParams } from '../js/params.js';
+import { ARM_ID_TO_FLAG } from '../js/actions.js';
 import { summarize, overlapCoefficient } from '../js/stats.js';
 import {
   loadFrames, loadLabels as readLabels, frameTs, stripBom, videoTimeMonotonic,
@@ -114,15 +115,21 @@ function fmtStats(s, digits = 2) {
  *  - start/end：毫秒，与 ts 同基准。
  *  - startFrame/endFrame：帧序号。
  */
-function buildRanges(labels, action, frames) {
+export function buildRanges(labels, action, frames) {
   const ranges = [];
   if (!labels || !action) return ranges;
   // 循环素材的 video_time 会回绕：同一秒数对应多帧，不能拿 video_time 比。
   // 这种情况退回「相对首帧的 ts」（t0 + sec*1000），与无 video_time 时的口径一致。
   const hasVideo = frames.some((f) => Number.isFinite(f.video_time)) && videoTimeMonotonic(frames);
   const t0 = frameTs(frames[0]);
+  // labels 里手臂动作既可能写注册表 id（arm_raised）也可能写 flag（armRaised）；
+  // --action 允许任一种写法。不归一的话 `--action arm_raised` 匹配恒 0。
+  const want = ARM_ID_TO_FLAG[action] || action;
   for (const seg of labels) {
-    if (seg.action !== action) continue;
+    const raw = String(seg?.action ?? '');
+    if (!raw || raw.startsWith('!')) continue;   // 反例窗口不是正例采样
+    if (seg.expect === false) continue;          // 同上，expect:false 也算反例
+    if ((ARM_ID_TO_FLAG[raw] || raw) !== want) continue;
     if (Number.isFinite(seg.startSec) && Number.isFinite(seg.endSec)) {
       const lo = seg.startSec * 1000;
       const hi = seg.endSec * 1000;
@@ -273,7 +280,8 @@ async function main() {
   }
   if (args.report) {
     await writeFile(args.report, report, 'utf8');
-    console.log(`报告已写入 ${args.report}`);
+    // --json 时 stdout 只留 JSON；状态行走 stderr。
+    (args.json ? console.error : console.log)(`报告已写入 ${args.report}`);
   }
 }
 

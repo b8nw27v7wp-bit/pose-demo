@@ -6,7 +6,8 @@
 
 import { Tracker, iou, area, optimalAssign } from '../js/track.js';
 import {
-  PersonPipelines, assignHands, logLimitFor, LOG_LIMITS, wristSideFor,
+  PersonPipelines, assignHands, logLimitFor, LOG_LIMITS, wristSideFor, nearestHandSide,
+  HAND_ASSIGN_MAX_DIST,
   TrackShapeStabilizers, classifyHandsByTrack, bindClassifiedHands, pickRoiPersons,
 } from '../js/multi.js';
 import { readFile } from 'node:fs/promises';
@@ -139,6 +140,15 @@ console.log('\n[3] Tracker 防换 id');
   t2.update([], 4000);
   const later = t2.update([mkPerson({ cx: 302 })], 4100)[0];
   check('超时 3s 后回来 → 新 id', later.track_id !== first.track_id, `${first.track_id} → ${later.track_id}`);
+
+  // 断档后**没有**空帧调用、直接回来：prune 必须先于匹配，否则旧轨迹先被匹配上、
+  // lastTs 被刷新，本帧不再 prune，新人继承旧 id/uid（PPE 计时也续上）。
+  const t3 = new Tracker({ maxLostMs: 1500 });
+  const f3 = t3.update([mkPerson({ cx: 300 })], 1000)[0];
+  const late3 = t3.update([mkPerson({ cx: 300 })], 3000)[0];
+  check('断档 >maxLostMs 直接回来 → 新 id/uid',
+    late3.track_id !== f3.track_id && late3.track_uid !== f3.track_uid,
+    `${f3.track_id}/${f3.track_uid} → ${late3.track_id}/${late3.track_uid}`);
 }
 
 // —— 4. 跟踪：中心距离兜底 + 面积排序 ——
@@ -261,6 +271,19 @@ console.log('\n[5] PersonPipelines 隔离');
   check('prune 丢掉不再跟踪的人', pipes.size() === 1 && !pipes.map.has(2));
   pipes.reset();
   check('reset 清空', pipes.size() === 0);
+
+  // 上限只淘汰「已超过 gapMs」的流水线；仍活跃（缺席 < gapMs）的不能清掉状态机。
+  const cap = new PersonPipelines({}, { gapMs: 1000, maxPipelines: 1 });
+  cap.ensure(1, 0);
+  cap.ensure(2, 500);
+  check('满员时活跃流水线不被淘汰（临时超上限）',
+    cap.map.has(1) && cap.map.has(2), `size=${cap.size()}`);
+  cap.ensure(3, 1100);   // 1 已过期（1100 > gapMs），2 仍活跃（600ms）
+  check('过期流水线优先淘汰',
+    !cap.map.has(1) && cap.map.has(2) && cap.map.has(3), `size=${cap.size()}`);
+
+  // 死配置不该留在参数里：appearWeight 不参与 similarity，却会改变 params_hash。
+  check('appearWeight 已移除', resolveParams({}).signals.track.appearWeight === undefined);
 }
 
 // —— 6. 手部归属 ——
@@ -468,6 +491,17 @@ console.log('\n[6f] 手部侧别按姿态腕点纠正');
   const mr = assignHands([p], [roi]);
   check('ROI 结果保持裁图侧别（不被最近腕点覆盖）',
     mr.get(1).L === roi && roi.handedness === 'Left' && roi.side_from === 'roi');
+
+  // 单人道补检判断「这一侧已检出」必须和 assignHands 同口径：
+  // 归一到躯干长 + 同一个 maxDist，否则 2×scale 区间里的手会挡住补检、归属又丢掉。
+  const nh = nearestHandSide(nearL, p);
+  check('nearestHandSide 给出侧别与归一化距离', nh?.side === 'L' && Math.abs(nh.d) < 1e-9,
+    JSON.stringify(nh));
+  check('assignHands 默认阈值已导出', HAND_ASSIGN_MAX_DIST === 0.8);
+  const far = mkHand(p.kp[5][0] - 3 * p.scale, p.kp[5][1]);
+  const farNear = nearestHandSide(far, p);
+  check('远端手有侧别但超过归属阈值', farNear?.side === 'L' && farNear.d > HAND_ASSIGN_MAX_DIST,
+    JSON.stringify(farNear));
 }
 
 // —— 6d. 手势稳定器按 track 隔离 ——
@@ -727,6 +761,35 @@ console.log('\n[R12-2 接线]');
   check('手势稳定器随 track prune', /shapeStable\.prune\(live\)/.test(src));
   check('换 profile / 重置时清空逐 track 稳定器',
     /shapeStable = makeShapeStable\(activeParams\)/.test(src) && /shapeStable\.reset\(\)/.test(src));
+
+  // —— 手部链路 P1 修复的接线（2026-11-20 审核）——
+  check('单人道补检「已检出」与归属同口径（nearestHandSide + HAND_ASSIGN_MAX_DIST）',
+    /nearestHandSide\(hd, target\)[\s\S]{0,80}HAND_ASSIGN_MAX_DIST/.test(src));
+  check('单人道 ROI 补检尊重 roi.minScalePx', /target\.scale \?\? 0\) >= \(handRoiCfg\.minScalePx/.test(src));
+  check('多人 ROI 去重看 owner（不是只按 8px 腕点）',
+    /nearHand\(x, hd\) && \(ownerOf\.get\(x\) \?\? null\) === owner/.test(src));
+  check('手部连续失败自动关闭时真的释放实例', /if \(\+\+handFails > 30\) \{\s*\n\s*releaseHands\(\)/.test(src));
+  check('停止时走同一个释放入口（代次 +1）', /closeEstimator\(\);\s*\n\s*releaseHands\(\)/.test(src));
+  check('手部创建在 await 之后校验代次', (src.match(/gen !== handsGen/g) || []).length >= 2);
+  check('关闭手部不清 activeHandModel（导出 meta 保留来源）',
+    !/activeHandModel = null;[\s\S]{0,120}closeHandEstimator/.test(src));
+
+  // —— 异步/代次链路（2026-11-20 审核 P1-4/5/6/11）——
+  check('resetRuntime 推进运行时代次（在途物体结果作废）',
+    /function resetRuntime\(\) \{[\s\S]{0,200}\+\+runtimeGen;/.test(src));
+  check('图片分析 await 后校验输入/参数代次',
+    /const runGen = runtimeGen;[\s\S]{0,300}runToken !== inputSeq \|\| runGen !== runtimeGen/.test(src));
+  check('在途物体结果同时校验 runtimeGen',
+    /detGen === objectGen && detRun === runtimeGen && objectOn/.test(src));
+  check('多人创建期间换 profile → 结束后按新配置重建',
+    /multiRecreatePending = true;/.test(src) && /if \(multiRecreatePending\) \{/.test(src));
+  check('stopAll 清空 lastVerdicts（人员列表/PPE 告警不残留）',
+    /lastResult = null;\s*\n\s*lastVerdicts = \[\];/.test(src));
+  const actionsSrc = await readFile(new URL('../js/actions.js', import.meta.url), 'utf8');
+  check('非持续 Hold 统一接 maxCallGap（感知引擎调用断档）',
+    /const callGap = this\.cfg\.holds\.maxCallGap/.test(actionsSrc)
+    && /new Hold\(this\.cfg\.holds\.reach, 0, callGap\)/.test(actionsSrc)
+    && /new Hold\(p\.minMs, 0, callGap\)/.test(actionsSrc));
 }
 
 // —— 物体框坐标：MediaPipe 返回像素，不能二次乘 w/h ——

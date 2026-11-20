@@ -7,7 +7,7 @@
 
 import {
   replay, personsFromFrame, evaluateClip, toTimeline, summarize, toMarkdown,
-  autoLabelClip, loadFrames, parseSegment, pairsFromDir,
+  autoLabelClip, loadFrames, parseSegment, pairsFromDir, fitThresholds,
   wilson, postureConfusion, armCooccurrence, groupSummaries,
   evaluateGates, sweepVariants, diffSummary, compareSummaries, compareSegments,
   temporalStats, gestureFrames, gestureSummary, gestureSummaryIfAny,
@@ -19,7 +19,7 @@ import { SignalEngine } from '../js/signals.js';
 import { ActionEngine } from '../js/actions.js';
 import { videoTimeMonotonic } from './frame-io.mjs';
 import { ARM_ACTIONS, REP_ACTIONS, POSTURE_IDS } from '../js/actions.js';
-import { writeFile, readFile, mkdtemp, rm } from 'node:fs/promises';
+import { writeFile, readFile, mkdtemp, mkdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -160,6 +160,23 @@ console.log('\n[2] 鼓掌计数评估');
   const bad = evaluateClip(recs, { segments: [{ action: 'clap', start: 0, end: t, count: 3 }] }, tl);
   check('标 3 次 → 不通过', bad.segments[0].pass === false, `got=${bad.segments[0].got}`);
 
+  // 反例只要求「窗口内没有新增」：计数器在窗口内被重置（主目标丢失/换 track）时
+  // last-base 可能为负；负增量不是误报，不能判失败。
+  const emptyAct = () => ({ reps: { clap: 0 }, repPhase: {}, flags: {}, postureId: null });
+  const resetTl = [
+    { ts: -100, empty: false, act: { ...emptyAct(), reps: { clap: 2 } } },   // 窗口前基数
+    { ts: 0, empty: false, act: emptyAct() },                                // 计数器被重置
+    { ts: 100, empty: false, act: emptyAct() },
+    { ts: 300, empty: false, act: emptyAct() },
+  ];
+  const resetFrames = [frame(0, STAND), frame(100, STAND), frame(300, STAND)];
+  const negReset = evaluateClip(resetFrames, {
+    segments: [{ action: '!clap', start: 0, end: 300 }],
+  }, resetTl);
+  check('计数器重置（got<0）不算反例误报',
+    negReset.segments[0].pass === true && negReset.segments[0].got < 0,
+    `got=${negReset.segments[0].got} pass=${negReset.segments[0].pass}`);
+
   // 门控：手抬到胸前才算鼓掌。两腕垂在髋高度时开合不该计数。
   const lowRecs = [];
   t = 0;
@@ -277,6 +294,44 @@ console.log('\n[8] 回归（审查修复）');
   check('profileName 取 name', profileName(wrapped) === 'fit');
   check('profileName 缺省回退', profileName({}, 'x') === 'x');
 
+  // 试点档是产品范围的一部分：多人关闭、只有 panel 算设备证据、operating fail-closed。
+  const pilotRaw = JSON.parse(await readFile(
+    new URL('../profiles/pilot-panel.json', import.meta.url), 'utf8'));
+  const pilot = validateParams(profileParams(pilotRaw));
+  check('pilot-panel 关闭多人', pilot.perception.multi.enabled === false);
+  check('pilot-panel 只让 panel 作设备证据',
+    pilot.signals.arm.operating.equipmentLabels.length === 1
+    && pilot.signals.arm.operating.equipmentLabels[0] === 'panel');
+  check('pilot-panel operating 失败即不判',
+    pilot.signals.arm.operating.equipmentFallbackRoi === false);
+  check('pilot-panel operating 保持窗 1500/600',
+    pilot.actions.holds.operating === 1500
+    && pilot.actions.holds.operatingMaxGap === 600);
+
+  // 头部阈值写错要在加载时报错，而不是让 head 三轴静默恒 null / 方向逐帧翻转
+  //（与 validateDrainParams 同一口径）。
+  const headErr = (head) => {
+    try { validateParams({ signals: { head } }); return null; } catch (e) { return e.message; }
+  };
+  check('head 默认值通过校验', validateParams().signals.head.enabled === true);
+  const errDrop = headErr({ noseDropMin: 1.8, noseDropMax: -0.3 });
+  check('head 鼻-眼区间颠倒 → 抛错',
+    !!errDrop && /signals\.head\.noseDropMax/.test(errDrop), errDrop || '未抛错');
+  const errHyst = headErr({ yawEnter: 5, yawExit: 8 });
+  check('head enter 不大于 exit → 抛错',
+    !!errHyst && /signals\.head\.yawEnter/.test(errHyst), errHyst || '未抛错');
+  // 2D 比较的是归一化量、3D 比较的是度：把 3D 的度数抄进 2D 键时阈值永远达不到，
+  // 方向会恒为 front；负阈值同理。两种都必须在加载时报错。
+  const err2d = headErr({ pitch2dEnter: 12, pitch2dExit: 6 });
+  check('head 2D 阈值写进度数 → 抛错',
+    !!err2d && /signals\.head\.pitch2dEnter/.test(err2d), err2d || '未抛错');
+  const errNeg = headErr({ yawEnter: -15, yawExit: -20 });
+  check('head 阈值为负 → 抛错',
+    !!errNeg && /signals\.head\.yawEnter/.test(errNeg), errNeg || '未抛错');
+  const errNull = headErr(null);
+  check('head 写成 null → 抛错且指出字段',
+    !!errNull && /signals\.head=null/.test(errNull), errNull || '未抛错');
+
   const recs = [];
   for (let i = 0; i < 60; i++) recs.push(frame(i * 100, STAND));
   // 关键：用 profileParams 解包后的值喂 replay，必须真的影响判定
@@ -334,6 +389,35 @@ console.log('\n[9] 输入格式');
       { encoding: 'utf8' });
     check('JSONL 能解析（不抛异常）', out.includes('帧数 5'), out.split('\n')[1] || '');
     check('JSONL 的 meta 行被跳过', !out.includes('(未检出)') || out.split('\n').length >= 5);
+
+    // --json 时 stdout 必须只有 JSON（“已写入 …”状态行走 stderr），否则 jq/JSON.parse 会失败。
+    const labelsPath = path.join(dir, 'a.labels.json');
+    await writeFile(labelsPath, JSON.stringify({
+      name: 'a', segments: [{ action: 'stand', start: 0, end: 400 }],
+    }));
+    // 评估器在段失败时退出码 2；这里只关心 stdout，别让 execFileSync 抛掉输出。
+    const runCli = (args) => {
+      try {
+        return execFileSync(process.execPath, [path.join(process.cwd(), 'web/test/evaluate.mjs'), ...args],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (e) {
+        return e.stdout || '';
+      }
+    };
+    const jsonOut = runCli([
+      '--input', jsonl, '--labels', labelsPath,
+      '--json', '--report', path.join(dir, 'report.md'),
+    ]);
+    let parsed = null;
+    try { parsed = JSON.parse(jsonOut); } catch { /* 解析失败下面判 */ }
+    check('--json + --report：stdout 只有 JSON', parsed?.mode === 'single',
+      jsonOut.slice(0, 80));
+    // --quiet 也要压住状态行（--report 仍会写文件）。
+    const quietOut = runCli([
+      '--input', jsonl, '--labels', labelsPath,
+      '--quiet', '--report', path.join(dir, 'report2.md'),
+    ]);
+    check('--quiet 时 stdout 为空', quietOut.trim() === '', JSON.stringify(quietOut));
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -354,6 +438,12 @@ console.log('\n[10] pairsFromDir');
       ['d.labels.draft.json', '{"segments":[]}'],
     ]) await writeFile(path.join(dir, name), body);
 
+    // 递归：子目录里的 labels + 同名帧要找到；只有 labels 没有帧的要跳过。
+    await mkdir(path.join(dir, 'nested'), { recursive: true });
+    await writeFile(path.join(dir, 'nested', 'e.jsonl'), '{"ts":0}\n');
+    await writeFile(path.join(dir, 'nested', 'e.labels.json'), '{"segments":[]}');
+    await writeFile(path.join(dir, 'orphan.labels.json'), '{"segments":[]}');
+
     const pairs = await pairsFromDir(dir);
     const names = pairs.map((p) => path.basename(p.frames)).sort();
     check('识别 .jsonl 帧', names.includes('a.jsonl'));
@@ -364,6 +454,49 @@ console.log('\n[10] pairsFromDir');
       === path.join(dir, 'a.labels.json'));
     check('没有同名 labels 也保留（由评估器报缺）', pairs.find((p) => p.frames.endsWith('c.jsonl'))?.labels === null);
     check('总对数正确', names.length === 3, names.join(','));
+
+    const rec = await pairsFromDir(dir, { recursive: true });
+    const recNames = rec.map((p) => path.basename(p.frames)).sort();
+    check('递归识别子目录 labels + 同名帧', recNames.includes('e.jsonl')
+      && rec.find((p) => p.frames.endsWith('e.jsonl'))?.labels
+        === path.join(dir, 'nested', 'e.labels.json'), recNames.join(','));
+    check('递归模式只返回有 labels 的配对', !recNames.includes('c.jsonl'), recNames.join(','));
+    check('只有 labels 没有帧的文件被跳过', recNames.length === 3, recNames.join(','));
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// —— 10b. 同一段素材的多个帧别名不能重复配对 ——
+console.log('\n[10b] 重复帧别名');
+{
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'evaldup-'));
+  try {
+    for (const [name, body] of [
+      ['dup.jsonl', '{"ts":0}\n'],
+      ['dup.frames.json', '{"frames":[]}'],
+      ['dup.labels.json', '{"segments":[]}'],
+      ['mixed.jsonl', '{"ts":0}\n'],
+      ['MIXED.labels.json', '{"segments":[]}'],
+    ]) await writeFile(path.join(dir, name), body);
+    const pairs = await pairsFromDir(dir);
+    const dups = pairs.filter((p) => path.basename(p.frames).startsWith('dup.'));
+    check('a.jsonl 与 a.frames.json 只配对一次', dups.length === 1 && dups[0].labels != null,
+      JSON.stringify(pairs.map((p) => path.basename(p.frames))));
+    check('优先当前 JSONL 格式', dups[0].frames.endsWith('dup.jsonl'), dups[0].frames);
+    const mixed = pairs.find((p) => p.frames.endsWith('mixed.jsonl'));
+    // Windows 文件系统不区分大小写：MIXED.labels.json 必须配上 mixed.jsonl；
+    // 其他平台保持原有的大小写敏感语义。
+    if (process.platform === 'win32') {
+      check('Windows 大小写不同的 labels 也能配对', mixed?.labels != null,
+        String(mixed?.labels));
+    } else {
+      check('非 Windows 保持大小写敏感', mixed?.labels === null, String(mixed?.labels));
+    }
+    const rec = await pairsFromDir(dir, { recursive: true });
+    check('递归模式同样不重复配对',
+      rec.filter((p) => path.basename(p.frames).startsWith('dup.')).length === 1,
+      JSON.stringify(rec.map((p) => path.basename(p.frames))));
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -1828,6 +1961,109 @@ console.log('\n[30] 放油取样参数校验');
   check('drain 写成 null 报错',
     errOf({ signals: { arm: { drain: null } } }).includes('signals.arm.drain'));
   check('默认参数通过校验', !!validateParams({}).signals.arm.drain);
+}
+
+// —— 31. 2026-11-20 审核 P0 回归 ——
+// 每条都对应 docs/code-review-2026-11-20.md 里的一个 P0：先有可复现的失败路径，再锁住修复。
+console.log('\n[31] 审核 P0 回归');
+{
+  // P0-1：多人导出 + 段不写 track（文档说 track 可选）曾抛 ReferenceError。
+  const mkPerson = (track_id, dx) => {
+    const kp = STAND.map(([x, y, v]) => [x + dx, y, v]);
+    const xs = kp.map((p) => p[0]);
+    const ys = kp.map((p) => p[1]);
+    return {
+      track_id, kp_format: 'mediapipe33', kp, scale: 127, score: 0.9,
+      bbox: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
+    };
+  };
+  const mframes = Array.from({ length: 5 }, (_, i) => ({
+    ts: i * 100, person_count: 2,
+    persons: [mkPerson(0, 0), mkPerson(1, 400)], signals: null, actions: null,
+  }));
+  const mtl = replay(mframes);
+  const evNoTrack = evaluateClip(mframes, {
+    segments: [{ action: 'stand', startFrame: 0, endFrame: 4 }],
+  }, mtl);
+  check('多人 + 段不写 track → 取段起点主目标、不抛错',
+    evNoTrack.segments.length === 1 && evNoTrack.segments[0].track === 0
+    && !evNoTrack.segments[0].error, JSON.stringify(evNoTrack.segments[0]));
+
+  // P0-3：拟合必须按段声明的 track 取信号，不能恒用主目标。
+  const repRow = (knee) => ({
+    ts: 0, empty: false,
+    sig: { knee_pick: knee, elbow_pick: 90, uprightness: 1, leg_vertical: 1, armPose: {} },
+    act: { postureId: 'sit', flags: {} },
+  });
+  const tlTracks = {
+    tracks: new Map([[0, [repRow(100)]], [1, [repRow(170)]]]),
+    primaryTrack: [0], uidToTrack: new Map(),
+  };
+  const fit = fitThresholds(
+    [{ segments: [{ action: 'sit', track: 1, start: 0, end: 100 }] }],
+    [tlTracks],
+    [[{ ts: 0 }, { ts: 100 }]],
+  );
+  check('fit 按段的 track 取信号（不是主目标）', fit['sit/knee']?.p50 === 170,
+    JSON.stringify(fit['sit/knee']));
+
+  // P0-4：旧 baseline 没有 track 时按动作回退；一条都没匹配上要判失败。
+  const gFallback = evaluateGates(
+    [{ action: 'waving', track: 0, recall: 0.1, precision: 1 }],
+    { baseline: { summary: [{ action: 'waving', recall: 1, precision: 1 }] }, maxDrop: 0.05 },
+  );
+  check('旧 baseline（无 track）→ 按动作回退并判退化',
+    gFallback.passed === false && gFallback.violations.some((v) => v.kind === 'baseline'),
+    JSON.stringify(gFallback.violations));
+  const gUnmatched = evaluateGates(
+    [{ action: 'waving', track: 0, recall: 1, precision: 1 }],
+    { baseline: { summary: [{ action: 'other', recall: 1 }] } },
+  );
+  check('baseline 一条都没匹配 → 明确失败，不假绿',
+    gUnmatched.passed === false
+    && gUnmatched.violations.some((v) => v.kind === 'baseline_unmatched'),
+    JSON.stringify(gUnmatched.violations));
+
+  // P0-5：多次拿取的草稿段必须各自有自己的起点（曾全部回溯到素材开头）。
+  const repFrames = Array.from({ length: 10 }, (_, i) => ({ ts: i * 100 }));
+  const counts = [0, 0, 0, 1, 1, 1, 2, 2, 3, 3];
+  const repTimeline = counts.map((n, i) => ({
+    ts: i * 100, empty: false,
+    act: {
+      postureId: null, flags: {},
+      reps: { grasp: n, clap: 0 },
+      repPhase: { grasp: 'reach', clap: 'down' },   // 计数帧上相位已归零，永远是起步相位
+    },
+  }));
+  const graspSegs = autoLabelClip(repFrames, repTimeline)
+    .segments.filter((s) => s.action === 'grasp');
+  check('多次拿取：3 段且起点递增（不再都从第一帧起算）',
+    graspSegs.length === 3 && graspSegs[0].start < graspSegs[1].start
+    && graspSegs[1].start < graspSegs[2].start, JSON.stringify(graspSegs));
+
+  // P0-6：Windows 编辑器另存的「UTF-8 with BOM」JSONL 必须能读。
+  const bomDir = await mkdtemp(path.join(os.tmpdir(), 'pose-bom-'));
+  try {
+    const bomFile = path.join(bomDir, 'bom.jsonl');
+    await writeFile(bomFile, `﻿${JSON.stringify({ schema: 'frame.jsonl v0', frame_count: 1 })}\n`
+      + `${JSON.stringify({ ts: 0, persons: [] })}\n`, 'utf8');
+    const bomLoaded = await loadFrames(bomFile);
+    check('BOM + 多行 JSONL 可读', bomLoaded.length === 1 && bomLoaded.meta?.frame_count === 1,
+      `n=${bomLoaded.length}`);
+  } finally {
+    await rm(bomDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // P0-8：operating 结构写错要在加载时报错，而不是运行期崩。
+  const armErr = (arm) => {
+    try { validateParams({ signals: { arm } }); return ''; } catch (e) { return e.message; }
+  };
+  const opNull = armErr({ operating: null });
+  check('signals.arm.operating 写成 null → 加载即报错',
+    /signals\.arm\.operating/.test(opNull), opNull || '未抛错');
+  const labelsStr = armErr({ operating: { equipmentLabels: 'panel' } });
+  check('equipmentLabels 写成字符串 → 加载即报错',
+    /equipmentLabels/.test(labelsStr), labelsStr || '未抛错');
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

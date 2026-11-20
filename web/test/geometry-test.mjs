@@ -6,7 +6,7 @@ import {
   polygonBBox, polygonArea, pointInPolygon, pointInAnyZone,
   clipPolygonToRect, rectPolygonIntersectionArea, rectPolygonOverlapRatio,
   maxZoneOverlap, resolveRegions, personBoxValidity, headPointsFromRaw,
-  personPlausibility, personCoveredByHand,
+  personPlausibility, personDisplayable, personCoveredByHand,
 } from '../js/geometry.js';
 
 let pass = 0;
@@ -26,6 +26,10 @@ console.log('\n[1] 旧矩形');
 {
   const r = normalizeRect({ x: 0.1, y: 0.2, w: 0.3, h: 0.4 });
   check('正常矩形原样保留', r.x === 0.1 && r.y === 0.2 && r.w === 0.3 && r.h === 0.4);
+  // 归一化值域：0.56 手滑写成 56 以前会静默把 ROI 放大 100 倍（operating 恒真）。
+  check('越界矩形判非法（w=56）', normalizeRect({ x: 0.4, y: 0.1, w: 56, h: 0.8 }) === null);
+  check('矩形超出画面判非法', normalizeRect({ x: 0.8, y: 0.1, w: 0.4, h: 0.3 }) === null);
+  check('负坐标判非法', normalizeRect({ x: -0.2, y: 0.1, w: 0.4, h: 0.3 }) === null);
   const neg = normalizeRect({ x: 0.5, y: 0.5, w: -0.2, h: -0.3 });
   check('负宽高翻正', near(neg.x, 0.3) && near(neg.y, 0.2) && near(neg.w, 0.2) && near(neg.h, 0.3),
     JSON.stringify(neg));
@@ -202,7 +206,10 @@ console.log('\n[10] 人物有效性门（personGate）');
       [407, 560, 0.18],
     ],
   };
-  const cfg = { enabled: true, minScore: 0.55, minAnchorVis: 0.4, minAspect: 0.12, maxTorsoHeight: 1.4 };
+  const cfg = {
+    enabled: true, minScore: 0.55, minAnchorVis: 0.4, minAspect: 0.12, maxTorsoHeight: 1.4,
+    minTorsoDrop: null, drawMinTorsoDrop: 0,
+  };
   const fp = personPlausibility(fake, 480, 853, cfg);
   check('细长取样管 → bbox_too_narrow', !fp.ok && fp.reasons.includes('bbox_too_narrow'),
     `aspect=${fp.aspect.toFixed(3)}`);
@@ -224,6 +231,27 @@ console.log('\n[10] 人物有效性门（personGate）');
   };
   const rp = personPlausibility(real, 1920, 1080, cfg);
   check('真实人物放行', rp.ok, rp.reasons.join(','));
+
+  // 2026-11-18 机场素材误检：设备特写被补成的人常把髋点放到肩上（drop<0，倒置）。
+  // 动作门默认不挡（逐帧剔除会打断 Hold），只在绘制骨架时挡；需要更严的 profile
+  // 可以打开 minTorsoDrop。用真实人物 fixture 只挪髋点，单独检验这两条路径。
+  const flat = { ...real, kp: real.kp.map((p) => p.slice()) };
+  flat.kp[7] = [1637.4, 596.3, 0.9];
+  flat.kp[8] = [1883.7, 596.3, 0.9];
+  const inverted = { ...real, kp: real.kp.map((p) => p.slice()) };
+  inverted.kp[7] = [1637.4, 420.0, 0.9];
+  inverted.kp[8] = [1883.7, 420.0, 0.9];
+  check('动作门默认不挡水平/倒置（避免打断 Hold）',
+    personPlausibility(flat, 1920, 1080, cfg).ok && personPlausibility(inverted, 1920, 1080, cfg).ok);
+  const fpTight = personPlausibility(inverted, 1920, 1080, { ...cfg, minTorsoDrop: 0 });
+  check('profile 打开 minTorsoDrop=0 后倒置被拒',
+    !fpTight.ok && fpTight.reasons.includes('torso_not_vertical'),
+    `drop=${fpTight.torso_drop?.toFixed(2)}`);
+  check('骨架：水平躯干（弯腰）仍绘制', personDisplayable(flat, 1920, 1080, cfg));
+  check('骨架：倒置躯干不绘制', !personDisplayable(inverted, 1920, 1080, cfg),
+    `drop=${personPlausibility(inverted, 1920, 1080, cfg).torso_drop?.toFixed(2)}`);
+  check('骨架：drawMinTorsoDrop=null 时倒置也绘制',
+    personDisplayable(inverted, 1920, 1080, { ...cfg, drawMinTorsoDrop: null }));
 
   // 缺 bbox/kp → fail-open（旧数据/测试夹具不因少字段被剔除）
   check('缺 bbox/kp fail-open', personPlausibility({ score: 0.2 }, 100, 100, cfg).ok

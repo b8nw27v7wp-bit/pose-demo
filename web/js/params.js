@@ -52,6 +52,35 @@ export const DEFAULT_PARAMS = {
     // 被模型当成人（refuel 样例实测：手+油枪特写 bbox 220×147、scale 100，被凑成躯干）。
     // minAspect = 高/宽 的下限；bbox 缺失时不设门。
     upperBody: { minAspect: 0.9 },
+    // 头部朝向（yaw/pitch/roll）：不依赖躯干/髋，只有头部 9 点也能判。
+    // 用于设备特写、头~胸构图、只有半个头出镜的场景。
+    // 符号按受试者自身：yaw 正=向右，pitch 正=低头，roll 正=左侧更低（与画面镜像无关）。
+    // 默认只用 2D：Pose 的 world 面部点实测噪声大（同一姿势 yaw 会跳 ±150°），
+    // use3d 只给实验 profile；2D 的 yaw/pitch 是近似度，输出带 *_approx。
+    head: {
+      enabled: true,
+      visMin: 0.3,
+      minPoints: 2,
+      use3d: false,
+      // —— 可信度门控（2026-11-20 实拍复核后加）——
+      // 远处小脸的眼距只有几像素，1px 噪声就是十几度：低于 minPairPx 直接不给角度。
+      minPairPx: 10,        // 眼对/耳对的像素距离下限
+      goodPairPx: 20,       // 达到这个尺度不再因尺度降置信
+      noseDropMin: -0.3,    // 去倾斜后 (鼻y-眼中心y)/眼距 的解剖范围
+      noseDropMax: 1.8,
+      maxRoll: 75,          // |roll| 超过此值 → roll 置 null
+      // 眼对/耳对 yaw 差超过此值 → yaw 置 null（背身/侧脸硬凑）。
+      // 实拍 P90≈105°、背身样例 154°；取 105° 只挡真正互相矛盾的样本。
+      maxPairDisagree: 105,
+      earYawGain: 2.4,      // 耳对回退的横向增益（耳距约眼距 2.4 倍）
+      dirHoldMs: 200,       // 方向状态去抖：稳定这么久才切换（只影响 UI/导出方向）
+      // 方向阈值带滞回：进入用 enter，退出用 exit。
+      // 2D 用原始归一化量（yaw2d/pitch2d），3D 用度数（yaw/pitch）。
+      yawEnter: 15, yawExit: 8,
+      pitchEnter: 12, pitchExit: 6,
+      yaw2dEnter: 0.3, yaw2dExit: 0.18,
+      pitch2dEnter: 0.25, pitch2dExit: 0.12,
+    },
     wave: {
       windowMs: 800,      // 挥手判定回看窗口
       deadzone: 0.10,     // 相邻帧水平位移小于此值（单位 scale）不计翻转
@@ -250,7 +279,7 @@ export const DEFAULT_PARAMS = {
       // 轻量外观 ReID：bbox 中部 2×2 网格的色相直方图。代码保留，默认关：
       // 慢放逐帧 6 序列 A/B：off 72/810 vs on 81/807，颜色直方图在拥挤/远景里
       // 不够判别，反而会接错人。要试可 profile 里开。
-      appearance: false, appearMin: 0.82, appearWeight: 0.5,
+      appearance: false, appearMin: 0.82,
     },
     // —— PPE（安全帽/手套，ppe.js）——
     // classes 是**标签名**，必须与检测模型的 label map 对上；写错时 requirePositive
@@ -344,6 +373,13 @@ export const DEFAULT_PARAMS = {
       minAspect: 0.12,         // bbox 宽/高；细长条（取样管）通常 <0.12
       maxAspect: null,         // 宽/高上限，默认关：手臂张开/出画会让 bbox 变宽，先不误杀
       maxTorsoHeight: 1.4,     // 躯干长/bbox 高；>1.4 说明 bbox 不可能装下这个躯干
+      // 动作判定用的躯干倒置门（髋在肩下多少×躯干长，0=不允许倒置）。
+      // 默认 null 关闭：逐帧剔除会打断 Hold 的连续帧——B787 面板实测把 operating
+      // 从 17 次采样打到 1 次（2026-11-18）。需要更严的 profile 可以自行打开。
+      minTorsoDrop: null,
+      // 骨架绘制门：髋不能高于肩（0；水平/弯腰允许）。设备/工件特写被补成的人
+      // 大多是倒置躯干，不画它们的骨架；动作判定仍用上面完整的人物列表。
+      drawMinTorsoDrop: 0,
       hand: {
         enabled: true,
         expand: 0.15,          // 手框外扩比例（手部 bbox 比 21 点紧）
@@ -391,6 +427,12 @@ export const DEFAULT_PARAMS = {
       upper: { minMs: 350, streak: 4, uprightGt: 0.75, leanGt: 0.0 },
     },
     holds: {
+      // 通用「调用断档」阈值：除 operating/oilSample/drainSample 这些自带 maxGap 的持续事件外，
+      // 所有 Hold 只检查「两次真值更新之间隔了多久」（引擎没被调用/该 track 连续缺帧）。
+      // 遮挡 900ms 期间 tracker 仍保留 track，回来时未满的 Hold 会直接成立、
+      // 拿取可凭空 +1；500ms 覆盖 5fps 素材（200ms/帧），又小于「遮挡—回来」的常见间隔。
+      // 不改变「cond=false 立即重置」的旧语义（maxGapMs 仍为 0）。
+      maxCallGap: 500,
       arm: 300, wave: 150, crossed: 400, hips: 400, open: 400,
       handFace: 350, bothHandsUp: 350,
       reach: 250, carry: 300, point: 250,
@@ -504,19 +546,153 @@ function validateDrainParams(drain = null) {
 }
 
 /**
+ * 头部朝向（`signals.head`）的值域校验。
+ *
+ * 与 `validateDrainParams` 同一口径：这些阈值写错不会报错、只会让头部信号静默失效。
+ * 例如 `noseDropMin >= noseDropMax`（区间反过来）时每帧都判 `nose_geometry`，
+ * yaw/pitch/roll 恒为 null；`yawEnter <= yawExit` 时方向在阈值附近逐帧抖动；
+ * `minPairPx > goodPairPx` 时置信缩放与尺度门互相矛盾。
+ *
+ * 关掉的档（`enabled:false`）不校验门控阈值：关掉就是不要这些值，不该因此拦 profile。
+ *
+ * @param {object} head 已合并默认值的 head 配置
+ * @throws {Error} 任一值非法时
+ */
+function validateHeadParams(head = null) {
+  if (!isPlain(head)) {
+    throw new Error(
+      `参数组合非法：signals.head=${JSON.stringify(head)} 必须是对象。`,
+    );
+  }
+  if (head.enabled === false) return;
+  const num = (key) => {
+    const v = head[key];
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(
+        `参数组合非法：signals.head.${key}=${JSON.stringify(v)} 必须是有限数值。`,
+      );
+    }
+    return v;
+  };
+  const range = (key, lo, hi) => {
+    const v = num(key);
+    if (v < lo || v > hi) {
+      throw new Error(
+        `参数组合非法：signals.head.${key}=${v} 必须在 ${lo}~${hi} 之间。`,
+      );
+    }
+    return v;
+  };
+  // 滞回对：进入阈值要严格大于退出阈值，否则状态机会在阈值附近来回翻；
+  // 同时约束量纲与符号——2D 组比较的是归一化量（-1~1），3D 组比较的是度（0~90）。
+  // 把 3D 的度数写进 2D 键（例如 pitch2dEnter:12）时 2D 永远达不到阈值，方向恒 front，
+  // 这类错法不会抛错、只会静默失效，所以必须在加载时拦住。
+  const descending = (enterKey, exitKey, max) => {
+    const enter = num(enterKey);
+    const exit = num(exitKey);
+    if (exit < 0 || enter > max) {
+      throw new Error(
+        `参数组合非法：signals.head.${enterKey}=${enter} / ${exitKey}=${exit} `
+        + `必须在 0~${max} 之间（${max === 1 ? '2D 归一化量' : '3D 度数'}）。`,
+      );
+    }
+    if (!(enter > exit)) {
+      throw new Error(
+        `参数组合非法：signals.head.${enterKey}=${enter} 必须大于 ${exitKey}=${exit}，`
+        + ' 否则方向滞回失效、阈值附近逐帧翻转。',
+      );
+    }
+  };
+
+  range('visMin', 0, 1);
+  const minPoints = range('minPoints', 1, 9);
+  if (!Number.isInteger(minPoints)) {
+    throw new Error(`参数组合非法：signals.head.minPoints=${minPoints} 必须是整数。`);
+  }
+  const minPairPx = range('minPairPx', 0, Infinity);
+  const goodPairPx = num('goodPairPx');
+  if (!(goodPairPx > 0) || goodPairPx < minPairPx) {
+    throw new Error(
+      `参数组合非法：signals.head.goodPairPx=${goodPairPx} 必须 > 0 且 >= `
+      + `minPairPx=${minPairPx}（尺度门与置信缩放用的是同一个眼对距离）。`,
+    );
+  }
+  const dropMin = num('noseDropMin');
+  const dropMax = num('noseDropMax');
+  if (!(dropMax > dropMin)) {
+    throw new Error(
+      `参数组合非法：signals.head.noseDropMax=${dropMax} 必须大于 `
+      + `noseDropMin=${dropMin}，否则鼻-眼几何门对每一帧都成立，三轴恒为 null。`,
+    );
+  }
+  range('maxRoll', 0, 90);
+  range('maxPairDisagree', 0, 180);
+  const gain = num('earYawGain');
+  if (!(gain > 0)) {
+    throw new Error(`参数组合非法：signals.head.earYawGain=${gain} 必须 > 0。`);
+  }
+  const hold = num('dirHoldMs');
+  if (hold < 0) {
+    throw new Error(`参数组合非法：signals.head.dirHoldMs=${hold} 必须 >= 0（0 = 关闭去抖）。`);
+  }
+  descending('yawEnter', 'yawExit', 90);
+  descending('pitchEnter', 'pitchExit', 90);
+  descending('yaw2dEnter', 'yaw2dExit', 1);
+  descending('pitch2dEnter', 'pitch2dExit', 1);
+}
+
+/**
+ * `signals.arm.operating` / `nearEquipment` 的结构校验。
+ *
+ * deepMerge 遇到 null / 数组 / 字符串会**整段替换**默认对象：
+ *   · `operating: null` → SignalEngine 构造读 `operating.boxMinHits` 抛 TypeError，
+ *     经 loopSafe 进入 stopLoop，整页停止推理；
+ *   · `equipmentLabels: "panel"`（字符串）→ 逐帧 `(labels || []).map` 抛错，同样停摆。
+ * 这两类都属于「加载时能拦住就不该让运行期崩」，与 drain/head 的整段类型校验同一口径。
+ *
+ * @param {object} arm 已合并默认值的 signals.arm
+ * @throws {Error} 结构非法时
+ */
+function validateArmStructure(arm = null) {
+  if (!isPlain(arm)) {
+    throw new Error(`参数组合非法：signals.arm=${JSON.stringify(arm)} 必须是对象。`);
+  }
+  for (const key of ['operating', 'nearEquipment']) {
+    const v = arm[key];
+    if (!isPlain(v)) {
+      throw new Error(
+        `参数组合非法：signals.arm.${key}=${JSON.stringify(v)} 必须是对象。`,
+      );
+    }
+  }
+  const labels = arm.operating.equipmentLabels;
+  if (labels != null && !Array.isArray(labels)) {
+    throw new Error(
+      `参数组合非法：signals.arm.operating.equipmentLabels=${JSON.stringify(labels)} `
+      + '必须是数组（设备类别名列表；没配就写 []）。',
+    );
+  }
+}
+
+/**
  * 参数一致性校验：非法组合在**加载时**报错，而不是让判定静默失效。
  *
  * 硬约束：
  *   1. 放油取样（`signals.arm.drain`）：`minKnee <= maxKnee`（区间反了时 `drainCrouched`
  *      对所有帧恒 false）、`maxHandsClose > 0`、膝角/抬臂角都在 0–180、直立度在 −1–1。
  *      这些值写错时动作会静默失效，排查只能逐帧看信号，所以在加载/评估器读取时就拦住。
- *   2. 设备框的时序确认要求框的有效期覆盖检测间隔：
- *   `equipmentLabels` 非空 且 `boxMinHits > 1` 时，`boxMaxAgeMs >= objects.intervalMs + 300`。
- * 违反时，两次检测之间的普通帧会先把轨迹过期，下一次检测又从 hits=1 开始，框永远累计不到
- * `minHits`，operating 会整段丢掉设备证据（审查实测 intervalMs=1000：确认态 328/366 → 4/30）。
+ *   2. 头部朝向（`signals.head`）：鼻-眼几何区间、2D/3D 的 enter/exit 滞回对、尺度门
+ *      （`minPairPx`/`goodPairPx`）与其余值域；写错的后果同上（三轴恒 null 或方向抖动）。
+ *   3. 设备框的时序确认要求框的有效期覆盖检测间隔：
+ *   `equipmentLabels` 非空 且（`boxMinHits > 1` 或 fail-closed `equipmentFallbackRoi=false`）时，
+ *   `boxMaxAgeMs >= objects.intervalMs + 300`。
+ * 违反时，两次检测之间的普通帧会先把轨迹过期：`boxMinHits > 1` 时下一次检测又从 hits=1 开始，
+ * 框永远累计不到 `minHits`；fail-closed 时那段时间没有任何设备证据，operating Hold 每个检测周期
+ * 都被清零，动作永不成立。审查实测 intervalMs=1000、boxMaxAgeMs=600 下确认态 328/366 → 4/30。
  * 300ms 是 ONNX 推理耗时量级；不静默自动放大 maxAge——那会让「框在不在」的语义随配置漂移。
  *
- * 只约束「时序确认真的在用」的组合：没配设备类别、或 boxMinHits=1 时不消费这两条时间。
+ * 没配设备类别（不消费设备框）时不约束；有 ROI 兜底（equipmentFallbackRoi=true）且
+ * boxMinHits=1 时，框过期会退回 ROI，也不会出现「被清零」的静默失效，因此不强制。
  *
  * @param {object} overrides profile 覆盖项（与 resolveParams 同一口径）
  * @throws {Error} 组合非法时
@@ -525,12 +701,17 @@ function validateDrainParams(drain = null) {
 export function validateParams(overrides = {}) {
   const resolved = resolveParams(overrides);
   validateDrainParams(resolved.signals?.arm?.drain);
+  validateHeadParams(resolved.signals?.head);
+  validateArmStructure(resolved.signals?.arm);
   const op = resolved.signals?.arm?.operating || {};
   const labels = Array.isArray(op.equipmentLabels) ? op.equipmentLabels : [];
   const minHits = Number(op.boxMinHits);
   const maxAge = Number(op.boxMaxAgeMs);
   const interval = Number(resolved.perception?.objects?.intervalMs);
-  if (!labels.length || !(minHits > 1) || !Number.isFinite(maxAge) || !Number.isFinite(interval)) {
+  // boxMinHits=1 也不代表不消费时间：fail-closed（ROI 不兜底）时框一过期，
+  // 两次检测之间就没有任何设备证据，operating 会被 Hold 清零。
+  const consumesBoxLifetime = minHits > 1 || op.equipmentFallbackRoi === false;
+  if (!labels.length || !consumesBoxLifetime || !Number.isFinite(maxAge) || !Number.isFinite(interval)) {
     return resolved;
   }
   const minMaxAge = interval + BOX_MAX_AGE_MARGIN_MS;

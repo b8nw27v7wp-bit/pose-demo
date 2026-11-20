@@ -217,6 +217,21 @@ console.log('\n[8] 参数一致性：boxMaxAgeMs 必须覆盖检测间隔');
   check('boxMinHits=1（关闭时序确认）时不约束',
     validateParams({ signals: { arm: { operating: op({ boxMinHits: 1 }) } }, perception: { objects: { intervalMs: 1000 } } })
       .signals.arm.operating.boxMinHits === 1);
+  // fail-closed 时即使 boxMinHits=1 也消费「框有效期」：两次检测之间没有框证据，
+  // operating Hold 每个周期被清零，动作永不成立。
+  let errFc = null;
+  try {
+    validateParams({
+      signals: { arm: { operating: op({ boxMinHits: 1, boxMaxAgeMs: 600, equipmentFallbackRoi: false }) } },
+      perception: { objects: { intervalMs: 1000 } },
+    });
+  } catch (e) { errFc = e; }
+  check('boxMinHits=1 + fail-closed 也要覆盖检测间隔', !!errFc, errFc?.message?.slice(0, 60));
+  check('fail-closed 但 interval 150 时通过',
+    validateParams({
+      signals: { arm: { operating: op({ boxMinHits: 1, boxMaxAgeMs: 600, equipmentFallbackRoi: false }) } },
+      perception: { objects: { intervalMs: 150 } },
+    }).signals.arm.operating.boxMaxAgeMs === 600);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

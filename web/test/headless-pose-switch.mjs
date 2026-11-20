@@ -42,7 +42,7 @@ try {
   })()`);
   check('先发请求被取代（superseded，不是加载失败）', single.first.superseded, single.first.message);
   check('后发请求创建成功', single.second === 'fulfilled');
-  check('最终槽位是后发模型 lite', /^lite\\|CPU\\|/.test(single.info.key), `key=${single.info.key}`);
+  check('最终槽位是后发模型 lite', /^lite\|CPU\|/.test(single.info.key), `key=${single.info.key}`);
   check('closeEstimator 后槽位为空', single.closedReady === false);
   console.log(`  ..  用时 ${single.ms}ms`);
 
@@ -66,7 +66,7 @@ try {
   })()`);
   check('先发多人请求被取代', multi.first.superseded, multi.first.message);
   check('后发多人请求创建成功', multi.second === 'fulfilled');
-  check('最终多人槽位是 lite', /^lite\\|CPU\\|/.test(multi.info.key), `key=${multi.info.key}`);
+  check('最终多人槽位是 lite', /^lite\|CPU\|/.test(multi.info.key), `key=${multi.info.key}`);
   check('closeMultiEstimator 后槽位为空', multi.closedReady === false);
 
   console.log('\n[3] 在途创建时关闭：不能再安装到槽位');

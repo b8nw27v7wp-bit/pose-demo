@@ -70,7 +70,22 @@
     "near_equipment_overlap": 0.42,
     "near_equipment_zone": "panel",    // 多边形 ROI 重叠最大的 zone id
     "near_equipment_source": "polygon",// equipment|rect|polygon|null
-    "near_equipment_validity": null    // 开启 validity 时为 {enabled,ok,area_ratio,...,reasons}
+    "near_equipment_validity": null,   // 开启 validity 时为 {enabled,ok,area_ratio,...,reasons}
+    // 头部朝向：只吃 persons[].kp_head（+ 可选 kp_world），不依赖躯干/髋。
+    // 全部按受试者自身方向：yaw 正=向右，pitch 正=低头，roll 正=左侧更低；与画面镜像无关。
+    // 2D 是近似度，带 *_approx；reliable 表示幅度是否可信；门控失败时角度为 null。
+    // 方向带滞回 + dirHoldMs 去抖，不参与动作 Hold。
+    "head": {
+      "visible": true, "points": 9, "face_px": 20.4, "source": "2d",
+      "yaw_source": "2d", "pitch_source": "2d", "roll_source": "2d",
+      "confidence": 0.85,
+      "yaw": -12.4, "pitch": 8.1, "roll": 2.0,
+      "yaw_approx": true, "pitch_approx": true, "roll_approx": true,
+      "reliable": { "yaw": true, "pitch": true, "roll": true },
+      "yaw_2d": -0.21, "pitch_2d": 0.18, "roll_2d": 2.0,
+      "yaw_dir": "left", "pitch_dir": "down", "dir": "left_down",
+      "reasons": []
+    }
   },
   "actions": {                      // 规则层输出
     "posture": "stand",             // stand|sit|upper_upright|upper_lean；连髋都不可见时为 null。躺卧/下蹲已下线
@@ -193,7 +208,7 @@
 | `kp[][0..1]` | 像素 | 相对原始视频分辨率（不是 CSS 尺寸），原点左上 |
 | `kp[][2]` | 0~1 | 置信度；< 0.3 的点不参与滤波与角度计算 |
 | `kp_head[][0..1]` | 像素 | 可选：9 个头部点（鼻/眼/耳），供 PPE 头部区域使用 |
-| `kp_head[][2]` | 0~1 | 头部点的 MediaPipe visibility |
+| `kp_head[][2]` | 0~1 | 头部点的 MediaPipe visibility；缺失时按可见处理（旧数据只有 `[x,y]`） |
 | `kp_world[][0..2]` | 米 | MediaPipe worldLandmarks：原点髋中心，**y 向下为正** |
 | `scale` | 像素 | 躯干长；2D 距离阈值的除数（保持像素以兼容既有数据） |
 | `scale_world` | 米 | 世界躯干长；3D 距离/比值的除数 |

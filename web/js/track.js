@@ -108,7 +108,7 @@ export class Tracker {
     // 轻量外观 ReID：desc 由调用方从图像 bbox 算好（归一化颜色直方图）
     // 默认关：MOT17 6 序列 A/B 实测 on 比 off 多约 10 次 ID 切换（颜色直方图在拥挤/远景里
     // 不够判别，会把旧轨迹接到错的人身上）。只保留"丢失后重连"用法，profile 可显式打开。
-    appearance = false, appearMin = 0.82, appearWeight = 0.5,
+    appearance = false, appearMin = 0.82,
     // 分配算法：greedy（默认）或 optimal（≤6×4 时穷举最大总分配）
     assignment = 'greedy',
   } = {}) {
@@ -124,7 +124,6 @@ export class Tracker {
     this.motionGapRatio = motionGapRatio;
     this.appearance = appearance;
     this.appearMin = appearMin;
-    this.appearWeight = appearWeight;
     this.assignment = assignment;
     this.nextId = 1;
     // track_uid：与 track_id 同时分配，但**不参与匹配**，track_id 的分配/匹配逻辑完全不动
@@ -243,6 +242,11 @@ export class Tracker {
     const dets = persons.filter((p) => p && Array.isArray(p.bbox) && area(p.bbox) > 0);
     const assigned = new Map(); // detIndex -> track
 
+    // 先 prune 再匹配：超过 maxLostMs 的旧轨迹不能参与本帧匹配。
+    // 以前在匹配之后 prune，断档 > maxLostMs 时旧轨迹先被匹配上、lastTs 被刷新，
+    // 本帧就不再 prune——新人会继承旧 id/uid，PPE 计时也跟着续上。
+    this.prune(ts);
+
     // 全局贪心：所有 (轨迹, 检测) 配对按相似度从高到低分配。
     // 逐个轨迹各自取最优会在两人交叉时抢同一个框，换人更频繁。
     const trackList = [...this.tracks.values()];
@@ -304,7 +308,6 @@ export class Tracker {
       });
     }
 
-    this.prune(ts);
     out.sort((a, b) => area(b.bbox) - area(a.bbox));
     return out;
   }

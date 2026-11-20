@@ -388,6 +388,10 @@ export function evaluatePpe(clips, opts = {}) {
       groups.set(k, {
         target, camera,
         nSegments: 0, nPredicted: 0, ambiguousSegments: 0, noDataSegments: 0, abstained: 0,
+        // 标签侧的段数（不受绑定成败影响）：判断「有 missing 标注却从未评上」
+        labelCounts: Object.fromEntries(STATES.map((s) => [s, 0])),
+        missingUnbound: 0,     // expect=missing 但 track/bbox 绑定失败
+        missingAbstained: 0,   // expect=missing 且绑定成功，但模型给 unknown
         confusion: Object.fromEntries(STATES.map((s) => [s, { tp: 0, fn: 0, fp: 0 }])),
         latencies: [],
         alertEvents: { total: 0, true: 0, false: 0 },
@@ -399,7 +403,14 @@ export function evaluatePpe(clips, opts = {}) {
   for (const s of segments) {
     const g = groupOf(s.target, s.camera);
     g.nSegments++;
-    if (s.status !== 'ok') { g.noDataSegments++; continue; }
+    if (g.labelCounts[s.expect] != null) g.labelCounts[s.expect]++;
+    if (s.status !== 'ok') {
+      g.noDataSegments++;
+      // 有 missing 标注却没绑到 track：这类段永远不会进混淆矩阵，
+      // 只按 nRecall>0 判门槛会让「从未评估」静默通过。
+      if (s.expect === 'missing') g.missingUnbound++;
+      continue;
+    }
     g.nPredicted++;
     if (s.ambiguous) g.ambiguousSegments++;
     // 弃权口径：标签要求 definite（worn/missing）而模型给 unknown 时只记弃权，
@@ -407,6 +418,7 @@ export function evaluatePpe(clips, opts = {}) {
     // 标签要求 unknown 而模型给 definite 时，仍算该 definite 状态的 FP（无依据的断言）。
     if (s.predicted === 'unknown' && s.expect !== 'unknown') {
       g.abstained++;
+      if (s.expect === 'missing') g.missingAbstained++;
     } else {
       for (const c of STATES) {
         if (s.expect === c) {
@@ -447,7 +459,10 @@ export function evaluatePpe(clips, opts = {}) {
           const e = open.get(ek);
           if (e && ts - e.endTs <= 1000) e.endTs = ts;
           else {
-            const ne = { target, camera, key, startTs: ts, endTs: ts, true: false };
+            const ne = {
+              target, camera, clip: clip.name ?? null, key,
+              startTs: ts, endTs: ts, true: false,
+            };
             events.push(ne);
             open.set(ek, ne);
           }
@@ -458,6 +473,9 @@ export function evaluatePpe(clips, opts = {}) {
   const missingSegs = segments.filter((s) => s.status === 'ok' && s.expect === 'missing');
   for (const e of events) {
     for (const s of missingSegs) {
+      // 必须先按 clip 限定：不同素材的 ts 都从各自的 0 起算，同 camera 时时间窗天然重叠，
+      // 只看 target/camera/时间窗会把 A 段素材的误报算到 B 段素材的 missing 标注头上。
+      if (e.clip !== s.clip) continue;
       if (s.target !== e.target || s.camera !== e.camera) continue;
       if (e.endTs < s.startTs || e.startTs > s.endTs) continue;
       if (s.locked != null && e.key !== s.locked) continue;
@@ -498,6 +516,9 @@ export function evaluatePpe(clips, opts = {}) {
       ambiguousSegments: g.ambiguousSegments,
       noDataSegments: g.noDataSegments,
       abstained: g.abstained,
+      labelCounts: { ...g.labelCounts },
+      missingUnbound: g.missingUnbound,
+      missingAbstained: g.missingAbstained,
       confusion,
       unknownAbstainRate: g.nPredicted ? +(abstainN / g.nPredicted).toFixed(3) : null,
       alertLatencyMs: {
@@ -601,6 +622,24 @@ function fmtPct(x) {
   return x == null ? '—' : `${(x * 100).toFixed(1)}%`;
 }
 
+/**
+ * missing recall 门槛判定。有标注却一段都没评上（绑定失败或全部弃权）时
+ * nRecall=0、recall=null，旧逻辑直接跳过 → 「从未评估」也会 exit 0。
+ * 这里把它当失败并说明原因。
+ */
+function recallGateProblem(g, minRecall) {
+  if (minRecall == null) return null;
+  const labeled = g.labelCounts?.missing ?? 0;
+  if (!labeled) return null;
+  const c = g.confusion.missing;
+  if (c.nRecall > 0) {
+    return c.recall < minRecall
+      ? `missing recall ${fmtPct(c.recall)} < ${fmtPct(minRecall)}` : null;
+  }
+  return `missing 标注 ${labeled} 段没有一段进入评估`
+    + `（未绑定 ${g.missingUnbound ?? 0}，弃权 ${g.missingAbstained ?? 0}），recall 无法计算`;
+}
+
 export function reportMarkdown(rep, opts = {}) {
   const lines = [];
   lines.push('# PPE 事件评估（R13-1 骨架）', '');
@@ -643,10 +682,8 @@ export function reportMarkdown(rep, opts = {}) {
   }
   const problems = [];
   for (const g of rep.groups) {
-    if (opts.minRecall != null && g.confusion.missing.nRecall > 0
-      && g.confusion.missing.recall < opts.minRecall) {
-      problems.push(`${g.target}/${g.camera}: missing recall ${fmtPct(g.confusion.missing.recall)} < ${fmtPct(opts.minRecall)}`);
-    }
+    const recallProblem = recallGateProblem(g, opts.minRecall);
+    if (recallProblem) problems.push(`${g.target}/${g.camera}: ${recallProblem}`);
     if (opts.maxFa != null && g.alertEvents.perHour != null
       && g.alertEvents.perHour > opts.maxFa) {
       problems.push(`${g.target}/${g.camera}: 误报 ${g.alertEvents.perHour}/h > ${opts.maxFa}/h`);
@@ -834,6 +871,86 @@ function selfTest() {
     check('弃权率 = 1', g.unknownAbstainRate === 1, String(g.unknownAbstainRate));
   }
 
+  console.log('[self-test 7] 告警事件按 clip 匹配（同 camera 的两段素材不互相污染）');
+  {
+    // 两段素材的 ts 都从各自的 0 起算，同 camera 时时间窗天然重叠。A 段 4s 起的误报
+    // 不能被 B 段 3~8s 的 missing 标注「洗白」成真报——事件匹配必须先限定 clip。
+    const mkFrames = (alertFrom) => {
+      const frames = [];
+      for (let k = 0; k <= 9; k++) {
+        const ts = k * 1000;
+        const helmet = ts >= alertFrom
+          ? ppe('missing', 'violation', ts - alertFrom)
+          : ppe('worn');
+        frames.push(frame(ts, [V(1, 1, helmet)]));
+      }
+      return frames;
+    };
+    const rep = evaluatePpe([
+      {
+        name: 'A',
+        frames: mkFrames(4000),
+        labels: {
+          camera: 'front',
+          segments: [{ action: 'ppe', target: 'helmet', expect: 'worn', track: 1, start: 0, end: 9000 }],
+        },
+      },
+      {
+        name: 'B',
+        frames: mkFrames(Infinity),
+        labels: {
+          camera: 'front',
+          segments: [{ action: 'ppe', target: 'helmet', expect: 'missing', track: 1, start: 3000, end: 8000 }],
+        },
+      },
+    ]);
+    const g = rep.groups.find((x) => x.target === 'helmet' && x.camera === 'front');
+    check('A 的误报不被 B 的 missing 标注洗白',
+      g.alertEvents.false === 1 && g.alertEvents.true === 0, JSON.stringify(g.alertEvents));
+  }
+
+  console.log('[self-test 8] 有 missing 标注却从未评上 → 门槛必须失败');
+  {
+    // 标注指向不存在的 track：段绑定失败，永远不进入混淆矩阵。
+    const unbound = evaluatePpe([{
+      name: 'syn8a',
+      frames: [frame(0, [V(1, 1, ppe('worn'))])],
+      labels: {
+        camera: 'gate',
+        segments: [{ action: 'ppe', target: 'helmet', expect: 'missing', track: 99, start: 0, end: 0 }],
+      },
+    }]);
+    const gu = unbound.groups[0];
+    check('未绑定的 missing 段计入 labelCounts / missingUnbound',
+      gu.labelCounts.missing === 1 && gu.missingUnbound === 1
+      && gu.confusion.missing.nRecall === 0, JSON.stringify(gu.labelCounts));
+    const md = reportMarkdown(unbound, { minRecall: 0.5 });
+    check('门槛判定：从未评估 = 未达标（不是静默通过）',
+      /未达标/.test(md) && /没有一段进入评估/.test(md), md.split('\n').slice(-3).join(' | '));
+
+    // 绑定成功但全部弃权：recall 同样无法计算，也要报未达标。
+    const abstain = evaluatePpe([{
+      name: 'syn8b',
+      frames: [frame(0, [V(1, 1, ppe('unknown'))])],
+      labels: {
+        camera: 'gate',
+        segments: [{ action: 'ppe', target: 'helmet', expect: 'missing', track: 1, start: 0, end: 0 }],
+      },
+    }]);
+    const ga = abstain.groups[0];
+    check('全部弃权的 missing 段单独计数', ga.missingAbstained === 1 && ga.missingUnbound === 0,
+      JSON.stringify({ a: ga.missingAbstained, u: ga.missingUnbound }));
+    check('全部弃权也判未达标', /未达标/.test(reportMarkdown(abstain, { minRecall: 0.5 })));
+    check('没有 missing 标注时不误报', !/未达标/.test(reportMarkdown(evaluatePpe([{
+      name: 'syn8c',
+      frames: [frame(0, [V(1, 1, ppe('worn'))])],
+      labels: {
+        camera: 'gate',
+        segments: [{ action: 'ppe', target: 'helmet', expect: 'worn', track: 1, start: 0, end: 0 }],
+      },
+    }]), { minRecall: 0.5 })));
+  }
+
   console.log(`\nself-test：${pass} 通过，${fail} 失败`);
   return fail ? 1 : 0;
 }
@@ -884,15 +1001,15 @@ async function main(argv) {
   const md = reportMarkdown(rep, opts);
   if (opts.report) {
     await writeFile(opts.report, md, 'utf8');
-    if (!opts.quiet) console.log(`报告：${opts.report}`);
+    // --json 时 stdout 只留 JSON；状态行走 stderr，--quiet 时不打印。
+    if (!opts.quiet) (opts.json ? console.error : console.log)(`报告：${opts.report}`);
   }
   if (opts.json) console.log(JSON.stringify(rep, null, 2));
   else if (!opts.quiet && !opts.report) console.log(md);
 
   let bad = false;
   for (const g of rep.groups) {
-    if (opts.minRecall != null && g.confusion.missing.nRecall > 0
-      && g.confusion.missing.recall < opts.minRecall) bad = true;
+    if (recallGateProblem(g, opts.minRecall)) bad = true;
     if (opts.maxFa != null && g.alertEvents.perHour != null && g.alertEvents.perHour > opts.maxFa) bad = true;
   }
   return bad ? 2 : 0;

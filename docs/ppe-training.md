@@ -33,9 +33,12 @@
 ```bash
 py -I scripts/prepare-ppe-dataset.py --init-sources   # 生成按 data.yaml 名字预填的骨架
 # 编辑 eval-data/open/sources.json：空字符串 = 未确认
-py -I scripts/prepare-ppe-dataset.py --strict         # 缺映射直接退出非 0，不写输出
+py -I scripts/prepare-ppe-dataset.py --strict         # 缺映射/缺 split 直接退出非 0，不动已有产物
 py -I scripts/prepare-ppe-dataset.py                  # 非 strict：未映射的 class id 跳过并报告
 ```
+
+产物先写到 `*.build` 临时目录，**确认有产出后**才替换上一版：strict 下缺 split、或任何
+原因导致 0 张图产出，都会保留旧数据集并退出非 0（旧实现先删旧目录，再得到空目录、exit 0）。
 
 产物：
 

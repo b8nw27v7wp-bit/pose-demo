@@ -15,13 +15,24 @@ import { HEAD_KPT } from './kpt.js';
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
-/** 旧矩形 {x,y,w,h} → 合法矩形（负宽高翻正）；非法返回 null，不 clamp。 */
+/** 归一化坐标的容差（浮点写 0.9999999 不算越界）。 */
+const UNIT_TOL = 1e-6;
+
+/**
+ * 旧矩形 {x,y,w,h} → 合法矩形（负宽高翻正）；非法返回 null，不 clamp。
+ *
+ * 矩形坐标是**归一化** 0~1（与多边形同口径）。越界多半是手滑：把 0.56 写成 56
+ * 以前会静默把 ROI 放大 100 倍、覆盖整个画面，operating 于是恒真。多边形那条路
+ * 已经 fail-closed，这里必须一致：值域不对就返回 null，不试图猜测意图。
+ */
 export function normalizeRect(roi) {
   if (!roi || typeof roi !== 'object') return null;
   let { x, y, w, h } = roi;
   if (![x, y, w, h].every(isNum) || w === 0 || h === 0) return null;
   if (w < 0) { x += w; w = -w; }
   if (h < 0) { y += h; h = -h; }
+  if (x < -UNIT_TOL || y < -UNIT_TOL || w <= UNIT_TOL || h <= UNIT_TOL) return null;
+  if (x + w > 1 + UNIT_TOL || y + h > 1 + UNIT_TOL) return null;
   return { x, y, w, h };
 }
 
@@ -341,7 +352,7 @@ export function personPlausibility(person, frameW, frameH, cfg = {}) {
   const enabled = cfg?.enabled !== false;
   const out = {
     enabled, ok: true, known: false, reasons: [],
-    aspect: null, torso_h: null, anchor_vis: null, score: null,
+    aspect: null, torso_h: null, torso_drop: null, anchor_vis: null, score: null,
   };
   if (!enabled) return out;
 
@@ -362,6 +373,9 @@ export function personPlausibility(person, frameW, frameH, cfg = {}) {
   const hipMid = [(hipL[0] + hipR[0]) / 2, (hipL[1] + hipR[1]) / 2];
   const torso = Math.hypot(shMid[0] - hipMid[0], shMid[1] - hipMid[1]);
   out.torso_h = torso / bh;
+  // 图像 y 向下：髋中点 y 大于肩中点 y 才算「髋在肩下」。设备特写被补成的人
+  // 经常整条躯干水平甚至倒置（髋在肩上），这是与真人区分度最高的几何信号。
+  out.torso_drop = torso > 1e-6 ? (hipMid[1] - shMid[1]) / torso : null;
   const vis = [shL[2], shR[2], hipL[2], hipR[2]].filter(isNum);
   out.anchor_vis = vis.length ? Math.min(...vis) : null;
 
@@ -376,6 +390,11 @@ export function personPlausibility(person, frameW, frameH, cfg = {}) {
   if (Number.isFinite(cfg.maxTorsoHeight) && out.torso_h > cfg.maxTorsoHeight) {
     out.reasons.push('torso_too_long');
   }
+  if (out.torso_drop == null) {
+    out.reasons.push('torso_degenerate');
+  } else if (Number.isFinite(cfg.minTorsoDrop) && out.torso_drop < cfg.minTorsoDrop) {
+    out.reasons.push('torso_not_vertical');
+  }
   out.ok = out.reasons.length === 0;
   return out;
 }
@@ -388,6 +407,19 @@ export function personPlausibility(person, frameW, frameH, cfg = {}) {
  *   - 全部关键点几乎都在手框里（minAllKp）。
  * 没有手数据/缺字段时不做判定（fail-open）。
  */
+/**
+ * 骨架绘制门（与动作判定分离）：设备/工件特写被补成的人多是倒置躯干，动作层的
+ * Hold 需要连续帧，不能逐帧剔除，所以只在绘制时用 `drawMinTorsoDrop` 挡掉。
+ * 返回 true=可以画（缺字段 fail-open）。cfg 用 perception.personGate。
+ */
+export function personDisplayable(person, frameW, frameH, cfg = {}) {
+  if (!cfg || cfg.enabled === false) return true;
+  const drawDrop = Object.prototype.hasOwnProperty.call(cfg, 'drawMinTorsoDrop')
+    ? cfg.drawMinTorsoDrop
+    : 0;
+  return personPlausibility(person, frameW, frameH, { ...cfg, minTorsoDrop: drawDrop }).ok;
+}
+
 export function personCoveredByHand(person, hands, cfg = {}) {
   const out = { enabled: cfg?.enabled !== false, covered: false, known: false, reasons: [],
     anchors_inside: null, hand_area_ratio: null, kp_inside: null };

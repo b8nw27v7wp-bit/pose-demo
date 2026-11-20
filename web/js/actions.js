@@ -83,28 +83,32 @@ export class ActionEngine {
     // 姿态只有站/坐/两个上半身推断；在用计数只剩拿取（grasp），鼓掌已 retired，
     // 深蹲/俯卧撑已下线（见 buildPostures 的说明）。
     this.postures = buildPostures(this.cfg);
-    this.postureHolds = new Map(this.postures.map((p) => [p.id, new Hold(p.minMs)]));
+    // 除了自带 maxGap 的持续事件（operating/oilSample/drainSample），其余 Hold 都要能
+    // 感知「引擎根本没被调用」的断档：遮挡期间没有 cond=false 的帧，不检查调用间隔时
+    // 未满的 Hold 会在 900ms 遮挡后直接成立（reach→fist 可凭空 +1 拿取）。
+    const callGap = this.cfg.holds.maxCallGap ?? 500;
+    this.postureHolds = new Map(this.postures.map((p) => [p.id, new Hold(p.minMs, 0, callGap)]));
     this.streaks = new Map(this.postures.map((p) => [p.id, 0]));
-    this.armHold = new Hold(this.cfg.holds.arm);
-    this.waveHold = new Hold(this.cfg.holds.wave);
-    this.crossedHold = new Hold(this.cfg.holds.crossed);
-    this.hipsHold = new Hold(this.cfg.holds.hips);
-    this.openHold = new Hold(this.cfg.holds.open);
-    this.upHold = new Hold(this.cfg.holds.bothHandsUp);
-    this.headHold = new Hold(this.cfg.holds.handFace);
+    this.armHold = new Hold(this.cfg.holds.arm, 0, callGap);
+    this.waveHold = new Hold(this.cfg.holds.wave, 0, callGap);
+    this.crossedHold = new Hold(this.cfg.holds.crossed, 0, callGap);
+    this.hipsHold = new Hold(this.cfg.holds.hips, 0, callGap);
+    this.openHold = new Hold(this.cfg.holds.open, 0, callGap);
+    this.upHold = new Hold(this.cfg.holds.bothHandsUp, 0, callGap);
+    this.headHold = new Hold(this.cfg.holds.handFace, 0, callGap);
     // 油样取样：举瓶到眼前「持续在看」，1s 才成立（见 params.actions.holds.oilSample）
     this.sampleHold = new Hold(this.cfg.holds.oilSample, this.cfg.holds.oilSampleMaxGap);
     // 放油取样：蹲/跪 + 双手在阀口与接油盆之间，双手通常停留 2s 以上；同样允许短暂遮挡。
     this.drainHold = new Hold(this.cfg.holds.drainSample, this.cfg.holds.drainSampleMaxGap);
-    this.reachHold = new Hold(this.cfg.holds.reach);
-    this.carryHold = new Hold(this.cfg.holds.carry);
-    this.pointHold = new Hold(this.cfg.holds.point);
-    this.frontHold = new Hold(this.cfg.holds.front);
-    this.sideHold = new Hold(this.cfg.holds.side);
+    this.reachHold = new Hold(this.cfg.holds.reach, 0, callGap);
+    this.carryHold = new Hold(this.cfg.holds.carry, 0, callGap);
+    this.pointHold = new Hold(this.cfg.holds.point, 0, callGap);
+    this.frontHold = new Hold(this.cfg.holds.front, 0, callGap);
+    this.sideHold = new Hold(this.cfg.holds.side, 0, callGap);
     // 操作设备是持续事件：800ms 才成立，允许短暂遮挡（见 params.actions.holds.operating）
     this.operatingHold = new Hold(this.cfg.holds.operating, this.cfg.holds.operatingMaxGap);
     // 在设备旁是上下文事件：1s 才成立；和 operating 分开，不互相替代
-    this.nearEquipmentHold = new Hold(this.cfg.holds.nearEquipment);
+    this.nearEquipmentHold = new Hold(this.cfg.holds.nearEquipment, 0, callGap);
     // 拿取 = 伸手 → 合手 → 收回/抬起。手部状态由调用方逐帧传入（见 update 的 hands 参数）
     this.graspSeq = new PhaseSequence(['reach', 'grasp'], {
       minPhaseMs: this.graspCfg.minPhaseMs,

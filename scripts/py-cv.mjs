@@ -32,34 +32,47 @@ const candidates = [
   ...commands,
 ];
 
-function tryRun(cmd, argv, { quiet = true } = {}) {
+/**
+ * @param {{quiet?:boolean, timeoutMs?:number}} opts
+ *   timeoutMs=0 表示不设超时（真实运行用：长素材跑几分钟是正常的，20s 会把它杀掉）。
+ */
+function tryRun(cmd, argv, { quiet = true, timeoutMs = 20000 } = {}) {
   return new Promise((resolve) => {
     const child = spawn(cmd, argv, { stdio: quiet ? 'ignore' : 'inherit' });
     let settled = false;
+    let t = null;
     const done = (r) => {
       if (settled) return;
       settled = true;
+      if (t) clearTimeout(t);
       resolve(r);
     };
     child.once('error', (e) => done({ missing: e.code === 'ENOENT', code: 127, message: e.message }));
-    // 探测卡住（损坏的 venv / 网络路径）不能把 npm script 挂死
-    const t = setTimeout(() => {
-      try { child.kill(); } catch { /* already gone */ }
-      done({ missing: false, code: 124, message: 'timeout' });
-    }, 20000);
+    // 探测卡住（损坏的 venv / 网络路径）不能把 npm script 挂死。
+    // 只给探活设超时：真实运行套 20s 会把 video-sheet.py 在第 20 秒杀掉（退出码 124）。
+    if (timeoutMs > 0) {
+      t = setTimeout(() => {
+        try { child.kill(); } catch { /* already gone */ }
+        done({ missing: false, code: 124, message: 'timeout' });
+      }, timeoutMs);
+    }
     child.once('close', (code, signal) => {
-      clearTimeout(t);
       done({ missing: false, code: code ?? (signal ? 1 : 0) });
     });
   });
 }
 
+// 探活必须与真实运行使用同一组解释器选项：带 -I 时用户 site-packages 不在 sys.path 里，
+// 不带 -I 探活通过、真实运行却 ModuleNotFoundError（按提示重装也不会好）。
+const isolated = args[0] === '-I';
+const probeArgs = isolated ? ['-I', '-c', 'import cv2'] : ['-c', 'import cv2'];
+
 const tried = [];
 for (const cmd of candidates) {
-  const probe = await tryRun(cmd, ['-c', 'import cv2']);
+  const probe = await tryRun(cmd, probeArgs);
   tried.push(cmd);
   if (probe.missing || probe.code !== 0) continue;
-  const r = await tryRun(cmd, args, { quiet: false });
+  const r = await tryRun(cmd, args, { quiet: false, timeoutMs: 0 });
   process.exit(r.code ?? 1);
 }
 

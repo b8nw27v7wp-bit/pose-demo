@@ -37,7 +37,8 @@ import { stripBom, videoTimeMonotonic } from './frame-io.mjs';
 
 function parseArgs(argv) {
   const out = {
-    dir: null, input: null, labels: null, report: null, profile: null, out: null,
+    dir: null, dirs: [], recursive: false,
+    input: null, labels: null, report: null, profile: null, out: null,
     compare: null, baseline: null, sweep: null, sweepActions: null,
     minRecall: null, minPrecision: null, maxCountErr: null, maxDrop: 0.05,
     allowModelChange: false,
@@ -53,7 +54,12 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
-    if (a === '--dir') out.dir = next();
+    if (a === '--dir') {
+      const d = next();
+      out.dir = d;
+      out.dirs.push(d);
+    }
+    else if (a === '--recursive') out.recursive = true;
     else if (a === '--input') out.input = next();
     else if (a === '--labels') out.labels = next();
     else if (a === '--report') out.report = next();
@@ -98,12 +104,14 @@ function parseArgs(argv) {
 
 const USAGE = `用法:
   node web/test/evaluate.mjs --input <frames.json> --labels <labels.json>
-  node web/test/evaluate.mjs --dir <目录> [--profile <profile.json>] [--fit] [--report <out.md>] [--json]
+  node web/test/evaluate.mjs --dir <目录> [--dir <目录> …] [--recursive] [--profile <profile.json>] [--fit] [--report <out.md>] [--json]
   node web/test/evaluate.mjs --input <frames.json> --timeline [--every N]
   node web/test/evaluate.mjs --input <frames.json> --autolabel [--out <labels.json>]
   node web/test/evaluate.mjs --dir <目录> --compare <A.json> <B.json> [--json] [--report <out.md>]
   node web/test/evaluate.mjs --dir <目录> --sweep <a.b.c> [--sweep-actions <a,b>]
 
+  --dir             可重复；目录下 *.frames.json / *.jsonl 配同名 *.labels.json
+  --recursive       递归子目录，只返回有同名 labels 的配对（--dir 可重复）
   --timeline        逐帧打印信号与判定，用于对着视频做标注（不是评估）
   --every N         配合 --timeline，每 N 帧打一行（默认 1）
   --autolabel       按当前规则生成 labels 草稿（只含正例，反例仍需人工补）
@@ -161,7 +169,9 @@ function attachMeta(frames, meta) {
 }
 
 function parseJsonl(text) {
-  const objs = text.split(/\r?\n/).filter((l) => l.trim()).map((l) => JSON.parse(l));
+  // 导出常被 Windows 编辑器以「UTF-8 with BOM」另存；loadFrames 整体解析失败后会把
+  // **原文**交到这里，首行带 U+FEFF 会让 JSON.parse 直接抛错，所以入口统一去 BOM。
+  const objs = stripBom(text).split(/\r?\n/).filter((l) => l.trim()).map((l) => JSON.parse(l));
   // Demo 的 JSONL 首行是 meta（带 schema/exported_at、没有 persons）；
   // 其余的才是帧记录。整份都当帧会把 meta 喂给信号层。
   const metaRow = objs.find((o) => o && !Array.isArray(o.persons)
@@ -978,7 +988,9 @@ function segmentTrack(seg, range, frames, tctx, fallbackTimeline) {
     return { id };
   }
   const idx = frameIndexAt(frames, range[0]);
-  id = tctx.primaryTrack?.[idx] ?? null;
+  // 函数级声明：seg.track 分支里的 let id 只在块内可见，这里若直接赋值会在 ESM
+  // 严格模式下抛 ReferenceError（多人导出 + 段不写 track，文档里 track 是可选字段）。
+  let id = tctx.primaryTrack?.[idx] ?? null;
   if (id == null) {
     // 段起点没有人：往前找最近一帧的主目标；整份素材都没人就退回任意一个 track
     for (let i = idx; i >= 0 && id == null; i--) id = tctx.primaryTrack?.[i] ?? null;
@@ -1025,11 +1037,13 @@ export function evaluateClip(frames, labels, timeline) {
     }
 
     if (REP_IDS.includes(action)) {
-      // 计数类：正例比较增量与期望次数；反例（!clap）期望 0，多出来的都算 FP
+      // 计数类：正例比较增量与期望次数；反例（!clap）期望 0，多出来的都算 FP。
+      // 反例只要求「窗口内没有新增」：计数器在窗口内被重置（主目标丢失/换 track）时
+      // got 可能为负，负增量不是误报，不能因为 |got| > 0 判失败。
       const got = repDelta(tline, action, range);
       const want = expect ? (seg.count ?? 1) : 0;
       const tol = seg.tol ?? (expect ? 1 : 0);
-      const pass = Math.abs(got - want) <= tol;
+      const pass = expect ? Math.abs(got - want) <= tol : got <= 0;
       const r = { type: 'rep', action, expect, range, want, got, pass, ...trackExtra };
       if (!pass) r.fail = { ...ctx, signals: sigStats(tline, range, SIGNALS_FOR[action]) };
       results.push(r);
@@ -1587,7 +1601,7 @@ const quantile = (arr, q) => {
  * 关键点：深蹲的下阈要取「蹲到底」那段的低分位，上阈取「站直」段的高分位；
  * 拿全体帧的分位去定阈值，等于把蹲和站混在一起，定出来的值没有意义。
  */
-function fitThresholds(labelsByClip, timelines, framesByClip) {
+export function fitThresholds(labelsByClip, timelines, framesByClip) {
   const SIGNALS = {
     knee: (s) => s.knee_pick,
     elbow: (s) => s.elbow_pick,
@@ -1620,6 +1634,9 @@ function fitThresholds(labelsByClip, timelines, framesByClip) {
     const labels = labelsByClip[i];
     const frames = framesByClip[i];
     if (!labels || !frames) continue;
+    // 多人素材：段声明的 track 决定取谁的时间线（缺省取段起点主目标，与 evaluateClip 同口径）。
+    // 不看 track 会让 track 2 的段拿主目标的信号去定分位，拟合出的阈值用在错误的人身上。
+    const tctx = timelineContext(timeline);
     for (const seg of labels.segments || []) {
       // 反例段不能用来定阈值：它描述的是「不该出现」的状态，不是动作本身的信号分布。
       // 混进来会把 P5/P95 拉向反例（例如 `!onHips` 里自然下垂的臂距）。
@@ -1629,9 +1646,12 @@ function fitThresholds(labelsByClip, timelines, framesByClip) {
       if (parsed.action === GESTURE) continue;
       let range;
       try { range = resolveRange(seg, frames); } catch { continue; }
+      const picked = segmentTrack(seg, range, frames, tctx, timeline);
+      if (picked.error) continue;   // 段声明了不存在的 track：跳过，不拿别人的信号拟合
+      const rows = tctx.multi && picked.id != null ? (tctx.tracks.get(picked.id) || []) : timeline;
       // 计数段的分位同样要统计：深蹲下阈就看这一段里膝角的低分位
       const bucket = REP_IDS.includes(parsed.action) ? `${parsed.action}_baseline` : parsed.action;
-      for (const r of timeline) {
+      for (const r of rows) {
         if (r.empty || !r.sig || r.ts < range[0] || r.ts > range[1]) continue;
         for (const [name, get] of Object.entries(SIGNALS)) push(`${bucket}/${name}`, get(r.sig));
       }
@@ -1872,9 +1892,25 @@ export function evaluateGates(summary, opts = {}) {
   }
   if (baseline) {
     const base = baselineRows(baseline);
+    // 精确键（action + track）查不到时，若该动作在 baseline 里只有一行，回退到它：
+    // 旧单人报告没有 track 字段，按 (track, action) 精确匹配会一条都比不上、门槛假绿
+    //（docs/eval.md 承诺「旧报告没有 track 时仍按动作比对」）。多 track 时不做回退，
+    // 避免把某一条随机对到当前行上。
+    const byAction = new Map();
+    for (const b of base.values()) {
+      const list = byAction.get(b.action) || [];
+      list.push(b);
+      byAction.set(b.action, list);
+    }
+    let matched = 0;
     for (const row of summary || []) {
-      const b = base.get(rowKey(row));
+      let b = base.get(rowKey(row));
+      if (!b) {
+        const cands = byAction.get(row.action) || [];
+        if (cands.length === 1) b = cands[0];
+      }
       if (!b) continue;
+      matched += 1;
       for (const metric of ['recall', 'precision']) {
         if (row[metric] === null || row[metric] === undefined || b[metric] === null || b[metric] === undefined) continue;
         const floor = +(b[metric] - maxDrop).toFixed(3);
@@ -1886,6 +1922,13 @@ export function evaluateGates(summary, opts = {}) {
           });
         }
       }
+    }
+    // 一条都没匹配上不能当「全部达标」：多半是报告格式或字段变了，静默跳过是最坏的绿灯。
+    if (base.size && matched === 0) {
+      violations.push({
+        action: '(baseline)', metric: 'matched', value: `0/${base.size}`, threshold: '≥1',
+        kind: 'baseline_unmatched',
+      });
     }
   }
   // 留一人验证：留出者相对训练集的退化超过上限即失败（PLAN §13.4：≤10 个百分点）
@@ -2165,9 +2208,10 @@ function renderGates(gates, lines) {
     lines.push('|---|---|---|---|---|');
     for (const v of gates.violations) {
       const src = v.kind === 'baseline' ? `baseline ${v.baseline}`
-        : v.kind === 'missing' ? '缺少数据'
-          : v.kind === 'loso' ? '留一人'
-            : v.kind === 'min' ? '绝对门槛' : '上限';
+        : v.kind === 'baseline_unmatched' ? 'baseline 未匹配'
+          : v.kind === 'missing' ? '缺少数据'
+            : v.kind === 'loso' ? '留一人'
+              : v.kind === 'min' ? '绝对门槛' : '上限';
       const name = v.track != null ? `#${v.track} ${v.action}` : v.action;
       lines.push(`| ${name} | ${v.metric} | ${v.value ?? '—'} | ${v.threshold ?? '—'} | ${src} |`);
     }
@@ -2530,24 +2574,23 @@ export function autoLabelClip(frames, timeline, { name = null, mergeMs = 500, mi
     }
   }
   for (const id of LABEL_REP_IDS) {
+    // 周期起点只能**向前**记：PhaseSequence 计数的同一帧就把 index 归零，所以计数帧上的
+    // `repPhase` 已经属于下一周期（'reach'/'down'），拿 `endPhase`（'grasp'/'up'）往回找
+    // 永远找不到终点，多周期时起点会一路退到素材开头，段互相重叠。
+    // 计数器的相位名不统一：鼓掌是 down→up，拿取是 reach→grasp（PhaseSequence）。
+    const startPhase = id === 'grasp' ? 'reach' : 'down';
     let prev = null;
+    let cycleStart = null;   // 本周期最早能观测到的一帧
     for (let i = 0; i < timeline.length; i++) {
       const r = timeline[i];
-      if (r.empty) { prev = null; continue; }
+      if (r.empty) { prev = null; cycleStart = null; continue; }
       const n = r.act.reps[id];
+      const phase = r.act.repPhase?.[id];
+      if (prev === null) cycleStart = r.ts;   // 新一段观测的第一个非空帧
+      else if (phase === startPhase && n === prev && cycleStart === null) cycleStart = r.ts;
       if (prev !== null && n > prev) {
-        // 周期起点 = 最近一次进入「计数起步」相位的那帧；终点 = 计数的这一帧。
-        // 计数器的相位名不统一：鼓掌是 down→up，拿取是 reach→grasp（PhaseSequence）。
-        const startPhase = id === 'grasp' ? 'reach' : 'down';
-        const endPhase = id === 'grasp' ? 'grasp' : 'up';
-        let start = i;
-        for (let j = i; j >= 0; j--) {
-          if (timeline[j].empty) break;
-          const phase = timeline[j].act.repPhase?.[id];
-          if (phase === startPhase) start = j;
-          else if (phase === endPhase && j < i) break;
-        }
-        add(id, timeline[start].ts, r.ts, { count: n - prev });
+        add(id, cycleStart ?? r.ts, r.ts, { count: n - prev });
+        cycleStart = null;   // 下一次计数从计数后的第一个起步相位帧重新算
       }
       prev = n;
     }
@@ -2568,23 +2611,120 @@ export function autoLabelClip(frames, timeline, { name = null, mergeMs = 500, mi
 
 // —— 主流程 -------------------------------------------------------------
 
-export async function pairsFromDir(dir) {
+const isFrameName = (f) => /\.(frames\.)?(json|jsonl)$/i.test(f)
+  && !/\.labels(\.draft)?\.json$/i.test(f)
+  // manifest.json / report.json 是清单与报告，不是素材（docs/data-collection.md）
+  && !/^manifest([._-].*)?\.json$/i.test(f)
+  && !/^report([._-].*)?\.json$/i.test(f)
+  // meta 是素材元信息，不是逐帧记录
+  && !/\.meta\.json$/i.test(f);
+
+const frameBaseOf = (f) => f
+  .replace(/\.frames\.(json|jsonl)$/i, '')
+  .replace(/\.(json|jsonl)$/i, '');
+
+/** Windows 文件系统不区分大小写：配对键/去重键必须同口径，否则 a.jsonl 与 A.labels.json 配不上。 */
+const caseFold = (s) => (process.platform === 'win32' ? s.toLowerCase() : s);
+const framePairKey = (dir, base) => `${caseFold(path.resolve(dir))}\0${caseFold(base)}`;
+
+/** 同目录多个帧文件共用 base 时的取舍：优先当前 JSONL，其次旧 JSON。 */
+const frameRank = (f) => {
+  if (/\.jsonl$/i.test(f)) return 0;
+  if (/\.frames\.json$/i.test(f)) return 1;
+  return 2;
+};
+
+/**
+ * 同一 base 只保留一个帧文件。a.jsonl 与 a.frames.json 是同一段素材的两种导出，
+ * 都配上同一份 labels 会把每段重复计一次（评估器的 FP/FN 直接翻倍）。
+ */
+function pickUniqueFrames(names) {
+  const byBase = new Map();
+  for (const f of names) {
+    const base = frameBaseOf(f);
+    const key = caseFold(base);
+    const prev = byBase.get(key);
+    if (!prev) { byBase.set(key, f); continue; }
+    const keep = frameRank(f) < frameRank(prev) ? f : prev;
+    const drop = keep === f ? prev : f;
+    byBase.set(key, keep);
+    console.warn(`同目录多个帧文件共用 base「${base}」：用 ${keep}，忽略 ${drop}`);
+  }
+  return [...byBase.values()];
+}
+
+/**
+ * 递归目录里只返回「labels + 同名帧」的配对。
+ * 为什么只走 labels：eval-data 下还有 3GB 视频/训练图；按 labels 发现配对不需要读帧文件，
+ * 也不会把没有标注的素材当成评估样本。没有同名帧的 label 会跳过并告警（常见于
+ * `refuel/refuel-operating.labels.json` 这种父目录遗留副本，真正配对在 `refuel/eval/`）。
+ */
+async function labeledPairsFromDir(root) {
+  const labels = [];
+  const frames = new Map();
+  const stack = [root];
+  const seen = new Set();
+  while (stack.length) {
+    const d = stack.pop();
+    const real = path.resolve(d);
+    if (seen.has(real)) continue;
+    seen.add(real);
+    let entries;
+    try {
+      entries = await readdir(d, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' || e.name === '.git') continue;
+        stack.push(path.join(d, e.name));
+      } else if (e.isFile()) {
+        if (/\.labels\.json$/i.test(e.name)) {
+          labels.push(path.join(d, e.name));
+        } else if (isFrameName(e.name)) {
+          const key = framePairKey(real, frameBaseOf(e.name));
+          const prev = frames.get(key);
+          if (prev && frameRank(e.name) >= frameRank(path.basename(prev))) {
+            console.warn(`同目录多个帧文件共用 base「${frameBaseOf(e.name)}」：用 ${prev}，忽略 ${path.join(d, e.name)}`);
+          } else {
+            if (prev) {
+              console.warn(`同目录多个帧文件共用 base「${frameBaseOf(e.name)}」：用 ${path.join(d, e.name)}，忽略 ${prev}`);
+            }
+            frames.set(key, path.join(d, e.name));
+          }
+        }
+      }
+    }
+  }
+  const pairs = [];
+  for (const labelPath of labels) {
+    const dir = path.dirname(labelPath);
+    const base = path.basename(labelPath).replace(/\.labels\.json$/i, '');
+    const framePath = frames.get(framePairKey(dir, base));
+    if (framePath) pairs.push({ frames: framePath, labels: labelPath });
+    else console.warn(`跳过没有同名帧文件的 labels：${labelPath}`);
+  }
+  return pairs.sort((a, b) => a.frames.localeCompare(b.frames));
+}
+
+/**
+ * @param {string} dir
+ * @param {{recursive?:boolean}} opts recursive=true 时只返回有 labels 的配对；
+ *        默认 false 保持旧行为（无 labels 的帧也返回，由调用方报「跳过评估」）。
+ */
+export async function pairsFromDir(dir, { recursive = false } = {}) {
+  if (recursive) return labeledPairsFromDir(dir);
   const files = await readdir(dir);
   // 帧文件既可能是 .json（旧版 {frames} 容器）也可能是 .jsonl（当前导出格式）；
   // 排除 labels 与 autolabel 草稿，否则它们会被当成帧文件读进来。
   // 之前只认 .json，导致 README 里「导出 .jsonl 到 eval-data 再 --dir」的流程静默跳过全部素材。
-  const isFrames = (f) => /\.(frames\.)?(json|jsonl)$/i.test(f)
-    && !/\.labels(\.draft)?\.json$/i.test(f)
-    // manifest.json / report.json 是清单与报告，不是素材（docs/data-collection.md）
-    && !/^manifest([._-].*)?\.json$/i.test(f)
-    && !/^report([._-].*)?\.json$/i.test(f);
-  const baseOf = (f) => f
-    .replace(/\.frames\.(json|jsonl)$/i, '')
-    .replace(/\.(json|jsonl)$/i, '');
   const pairs = [];
-  for (const f of files.filter(isFrames)) {
-    const base = baseOf(f);
-    const labelName = files.find((l) => l === `${base}.labels.json`);
+  for (const f of pickUniqueFrames(files.filter(isFrameName))) {
+    const base = frameBaseOf(f);
+    // Windows 大小写不同也要配上（文件系统本身不区分大小写，字符串精确比较会漏配）。
+    const wantLabel = caseFold(`${base}.labels.json`);
+    const labelName = files.find((l) => /\.labels\.json$/i.test(l) && caseFold(l) === wantLabel);
     if (labelName) pairs.push({ frames: path.join(dir, f), labels: path.join(dir, labelName) });
     else pairs.push({ frames: path.join(dir, f), labels: null });
   }
@@ -2613,17 +2753,51 @@ const DEFAULT_PROFILE = {
 
 /** 读素材与标注。帧只读一次：A/B 对比和灵敏度扫描都在内存里换参数重放。 */
 async function loadPairs(args) {
-  const pairs = args.dir
-    ? await pairsFromDir(args.dir)
-    : [{ frames: args.input, labels: args.labels }];
+  const dirs = Array.isArray(args.dirs) && args.dirs.length
+    ? args.dirs
+    : (args.dir ? [args.dir] : []);
+  let pairs;
+  if (dirs.length) {
+    const lists = await Promise.all(dirs.map((d) => pairsFromDir(d, { recursive: args.recursive })));
+    const seen = new Set();
+    const seenLabels = new Set();
+    pairs = [];
+    for (const p of lists.flat()) {
+      const key = caseFold(path.resolve(p.frames));
+      if (seen.has(key)) continue;      // 重叠目录（如 eval-data 与其子目录）只算一次
+      seen.add(key);
+      // 同一份 labels 被多个帧文件配上（a.jsonl + a.frames.json，或大小写不同的别名）
+      // 会把同一段素材重复计一次；labels 是真正的评估单元，按它去重。
+      if (p.labels) {
+        const lk = caseFold(path.resolve(p.labels));
+        if (seenLabels.has(lk)) continue;
+        seenLabels.add(lk);
+      }
+      pairs.push(p);
+    }
+  } else {
+    pairs = [{ frames: args.input, labels: args.labels }];
+  }
   if (!pairs.length) throw new Error('没有找到任何帧文件');
   const loaded = [];
+  const seenNames = new Map();
   for (const pair of pairs) {
     const frames = await loadFrames(pair.frames);
     let labels = null;
     if (pair.labels) {
       labels = await loadLabels(pair.labels);
       if (!labels.name) labels.name = path.basename(pair.frames);
+      // 同一段素材的不同 fps 导出（如 incoming/neg-eq 与 negative/eval）会被当成两段，
+      // 把 FN/FP 重复计数。默认脚本已只指 incoming；递归到 eval-data 根目录时给出告警。
+      const prev = seenNames.get(labels.name);
+      if (prev) {
+        if (!args.quiet) {
+          console.warn(`⚠ 重复 clip 名「${labels.name}」：${prev} 与 ${pair.frames}；`
+            + '同一素材的不同 fps 导出会重复计数，建议只保留一套');
+        }
+      } else {
+        seenNames.set(labels.name, pair.frames);
+      }
     } else if (!args.quiet) {
       console.error(`跳过评估（无 labels）：${pair.frames}`);
     }
@@ -2935,7 +3109,9 @@ async function runSingle(args, loaded, profile) {
   }
   if (args.report) {
     await writeFile(args.report, toMarkdown(report), 'utf8');
-    console.log(`\n已写入 ${args.report}`);
+    // --json 时 stdout 只留 JSON（管道给 jq / JSON.parse 不能被状态行打断）；
+    // --quiet 时连状态行也不要。
+    if (!args.quiet) (args.json ? console.error : console.log)(`\n已写入 ${args.report}`);
   }
 
   const anyFail = run.clips.some((c) => c.segments.some((s) => !s.pass));
@@ -2979,7 +3155,7 @@ async function runCompare(args, loaded, a, b) {
   }
   if (args.report) {
     await writeFile(args.report, toCompareMarkdown(report), 'utf8');
-    console.log(`\n已写入 ${args.report}`);
+    if (!args.quiet) (args.json ? console.error : console.log)(`\n已写入 ${args.report}`);
   }
   return 0;
 }

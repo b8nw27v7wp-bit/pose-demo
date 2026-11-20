@@ -14,8 +14,9 @@
 |---|---|---|
 | 每个动作正例 | ≥ 40 | 计数类按 `count` 求和，其余按标注段数 |
 | 每个动作反例 | ≥ 20 | 含 `none` 段与 `!动作` 反例段 |
-| 人物 | ≥ 2 人 | 必须有一个**没有参与调参**的人（留一验证） |
-| 机位 | ≥ 2 个 | 至少正面 + 侧面 |
+| 人物 | ≥ 2 人 | 必须有一个**没有参与调参**的人（留一验证）；labels 顶层写 `subject` |
+| 机位 | ≥ 2 个 | 至少正面 + 侧面；labels 顶层写 `camera`，跨机位分组/留出靠它 |
+| 头部角度（pilot） | 每个分档 ≥20 段 | yaw/pitch/roll 各分档；背身/帽檐/口罩另建弃权集，不混进正档 |
 | 模型档位 | 记录 `full` / `heavy` / `lite` | 录制用 full + 30fps；量化时另跑 lite/15fps；heavy 可选 |
 
 低于这个量，报告里的百分比没有统计意义。**反例不够时，precision 恒为 1，等于没测。**
@@ -31,6 +32,8 @@
   会停止继续记录。循环素材的秒数不唯一，`evaluate` 会拒绝 `startSec/endSec` 标注。
 - 上传后视频会**先停住、等第一帧分析完再播放**（约 1~2 秒，冷启动时更久）。
   这是故意的：否则预热时间会被算进视频里，开头几秒的帧直接丢失。
+- **评测导出一律用 `scripts/deterministic-replay.mjs` 固定 fps**（通常 5fps）。同一段素材
+  10fps 与 5fps 的 TP/FN/FP 可能不同（operating 实测 5/1/3 vs 3/3/3），不能混在一张表里。
 - 播完再点「判错了」也可以，窗口会锚到最后一段（`docs/eval.md` 难例闭环）。
 
 ## 三、机位
@@ -91,6 +94,27 @@
 **变形执行**（每个动作 5~10 次）也要录，并在 labels 里如实标：幅度更小、速度更快/更慢、手臂换一侧。
 它们决定阈值留多少余量，不是"脏数据"。
 
+头部角度段（`action:"head"`，用于 `web/test/headpose-eval.mjs`）：
+
+```jsonc
+{ "action": "head", "startSec": 1.0, "endSec": 3.0,
+  "yaw": "left", "pitch": "down", "roll": "level",
+  "yawDeg": -30, "pitchDeg": 12, "rollDeg": 3 }
+```
+
+- `yaw`: `left|right|front|any`；`pitch`: `up|down|front|any`；`roll`: `left|right|level|any`。
+  左右按受试者自身；`roll` 的 `level` 容差默认 ±10°（`--roll-tol`）。
+- 分档比连续角更容易标一致：要求受试者在每段里**稳定保持**一个分档 ≥2 s；
+  如果要做 MAE，再填 `yawDeg/pitchDeg/rollDeg`（同一段内角度变化 ≤10°）。
+- 采集量：每个分档 **≥20 段**、跨 **2 个机位**（正面 + 侧面/45°），并且至少一半是
+  「脸可见」的正常构图；背身/帽檐/口罩另建一批，专门测门控的弃权率，不混进正档统计。
+- 头部段也要写顶层 `camera` / `subject`，报告会按机位/受试分组。
+
+`camera` 字段：labels 顶层（或段级）写 `"camera": "front"`，值与 manifest 的
+`front|side|oblique|close` 一致。设备/PPE 跨机位评估靠它分组：`evaluate.mjs` 的
+`groups.camera` 和 `ppe-eval.mjs` 的 `target×camera` 都从这里取；不写就只能得到
+`(未标注)` 一组，跨机位结论不成立。
+
 ## 六、反例（比正例更重要）
 
 反例决定 precision。每个反例至少 5 次、2 个机位：
@@ -113,7 +137,9 @@
 - `!动作` 或 `expect: false`：这段该动作**不应成立**，其他动作不限；
 - `noArm`：姿态不限，但不许有手臂动作（用于坐着但没有手臂动作）。
 
-> 评估器原生支持 `none`、`!动作`、`expect:false`、`noArm`；manifest 校验器按手臂动作计 `noArm` 反例。
+> 评估器原生支持 `none`、`!动作`、`expect:false`、`noArm`；manifest 校验器按手臂动作计
+> `noArm` 反例，但 `none`/`noArm` **不**给上下文动作（nearEquipment）记反例——它只回答
+> 「人在不在设备旁」，与 evaluate 的 `culprits(includeContext=false)` 同口径。
 > 单动作误报（例如站着但被误判举手）用 `!armRaised`，不要用 `none`——`none` 还要求姿态也不出现。
 >
 > **`subject` 必须填**（labels 顶层，例如 `"subject": "A"`）：留一人验证（`evaluate --loso`）
@@ -190,6 +216,8 @@ node web/test/evaluate.mjs --dir eval-data --resample 15
 `--autolabel` 只生成正例，**不会生成 `none`**；反例必须人工补。两个入口的动作清单相同，
 但计数段的合并方式不同：独立工具 `web/test/autolabel.mjs` 会把相邻计数并成一段并累加 `count`，
 内置的 `evaluate.mjs --autolabel` 逐次输出 `count: 1`。两种都要按视频核对实际次数。
+多人素材里主目标离场超过跟踪保留窗时，计数会归零再重新累计；草稿按「归零后从 1 重新起算」
+处理，离场后回来的前 N 次计数同样会进草稿（不会因为离场前的旧计数更大而被漏掉）。
 
 ## 十、常见错误
 

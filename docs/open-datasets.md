@@ -15,6 +15,9 @@ npm run fetch:data -- --skip-mot17                  # 只要 PPE 图
 等价的直接调用：`python scripts/fetch-eval-data.py ...`（Windows 上没有 `python` 命令时用 `py`）。
 
 下载目标：`eval-data/open/`（已在 `.gitignore` 里），清单写 `eval-data/open/MANIFEST.json`。
+清单记录**实际**下到的帧数/图数（`images`）与请求数（`images_requested`）、失败数（`failed`）。
+任何文件下载失败都会让退出码非 0，并跳过该 MOT17 序列的 mp4——缺帧时按现有文件编码会让
+帧号整体前移，下游按帧号对齐 `gt.txt` 就全错了。补齐后重跑，或只补标注用 `--repair-labels`。
 
 ---
 

@@ -142,6 +142,37 @@ const eqOnlyReady = explainArmActions({
 });
 check('无 ROI 且物体检测就绪 → operating 可用', eqOnlyReady.byId.operating.na === false);
 
+// fail-closed（equipmentFallbackRoi=false）：有 ROI 也不能当设备证据。
+// pilot-panel 就是「ROI + fail-closed」：关掉物体检测时 operating 恒 false，
+// 面板不能还标「可用」——否则用户只会看到动作永远不亮。
+const failClosedOff = explainArmActions({
+  operatingRoi: true,
+  operatingCfg: { equipmentLabels: ['panel'], equipmentFallbackRoi: false },
+  objectOn: false,
+  objectReady: true,
+});
+check('fail-closed + 物体检测关闭 → operating 不可用',
+  failClosedOff.byId.operating.na && failClosedOff.byId.operating.why.includes('物体检测已关闭'),
+  failClosedOff.byId.operating.why);
+check('fail-closed 跟随到 nearEquipment（默认 null 跟随 operating）',
+  failClosedOff.byId.near_equipment.na, failClosedOff.byId.near_equipment.why);
+const failClosedReady = explainArmActions({
+  operatingRoi: true,
+  operatingCfg: { equipmentLabels: ['panel'], equipmentFallbackRoi: false },
+  objectOn: true,
+  objectReady: true,
+});
+check('fail-closed + 物体检测就绪 → operating 可用', failClosedReady.byId.operating.na === false);
+const failClosedNoEq = explainArmActions({
+  operatingRoi: true,
+  operatingCfg: { equipmentFallbackRoi: false },
+  objectOn: true,
+  objectReady: true,
+});
+check('fail-closed 且没配设备类别 → 明确说「ROI 不兜底」',
+  failClosedNoEq.byId.operating.na && failClosedNoEq.byId.operating.why.includes('ROI 不兜底'),
+  failClosedNoEq.byId.operating.why);
+
 // tooltip 必须反映 profile 覆盖后的生效阈值，不能写死默认 800ms/0.35
 const opCfg = {
   roi: { x: 0.1, y: 0.1, w: 0.2, h: 0.2 },

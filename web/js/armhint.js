@@ -222,12 +222,23 @@ export function explainArmActions({
       const roiConfigured = operatingRoi ?? sig?.armPose?.operating_roi;
       const eqConfigured = Array.isArray(operatingCfg?.equipmentLabels)
         && operatingCfg.equipmentLabels.length > 0;
-      if (roiConfigured === false && !eqConfigured) {
-        reasons.push('未配置设备 ROI/检测框（profile 的 operating.roi / operating.rois 或 equipmentLabels）');
-      } else if (roiConfigured !== true && eqConfigured) {
-        // 没有 ROI，设备证据只能来自检测框：检测器没开/没加载时同样不可用。
+      // fail-closed（equipmentFallbackRoi=false）时 ROI 不能当设备证据：没有设备框就不判。
+      // nearEquipment 用自己的开关，null 表示跟随 operating。
+      const fallback = id === 'near_equipment'
+        ? (nearEquipmentCfg?.equipmentFallbackRoi ?? operatingCfg?.equipmentFallbackRoi ?? true) !== false
+        : (operatingCfg?.equipmentFallbackRoi ?? true) !== false;
+      const roiUsable = roiConfigured === true && fallback;
+      if (roiUsable) {
+        // ROI 就能提供证据，不依赖物体检测
+      } else if (eqConfigured) {
+        // 没有可用的 ROI，设备证据只能来自检测框：检测器没开/没加载时同样不可用。
+        // （fail-closed 下「没有框的帧不判」是口径，不是不可用——检测器就绪时仍算可用。）
         if (objectOn === false) reasons.push('物体检测已关闭（设备框来源）');
         else if (objectReady === false) reasons.push('物体检测未加载（设备框来源）');
+      } else {
+        reasons.push(fallback
+          ? '未配置设备 ROI/检测框（profile 的 operating.roi / operating.rois 或 equipmentLabels）'
+          : '未配置设备检测框（equipmentLabels），且 equipmentFallbackRoi=false（ROI 不兜底）');
       }
     }
     return reasons.join('；');

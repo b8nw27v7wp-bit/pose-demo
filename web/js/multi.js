@@ -111,18 +111,30 @@ const handSideKey = (hd) => (hd?.handedness === 'Left' ? 'L' : hd?.handedness ==
  * @returns {'L'|'R'|null} 两侧腕点都不可见时返回 null（保留模型输出）
  */
 export function wristSideFor(hd, person) {
+  return nearestHandSide(hd, person)?.side ?? null;
+}
+
+/**
+ * 检出腕点到该人最近可见姿态腕点的**归一化距离**（÷ 躯干长 scale）。
+ * 与 assignHands 的归属判据同一口径：不可见腕点不参与，距离按 scale 归一化。
+ * 单人道补检的「这一侧是否已检出」也用它，阈值取 HAND_ASSIGN_MAX_DIST，
+ * 否则会出现「补检以为已有、归属时又丢掉」的侧别丢失。
+ *
+ * @returns {{side:'L'|'R', d:number}|null} d = 归一化距离；无可见腕点或数据缺失时 null
+ */
+export function nearestHandSide(hd, person) {
   const w = hd?.kp?.[0];
-  if (!w || !person?.kp) return null;
+  if (!w || !person?.kp || !(person.scale > 0)) return null;
   const [hx, hy] = w;
   let side = null;
   let bestD = Infinity;
   for (const [s, wi] of [['L', 5], ['R', 6]]) {
     const q = person.kp[wi];
     if (!q || !(q[2] >= 0.3)) continue;
-    const d = Math.hypot(q[0] - hx, q[1] - hy);
+    const d = Math.hypot(q[0] - hx, q[1] - hy) / person.scale;
     if (d < bestD) { bestD = d; side = s; }
   }
-  return side;
+  return side ? { side, d: bestD } : null;
 }
 
 /**
@@ -235,7 +247,12 @@ export function pickRoiPersons(persons, target, {
  * 左右姿态腕点的距离」纠正 L/R（普通视频的 handedness 会反过来）。ROI 结果保持
  * 裁图时确定的侧别。纠正记录在 handedness_raw / side_from。
  */
-export function assignHands(persons, hands, { maxDist = 0.8, minMargin = 0.15 } = {}) {
+/**
+ * 手 → 人的最大归一化腕距（÷ 躯干长）。单人道补检判断「已检出」时必须用同一个值。
+ */
+export const HAND_ASSIGN_MAX_DIST = 0.8;
+
+export function assignHands(persons, hands, { maxDist = HAND_ASSIGN_MAX_DIST, minMargin = 0.15 } = {}) {
   const out = new Map();
   const valid = [];
   const byId = new Map();
@@ -368,13 +385,17 @@ export class PersonPipelines {
   ensure(trackId, ts) {
     let p = this.map.get(trackId);
     if (!p) {
-      // 超过上限时淘汰最久未见的那条：长会话里人进人出，不清会无限增长
+      // 超过上限时只淘汰「已经超过 gapMs 的」流水线：它们回来本来就要 reset，
+      // 丢掉只是丢缓存。仍活跃（缺席 < gapMs）的不能淘汰——以前按 lastTs 一刀切，
+      // 会在人多的场景里把刚离开一两帧的人的状态机清掉，回来时计数/滤波从零开始。
+      // 真正的回收是每帧按 tracker 活跃 id 调用的 prune()；maxPipelines 只是内存护栏。
       if (this.map.size >= this.maxPipelines) {
-        let oldest = null;
+        let stale = null;
         for (const [id, v] of this.map) {
-          if (!oldest || v.lastTs < oldest.v.lastTs) oldest = { id, v };
+          if (ts - v.lastTs <= this.gapMs) continue;
+          if (!stale || v.lastTs < stale.v.lastTs) stale = { id, v };
         }
-        if (oldest) this.map.delete(oldest.id);
+        if (stale) this.map.delete(stale.id);
       }
       p = {
         track_id: trackId,

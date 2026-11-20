@@ -132,6 +132,34 @@ console.log('\n[2] coverageReport');
     alias.unknownActions.length === 0 && alias.rows[0].action === 'armRaised'
     && alias.rows[0].pos === 1,
     JSON.stringify({ unknown: alias.unknownActions, row: alias.rows[0] }));
+
+  // 上下文动作（nearEquipment）不是「做了什么」：none / noArm 反例不追究它，
+  // 与 evaluate.mjs 的 culprits(includeContext=false) 同口径。
+  const ctxRows = await coverageReport(manifest, dir, {
+    actions: ['nearEquipment'], minPos: 0, minNeg: 0, minSubjects: 1, minCameras: 1,
+  });
+  check('none / noArm 不给上下文动作记反例', ctxRows.rows[0].neg === 0,
+    `neg=${ctxRows.rows[0].neg}`);
+  await writeFile(path.join(dir, 'ctx.labels.json'),
+    JSON.stringify({ segments: [{ action: '!nearEquipment', start: 0, end: 1000 }] }));
+  const ctxNeg = await coverageReport({
+    clips: [{ clip: 'a.frames.json', labels: 'ctx.labels.json', camera: 'front', subject: 'A', model: 'full' }],
+  }, dir, { actions: ['nearEquipment'] });
+  check('显式 !nearEquipment 才记反例', ctxNeg.rows[0].neg === 1, `neg=${ctxNeg.rows[0].neg}`);
+
+  // 截断的 labels：不能静默当 0 统计（会让覆盖度凭空不足、以「未达标」收场）。
+  await writeFile(path.join(dir, 'trunc.labels.json'), '{"segments":[{"action":"stand",');
+  const broken = await coverageReport({
+    clips: [{ clip: 'trunc.frames.json', labels: 'trunc.labels.json', camera: 'front', subject: 'A', model: 'full' }],
+  }, dir, { actions: ['stand'] });
+  check('截断的 labels 报成读取错误而不是 0 样本',
+    broken.labelErrors.length === 1 && broken.rows[0].pos === 0 && broken.ok === false,
+    JSON.stringify(broken.labelErrors));
+  // 文件缺失交给 validateManifest 报，不重复算成 labels 解析错误。
+  const missing = await coverageReport({
+    clips: [{ clip: 'gone.frames.json', labels: 'gone.labels.json', camera: 'front', subject: 'A' }],
+  }, dir, { actions: ['stand'] });
+  check('缺文件不重复报解析错误', missing.labelErrors.length === 0);
 }
 
 // —— 3. 清单骨架 ——

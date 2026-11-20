@@ -344,6 +344,7 @@ def process_dataset(root, mapping, train_split, val_splits, prefix, out_root, yo
         img_dir = os.path.join(root, split, "images")
         lbl_dir = os.path.join(root, split, "labels")
         if not os.path.isdir(img_dir):
+            print(f"  [skip] {rel(os.path.join(root, split, 'images'))} 不存在")
             continue
         out_img = os.path.join(out_root, out_split, "images")
         out_ann = os.path.join(out_root, out_split, "annotations")
@@ -451,39 +452,67 @@ def main():
     yolo_root = os.path.abspath(args.yolo_out) if args.yolo_out else None
     if yolo_root and os.path.normcase(yolo_root) == os.path.normcase(out_root):
         raise SystemExit("--out 与 --yolo-out 不能是同一个目录（VOC 与 YOLO 产物会混在一起）")
-    # 每次重建，避免上次残留的图片混进来。但只删「本脚本的产物」：--out 指到
-    # eval-data 或仓库根时，无脑 rmtree 会把源数据一起删掉（不可恢复）。
-    prepare_out_dir(out_root, VOC_ENTRIES, "--out")
-    if yolo_root:
-        prepare_out_dir(yolo_root, YOLO_ENTRIES, "--yolo-out")
+
+    # strict：split 缺失要在**删旧产物之前**报错。旧实现先 rmtree 再静默跳过，
+    # 结果是「先毁掉可用的旧数据集，再得到一个 0 张图的新目录，还返回 0」。
+    if args.strict:
+        missing = []
+        for s in usable:
+            sid = s.get("id", s["prefix"])
+            if not os.path.isdir(os.path.join(s["_root"], s["trainSplit"], "images")):
+                missing.append(f"{sid}: {s['trainSplit']}/images 不存在")
+            # valSplits 是候选名（valid / test 通常只有其中一个），至少要有 1 个。
+            if not any(os.path.isdir(os.path.join(s["_root"], v, "images")) for v in s["valSplits"]):
+                missing.append(f"{sid}: valSplits 里没有可用的 images（试过 {s['valSplits']}）")
+        if missing:
+            print("\n--strict：以下 split 缺失，未改动任何已有产物：", file=sys.stderr)
+            for m in missing:
+                print(f"  - {m}", file=sys.stderr)
+            return 1
+
+    # 先写临时目录，确认有产出后再替换旧目录：任何失败都不会毁掉上一版数据集。
+    build_out = out_root + ".build"
+    build_yolo = (yolo_root + ".build") if yolo_root else None
+    prepare_out_dir(build_out, VOC_ENTRIES, "--out.build")
+    if build_yolo:
+        prepare_out_dir(build_yolo, YOLO_ENTRIES, "--yolo-out.build")
     stats = {s: {"images": 0, "boxes": {}, "unmapped": {}} for s in ("train", "val")}
 
     for s in usable:
         print(f"[{s.get('id', s['prefix'])}] {rel(s['_root'])}")
         process_dataset(s["_root"], s["mapping"], s["trainSplit"], s["valSplits"],
-                        s["prefix"], out_root, yolo_root, stats)
+                        s["prefix"], build_out, build_yolo, stats)
 
     produced = sum(stats[s]["images"] for s in ("train", "val"))
     if not produced:
-        print("[warn] 没有产出任何图片：检查 sources.json 的 root/split 是否存在、"
-              "mapping 是否全部为空、label 文件是否为空。")
+        # 0 产出不是「成功」：旧数据集保持原样，退出码非 0。
+        shutil.rmtree(build_out, ignore_errors=True)
+        if build_yolo:
+            shutil.rmtree(build_yolo, ignore_errors=True)
+        print("[error] 没有产出任何图片：检查 sources.json 的 root/split 是否存在、"
+              "mapping 是否全部为空、label 文件是否为空。已有产物未改动。", file=sys.stderr)
+        return 1
 
-    # 没有任何图片时 out_root 可能还没被创建（process_dataset 只在有 split 时建目录）。
-    os.makedirs(out_root, exist_ok=True)
-    if yolo_root:
-        os.makedirs(yolo_root, exist_ok=True)
     label_map = {name: i for i, name in enumerate(CLASSES)}
-    with open(os.path.join(out_root, "label_map.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(build_out, "label_map.json"), "w", encoding="utf-8") as f:
         json.dump(label_map, f, ensure_ascii=False, indent=2)
-    if yolo_root:
-        with open(os.path.join(yolo_root, "data.yaml"), "w", encoding="utf-8") as f:
+    if build_yolo:
+        with open(os.path.join(build_yolo, "data.yaml"), "w", encoding="utf-8") as f:
+            # path 写最终目录（build 目录只用于本次构建）
             f.write("path: " + yolo_root.replace("\\", "/") + "\n")
             f.write("train: images/train\nval: images/val\n")
             f.write("names:\n")
             for i, name in enumerate(CLASSES):
                 f.write(f"  {i}: {name}\n")
-        with open(os.path.join(yolo_root, "labels.txt"), "w", encoding="utf-8") as f:
+        with open(os.path.join(build_yolo, "labels.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(CLASSES) + "\n")
+
+    # 有产出才替换旧目录；替换前仍按白名单确认目标目录是本脚本的产物。
+    prepare_out_dir(out_root, VOC_ENTRIES, "--out")
+    os.replace(build_out, out_root)
+    if build_yolo:
+        prepare_out_dir(yolo_root, YOLO_ENTRIES, "--yolo-out")
+        os.replace(build_yolo, yolo_root)
 
     print(f"\n输出：{out_root}")
     for split in ("train", "val"):

@@ -15,14 +15,15 @@ import { loadAccuracyReport, accuracyFor, formatAccuracy, accuracyStale } from '
 import {
   resolveParams, validateParams, profileParams, profileName as profileNameOf, paramsHash,
 } from './params.js';
-import { hasRegionConfig, personPlausibility, personCoveredByHand } from './geometry.js';
+import { hasRegionConfig, personPlausibility, personDisplayable, personCoveredByHand } from './geometry.js';
+import { headPoseText, HEAD_DIR_LABELS } from './headpose.js';
 import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS, HARDCASE_BEFORE_MS } from './hardcase.js';
 import { drawSkeleton, drawHand, drawBoxes, drawTrackLabel, clearCanvas } from './draw.js';
 import { Tracker, area } from './track.js';
 import {
   PersonPipelines, assignHands, logLimitFor,
   TrackShapeStabilizers, classifyHandsByTrack, bindClassifiedHands, pickRoiPersons,
-  pickSingleTarget, wristSideFor,
+  pickSingleTarget, nearestHandSide, HAND_ASSIGN_MAX_DIST,
 } from './multi.js';
 import { PpeMonitor } from './ppe.js';
 import {
@@ -129,6 +130,9 @@ let lastObjectMeta = null;
 // 同一份素材两次回放会得到不同的 objects 序列（详见 detReplay）。
 let objectInflight = null;
 let objectGen = 0;        // 物体检测器代次：换 profile/关开关时 +1，作废在途的创建与推理
+// 运行时代次：每次 resetRuntime（换输入/重播/清空） +1。异步推理（图片的物体检测）
+// 回来时用它作废旧画面/旧参数的结果；不能复用 objectGen——那会连检测器一起重建。
+let runtimeGen = 0;
 let replaySeq = 0;        // 重播代次：快速连点时只让最后一次的 seek→play 生效
 let profileLoaded = false;   // initProfile() 完成（无头脚本等它再改开关，避免抢跑用默认参数建模型）
 let multiMaxFromSettings = false;   // 用户保存过多人数选择后，profile 不再覆盖它
@@ -536,15 +540,38 @@ async function initEstimator() {
 // 手部初始化做串行化：快速开关「手部」会并发两次 createHandEstimator，
 // 两边都看到槽位为空、各建一个实例，后一个覆盖前一个，前一个的显存就泄漏了。
 let handsInitPromise = null;
+let handsInitGen = -1;
 
-async function initHands(delegate) {
-  if (handsInitPromise) return handsInitPromise;
-  handsInitPromise = doInitHands(delegate).finally(() => { handsInitPromise = null; });
-  return handsInitPromise;
+// 关闭/释放手部的代次：创建是异步的，停止/取消勾选后必须让在途创建的结果作废，
+// 否则「点了停止又回来」会把实例装回去并设 handReady=true（模型句柄已释放但状态说就绪）。
+let handsGen = 0;
+
+/** 释放手部实例并让在途创建作废。所有「关闭手部」的入口都走这里。 */
+function releaseHands() {
+  ++handsGen;
+  handReady = false;
+  closeHandEstimator();
 }
 
-async function doInitHands(delegate) {
+async function initHands(delegate) {
+  if (handsInitPromise) {
+    // 只有同一代次的在途任务可以复用；停止/关闭后再打开时必须排到它后面重建，
+    // 否则新调用会拿到一个注定被代次检查作废的 promise，手部再也起不来。
+    if (handsInitGen === handsGen) return handsInitPromise;
+    await handsInitPromise.catch(() => {});
+  }
+  const gen = handsGen;
+  handsInitGen = gen;
+  const p = doInitHands(delegate, gen).finally(() => {
+    if (handsInitPromise === p) { handsInitPromise = null; handsInitGen = -1; }
+  });
+  handsInitPromise = p;
+  return p;
+}
+
+async function doInitHands(delegate, gen) {
   handReady = false;
+  handFails = 0;   // 自动关闭后重新打开：别让旧计数立刻再触发一次关闭
   if (!show.hands) {
     // 手部关闭时要真的把实例放掉，否则换模型后旧的 VIDEO/IMAGE 实例仍各占一份显存。
     closeHandEstimator();
@@ -553,8 +580,8 @@ async function doInitHands(delegate) {
   for (const d of delegate === 'GPU' ? ['GPU', 'CPU'] : ['CPU']) {
     try {
       await createHandEstimator({ delegate: d, runningMode: 'VIDEO', numHands: 2 });
-      // 建模型期间用户可能已经关掉手部（或又换了输入）：关掉就释放，别留下实例。
-      if (!show.hands) { closeHandEstimator(); return; }
+      // 建模型期间用户可能已经停止/关掉手部：代次变了就释放刚建好的实例，状态保持关闭。
+      if (gen !== handsGen || !show.hands) { closeHandEstimator(); return; }
       handReady = true;
       activeHandModel = 'hand_landmarker';
       // ROI 补检需要独立的 IMAGE 实例（VIDEO 实例用于整帧追踪，混用会把裁图当成下一帧）。
@@ -565,7 +592,7 @@ async function doInitHands(delegate) {
           detConf: 0.3, presenceConf: 0.3,
         });
       } catch { /* ROI 补检不可用 */ }
-      if (!show.hands) { closeHandEstimator(); return; }
+      if (gen !== handsGen || !show.hands) { closeHandEstimator(); return; }
       handReady = handsReady('VIDEO');
       return;
     } catch { /* 手部模型失败不影响主体识别 */ }
@@ -576,6 +603,9 @@ async function doInitHands(delegate) {
 // 懒加载，理由同姿态模型：页面一打开就建 GPU 上下文，多开几个标签页很吃内存。
 
 let multiInitPromise = null;
+// 创建期间 profile/人数上限变了：本次 applyParams 看到 multiReady=false 跳过了重建，
+// 等当前创建结束后必须再按新配置建一次（否则旧人数上限/检测阈值一直生效）。
+let multiRecreatePending = false;
 // 单人道漏检补救（perception.single.fallback）的失败记忆：
 // 建不起来就不要再每帧重试——和多人开关失败时一样的坑（每帧建一次模型会拖垮主循环）。
 let fallbackPoseFailed = false;
@@ -603,8 +633,22 @@ async function ensureMultiEstimator({ quiet = false } = {}) {
         });
         multiReady = multiEstimatorInfo().ready;
         if (multiReady) {
-          multiCfgKey = `${multiNumPoses}|${cfg.detConf}|${cfg.presenceConf}`;
+          const key = `${multiNumPoses}|${cfg.detConf}|${cfg.presenceConf}`;
+          multiCfgKey = key;
           multiError = null;
+          if (!multiOn) {
+            // 创建期间用户关掉了多人：实例没人消费，别白占显存；下次打开重新建。
+            closeMultiEstimator();
+            multiReady = false;
+            multiCfgKey = '';
+          } else if (desiredMultiKey() !== key) {
+            // 创建期间切了 profile / 改了人数：旧实例的参数已经过时。先关掉，
+            // 在当前 promise 结束后按新配置重建（不能在这里递归——multiInitPromise 还是自己）。
+            closeMultiEstimator();
+            multiReady = false;
+            multiCfgKey = '';
+            multiRecreatePending = true;
+          }
           return true;
         }
       } catch (e) {
@@ -615,7 +659,13 @@ async function ensureMultiEstimator({ quiet = false } = {}) {
     // 补救路径是后台优化，失败不该覆盖用户正在看的输入状态（主路径仍可用）
     if (!quiet) setStatus(`多人模型加载失败：${multiError || 'unknown'}`, 'err');
     return false;
-  })().finally(() => { multiInitPromise = null; });
+  })().finally(() => {
+    multiInitPromise = null;
+    if (multiRecreatePending) {
+      multiRecreatePending = false;
+      ensureMultiEstimator().catch(() => {});
+    }
+  });
   return multiInitPromise;
 }
 
@@ -702,6 +752,9 @@ async function ensureObjectDetector() {
 }
 
 function resetRuntime() {
+  // 上一段在途的异步推理（物体检测）属于旧输入/旧参数：代次 +1 后结果不再写回
+  // （只推代次、不关检测器：切输入/重播可以继续用同一个模型实例）。
+  ++runtimeGen;
   cancelHardcase();
   pipelines.reset();
   tracker.reset();
@@ -1181,17 +1234,17 @@ function appearanceDescriptor(source, person) {
 /**
  * 只保留目标人的手。多人画面里 `hands` 会混进别人的手，
  * 而动作层只认目标人——不筛的话「张开/握拳」可能取到旁边那个人的手。
- * 判定口径：整帧检出要求腕点离目标腕点足够近；ROI 补检本来就是按目标腕点裁的，直接保留。
+ * 判定口径与 assignHands 单人路径完全一致（归一化腕距 + 可见性 + 同一个 maxDist）：
+ * 以前这里用 2×scale 像素距离，比归属用的 0.8×scale 宽——落在两者之间的手
+ * 会被当成「已检出」而不补检，归属时又被丢掉，该侧伸手/指向/拿取整段失效。
+ * ROI 补检本来就是按目标腕点裁的，直接保留。
  */
 function handsOfTarget(list, target) {
   if (!target) return [];
-  const wl = target.kp[5];
-  const wr = target.kp[6];
-  const maxD = 2 * Math.max(target.scale, 1);
   return list.filter((hd) => {
     if (hd.side_from === 'roi') return true;
-    const [x, y] = hd.kp[0];
-    return Math.hypot(x - wl[0], y - wl[1]) < maxD || Math.hypot(x - wr[0], y - wr[1]) < maxD;
+    const near = nearestHandSide(hd, target);
+    return !!near && near.d <= HAND_ASSIGN_MAX_DIST;
   });
 }
 
@@ -1203,12 +1256,22 @@ const nearHand = (a, b) => Math.hypot(a.kp[0][0] - b.kp[0][0], a.kp[0][1] - b.kp
  */
 function completeHands(fullHands, target, source, w, h, ownerTrackId = null) {
   if (!target || !handsReady('IMAGE')) return fullHands;
+  // 远景小目标（躯干长 < roi.minScalePx）裁出来全是背景，补检只会白烧推理。
+  // 多人路径由 pickRoiPersons 按同一阈值筛人，单人道也必须一致地跳过。
+  if (!((target.scale ?? 0) >= (handRoiCfg.minScalePx ?? 0))) return fullHands;
   // 注意 handedness 是 'Left'/'Right'，腕点侧是 'L'/'R'，必须换算后再比较，
   // 否则每一侧都会被当成「没检出」而重复补检（多人画面上会多出两只手）。
   // 更关键的是：整帧 handedness 在普通视频里可能是反的，所以按检出腕点离该人
-  // 左右姿态腕点的距离判断，与 assignHands 的最终槽位同一判据。
+  // 左右姿态腕点的距离判断，并且用与 assignHands 相同的可见性 + maxDist 门槛：
+  // 只按「最近可见腕点」判会让一只会被归属丢掉的手挡住补检。
   const have = new Set(fullHands
-    .map((hd) => wristSideFor(hd, target))
+    .map((hd) => {
+      if (hd.side_from === 'roi') {
+        return hd.handedness === 'Left' ? 'L' : hd.handedness === 'Right' ? 'R' : null;
+      }
+      const near = nearestHandSide(hd, target);
+      return near && near.d <= HAND_ASSIGN_MAX_DIST ? near.side : null;
+    })
     .filter(Boolean));
   const wrists = [
     { side: 'L', x: target.kp[5][0], y: target.kp[5][1], vis: target.kp[5][2], scale: target.scale },
@@ -1239,10 +1302,22 @@ function completeHandsMulti(fullHands, judged, target, source, w, h) {
   // 「补检时以为 A 已有这只手、归属时又判给别人」→ A 这一侧既没有手也没补检。
   // 先按整帧归属一次，直接取每个人的槽位；ROI 结果按 owner_track_id 并回。
   const preAssigned = assignHands(judged, fullHands);
+  // 8px 去重必须看归属：整帧那只手已归给 B 时，A 的 ROI 检出（同一腕点位置）
+  // 不能被它挤掉——否则 A 的槽位空着、B 槽里留着 A 的手。只有「同一 owner 的同一只手」
+  // 才去重；整帧手未归属时也不要拿它当重复证据。
+  const ownerOf = new Map();
+  for (const [tid, slot] of preAssigned) {
+    for (const hd of slot.list || []) ownerOf.set(hd, tid);
+  }
   for (const person of picked) {
     const own = preAssigned.get(person.track_id)?.list || [];
     for (const hd of completeHands(own, person, source, w, h, person.track_id)) {
-      if (!fullHands.some((x) => nearHand(x, hd))) fullHands.push(hd);
+      if (fullHands.includes(hd)) continue;   // 原样返回的整帧手，不是新补检结果
+      const owner = hd.owner_track_id ?? null;
+      if (!fullHands.some((x) => nearHand(x, hd) && (ownerOf.get(x) ?? null) === owner)) {
+        fullHands.push(hd);
+        ownerOf.set(hd, owner);
+      }
     }
   }
   return fullHands;
@@ -1287,6 +1362,11 @@ function gatePersonsByHand(persons, hands, handsByTrack, single = false) {
 
 /** 单张图片：推理一次，然后在信号/动作层收敛后绘制 */
 async function analyzeStill(img) {
+  // 分析期间可能切输入 / 切 profile（applyParams → resetRuntime）：await 回来后
+  // 旧图不能再改 lastResult/lastVerdicts，也不能在新画面上画框。
+  const runToken = inputSeq;
+  const runGen = runtimeGen;
+  const stale = () => runToken !== inputSeq || runGen !== runtimeGen;
   const w = img.naturalWidth;
   const h = img.naturalHeight;
   canvas.width = w;
@@ -1337,12 +1417,15 @@ async function analyzeStill(img) {
     const gen = objectGen;
     try {
       const det = await detectObjects(img, ts + 1, w, h);
-      // ONNX 推理期间可能切了 profile/关了开关：旧代次的结果/错误都不要再写回
+      // ONNX 推理期间可能切了 profile/关了开关，也可能换了输入：旧代次的
+      // 结果/错误都不要再写回。输入/参数代次变了就直接放弃整次分析。
+      if (stale()) return;
       if (gen === objectGen && objectOn) {
         objects = det;
         lastObjects = objects;   // state.objects 读的是它；不写回去，无头检查会永远是 0
       }
     } catch (e) {
+      if (stale()) return;
       if (gen === objectGen) objectError = e.message;   // 留给 UI/自检，别静默
     }
   }
@@ -1378,12 +1461,18 @@ async function analyzeStill(img) {
       ppe: ppeById.get(vd.track_id) || null,
     }));
     if (show.skeleton) {
-      let first = true;
-      for (const p of persons) {
-        drawSkeleton(ctx, p.kp_raw, w, h, {
-          points: show.points, clear: first, alpha: p === target ? 1 : 0.4,
-        });
-        first = false;
+      // 图片路径同样是：能判（动作/UI）不代表该画。倒置躯干只在绘制时挡掉。
+      const drawable = persons.filter((p) => personDisplayable(p, w, h, personGateCfg));
+      if (!drawable.length) {
+        clearCanvas(ctx, w, h);
+      } else {
+        let first = true;
+        for (const p of drawable) {
+          drawSkeleton(ctx, p.kp_raw, w, h, {
+            points: show.points, clear: first, alpha: p === target ? 1 : 0.4,
+          });
+          first = false;
+        }
       }
     } else {
       clearCanvas(ctx, w, h);
@@ -1519,17 +1608,18 @@ function stopAll() {
   $('badgeRes').hidden = true;
   if (canvas.width) clearCanvas(ctx, canvas.width, canvas.height);
   setActiveInput(null);
-  // 清掉上一帧的判定结果，否则面板会一直显示停止前的姿态
+  // 清掉上一帧的判定结果，否则面板会一直显示停止前的姿态；
+  // lastVerdicts 也要清——人员列表/PPE 告警读的是它，停止后会一直挂着旧的人。
   lastResult = null;
+  lastVerdicts = [];
   updateUI();
   syncPlayer();
   // 释放模型，别让关掉的页面继续占显存/内存
   closeEstimator();
-  closeHandEstimator();
+  releaseHands();
   closeMultiEstimator();
   invalidateObjectDetector();
   estimatorReady = false;
-  handReady = false;
   multiReady = false;
   objectBusy = false;
   // activeModel/activeDelegate 故意保留：已录的帧就是这两档模型产出的，
@@ -1717,6 +1807,7 @@ async function loop() {
         // 上一次推理还没回来，这一帧跳过（沿用上一帧的框）
       } else {
         const detGen = objectGen;
+        const detRun = runtimeGen;
         // 记下这次检测的帧时间：结果可能晚一两帧才回来，但「是哪一次检测」不能变，
         // 否则设备框的时序确认会把同一次的重复结果当成两次命中。
         const detTs = ts;
@@ -1724,8 +1815,9 @@ async function loop() {
         if (det && typeof det.then === 'function') {
           objectBusy = true;
           const inflight = det.then((o) => {
-            // 推理期间换了 profile / 关了开关：结果属于旧代次，丢掉
-            if (detGen === objectGen && objectOn) {
+            // 推理期间换了 profile / 换了输入 / 重播：结果属于旧代次，丢掉。
+            // 只推 runtimeGen（输入）而不动 objectGen，模型实例继续复用。
+            if (detGen === objectGen && detRun === runtimeGen && objectOn) {
               lastObjects = o;
               lastObjectsTs = detTs;
             }
@@ -1762,9 +1854,11 @@ async function loop() {
       hands = toHands(detectHandsVideo(v, ts), w, h);
       handFails = 0;
     } catch (e) {
-      // 连续失败说明手部模型挂了：关掉它，别每帧都抛异常拖慢主循环
+      // 连续失败说明手部模型挂了：关掉它，别每帧都抛异常拖慢主循环。
+      // 必须真的释放实例（releaseHands）：只置 handReady=false 的话，重新勾选时
+      // handsReady() 仍为真、initHands 被跳过，手部再也回不来。
       if (++handFails > 30) {
-        handReady = false;
+        releaseHands();
         $('chkHands').checked = false;
         show.hands = false;
         setStatus('手部模型异常，已自动关闭', 'err');
@@ -1838,19 +1932,28 @@ async function loop() {
   const tDraw = performance.now();
   if (judged.length) {
     if (show.skeleton) {
-      // 先画非主目标（淡），最后画主目标（实）：主目标永远在最上层
-      let first = true;
-      for (const p of judged) {
-        if (p === target) continue;
-        drawSkeleton(ctx, p.kp_raw, w, h, { points: show.points, clear: first, alpha: 0.45 });
-        first = false;
+      // 动作判定可以继续用 judged（Hold 需要连续帧），但倒置躯干的骨架不画。
+      const drawable = (p) => personDisplayable(p, w, h, personGateCfg);
+      const nonTarget = judged.filter((p) => p !== target && drawable(p));
+      const others = persons.filter((p) => !judged.includes(p) && drawable(p));
+      const drawTarget = target && drawable(target) ? target : null;
+      if (!nonTarget.length && !others.length && !drawTarget) {
+        clearCanvas(ctx, w, h);
+      } else {
+        // 先画非主目标（淡），最后画主目标（实）：主目标永远在最上层
+        let first = true;
+        for (const p of nonTarget) {
+          drawSkeleton(ctx, p.kp_raw, w, h, { points: show.points, clear: first, alpha: 0.45 });
+          first = false;
+        }
+        for (const p of others) {
+          drawSkeleton(ctx, p.kp_raw, w, h, { points: show.points, clear: first, alpha: 0.25 });
+          first = false;
+        }
+        if (drawTarget) {
+          drawSkeleton(ctx, drawTarget.kp_raw, w, h, { points: show.points, clear: first });
+        }
       }
-      for (const p of persons) {
-        if (judged.includes(p)) continue;
-        drawSkeleton(ctx, p.kp_raw, w, h, { points: show.points, clear: first, alpha: 0.25 });
-        first = false;
-      }
-      drawSkeleton(ctx, target.kp_raw, w, h, { points: show.points, clear: first });
     } else {
       clearCanvas(ctx, w, h);
     }
@@ -2073,6 +2176,8 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       angle_source: sig.angle_source,
       extrapolated: sig.extrapolated,
       bones_ok: sig.world.bones,
+      // 头部朝向：与躯干无关，设备特写/头~胸构图也能有值（旧导出没有这个字段）
+      head: sig.head ? { ...sig.head } : null,
     } : null,
     actions: act ? {
       posture: act.postureId,
@@ -2649,6 +2754,8 @@ function updateUI() {
 
   const fmt = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : '—');
   const rows = [
+    // 头部朝向不依赖躯干/髋：设备特写、头~胸构图里姿态可能判不出来，但头还能判。
+    ['头部朝向', sig?.head ? headPoseText(sig.head) : null],
     ['膝角 °', sig ? r1(sig.knee_pick) : null],
     ['肘角 °', sig ? r1(sig.elbow_pick) : null],
     ['抬臂角 L/R', sig ? `${fmt(sig.armPose.elev_L, 0)} / ${fmt(sig.armPose.elev_R, 0)}` : null],
@@ -2671,9 +2778,14 @@ function updateUI() {
     bone_blocked: '骨骼异常', angle_outlier: '角度坏点',
   };
   const unrel = (act?.unreliable || []).map((r) => UNRELIABLE[r] || r);
+  const head = sig?.head;
+  const headShort = head?.visible && head.dir
+    ? `${HEAD_DIR_LABELS[head.dir] || head.dir}${Number.isFinite(head.yaw) ? `${head.yaw_approx ? '≈' : ''}${Math.abs(head.yaw).toFixed(0)}°` : ''}`
+    : '';
   $('signalMeta').textContent = sig
     ? `膝角取${sig.knee_side === 'L' ? '左' : '右'}腿 · 置信 ${r2(sig.score)}`
-      + `${lowerHidden ? ' · 下半身不可见' : ''}${unrel.length ? ` · 不可靠：${unrel.join('/')}` : ''}`
+      + `${lowerHidden ? ' · 下半身不可见' : ''}${headShort ? ` · 头部 ${headShort}（受试者方向）` : ''}`
+      + `${unrel.length ? ` · 不可靠：${unrel.join('/')}` : ''}`
     : '—';
 
   if (act?.reps) renderReps(act.reps);
@@ -2871,10 +2983,12 @@ $('chkHands').addEventListener('change', async (e) => {
   saveSettings();
   if (!show.hands) {
     // 关掉手部就别再让实例占显存；下次打开时重新加载。
-    closeHandEstimator();
-    handReady = false;
-    activeHandModel = null;
-  } else if (!handsReady()) {
+    // activeHandModel 故意不清空：已录帧的导出 meta.hand_model 仍要如实写来源，
+    // 与 stopAll 保留 activeModel 的约定一致。
+    releaseHands();
+  } else if (!handReady || !handsReady()) {
+    // handReady=false 但 handsReady() 为真（实例还在、状态没接上）也要走一次 init：
+    // 只判 handsReady 会把「模型已释放但实例仍在」的坏状态一直留在界面上。
     await initHands($('delegateSel').value);
   }
   updateUI();

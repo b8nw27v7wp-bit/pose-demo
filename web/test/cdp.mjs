@@ -4,7 +4,7 @@
 // 需要同一套能力，所以抽到这里。headless-check 暂不改造，避免动到已经稳定的回归脚本。
 
 import { spawn } from 'node:child_process';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -123,55 +123,69 @@ export async function openPage(url, { width = 1440, height = 900 } = {}) {
   const bin = await findChrome();
   const { proc, profile } = await startChrome(bin, port);
   const errors = [];
-  const wsUrl = await endpoint(port);
-  const ws = new WebSocket(wsUrl);
-  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
-  const cdp = new CDP(ws);
+  let ws = null;
 
-  const { targetInfos } = await cdp.send('Target.getTargets', {}, null);
-  const page = targetInfos.find((t) => t.type === 'page');
-  if (!page) throw new Error('没有可用的 page target');
-  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: page.targetId, flatten: true }, null);
-  cdp.sessionId = sessionId;
-
-  await cdp.send('Page.enable');
-  await cdp.send('Runtime.enable');
-  await cdp.send('Log.enable');
-
-  ws.addEventListener('message', (ev) => {
-    const m = JSON.parse(ev.data);
-    if (m.method === 'Runtime.exceptionThrown') {
-      const d = m.params.exceptionDetails;
-      errors.push(d.exception?.description || d.text);
-    }
-    if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error') {
-      const text = m.params.entry.text || '';
-      if (!/favicon\.ico/.test(text)) errors.push(text);
-    }
-  });
-
-  await cdp.send('Emulation.setDeviceMetricsOverride', {
-    width, height, deviceScaleFactor: 1, mobile: false,
-  });
-  // 导航失败必须当场报出来：否则页面停在 about:blank，后续 localStorage / __pose
-  // 全部抛 SecurityError，看起来像应用坏了（实测 pose-screenshots 0/5 就是服务没起）。
-  const nav = await cdp.send('Page.navigate', { url });
-  if (nav?.errorText) {
-    throw new Error(`无法打开 ${url}：${nav.errorText}（本地服务没起来？先运行 npm run serve）`);
-  }
-  if (!(await cdp.waitFor('Page.loadEventFired', 20000))) {
-    throw new Error(`等待 ${url} 加载超时`);
-  }
-  const hasApp = await cdp.eval('typeof window.__pose !== "undefined"').catch(() => false);
-  if (!hasApp) {
-    throw new Error(`页面已打开但没有 __pose（${url}）：确认 http 服务的根目录是仓库根目录（npm run serve）`);
-  }
-
-  const close = async () => {
-    try { ws.close(); } catch { /* ignore */ }
+  // 失败路径也必须收拾干净：serve 没起时每次 openPage 失败都会漏一个 headless Chrome
+  // 和一份 %TEMP% 里的 profile。close 与 catch 共用同一个清理入口。
+  const cleanup = async () => {
+    try { ws?.close(); } catch { /* ignore */ }
     try { proc.kill(); } catch { /* ignore */ }
-    const { rm } = await import('node:fs/promises');
-    await rm(profile, { recursive: true, force: true }).catch(() => {});
+    // Windows 上 Chrome 刚被 kill 时 profile 文件仍被占用，rm 会 EBUSY：重试几次。
+    for (let i = 0; i < 10; i++) {
+      try { await rm(profile, { recursive: true, force: true }); return; } catch { await sleep(100); }
+    }
+    // 最后还是删不掉就留着（临时目录），但不要因此吞掉真正的错误。
   };
-  return { cdp, errors, close };
+
+  try {
+    const wsUrl = await endpoint(port);
+    ws = new WebSocket(wsUrl);
+    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+    const cdp = new CDP(ws);
+
+    const { targetInfos } = await cdp.send('Target.getTargets', {}, null);
+    const page = targetInfos.find((t) => t.type === 'page');
+    if (!page) throw new Error('没有可用的 page target');
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: page.targetId, flatten: true }, null);
+    cdp.sessionId = sessionId;
+
+    await cdp.send('Page.enable');
+    await cdp.send('Runtime.enable');
+    await cdp.send('Log.enable');
+
+    ws.addEventListener('message', (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.method === 'Runtime.exceptionThrown') {
+        const d = m.params.exceptionDetails;
+        errors.push(d.exception?.description || d.text);
+      }
+      if (m.method === 'Log.entryAdded' && m.params.entry.level === 'error') {
+        const text = m.params.entry.text || '';
+        if (!/favicon\.ico/.test(text)) errors.push(text);
+      }
+    });
+
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width, height, deviceScaleFactor: 1, mobile: false,
+    });
+    // 导航失败必须当场报出来：否则页面停在 about:blank，后续 localStorage / __pose
+    // 全部抛 SecurityError，看起来像应用坏了（实测 pose-screenshots 0/5 就是服务没起）。
+    const nav = await cdp.send('Page.navigate', { url });
+    if (nav?.errorText) {
+      throw new Error(`无法打开 ${url}：${nav.errorText}（本地服务没起来？先运行 npm run serve）`);
+    }
+    if (!(await cdp.waitFor('Page.loadEventFired', 20000))) {
+      throw new Error(`等待 ${url} 加载超时`);
+    }
+    const hasApp = await cdp.eval('typeof window.__pose !== "undefined"').catch(() => false);
+    if (!hasApp) {
+      throw new Error(`页面已打开但没有 __pose（${url}）：确认 http 服务的根目录是仓库根目录（npm run serve）`);
+    }
+
+    const close = async () => { await cleanup(); };
+    return { cdp, errors, close };
+  } catch (e) {
+    await cleanup();
+    throw e;
+  }
 }

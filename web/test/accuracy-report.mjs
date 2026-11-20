@@ -62,7 +62,10 @@ function poolByAction(rows) {
   return by;
 }
 
-export function buildAccuracyReport(evalReport, { dir = 'eval-data', minSamples = DEFAULT_MIN_SAMPLES, generatedAt = new Date().toISOString() } = {}) {
+export function buildAccuracyReport(evalReport, {
+  dir = 'eval-data', minSamples = DEFAULT_MIN_SAMPLES, recursive = false,
+  generatedAt = new Date().toISOString(),
+} = {}) {
   const rows = Array.isArray(evalReport?.summary) ? evalReport.summary : [];
   const byFlag = poolByAction(rows);
 
@@ -85,22 +88,34 @@ export function buildAccuracyReport(evalReport, { dir = 'eval-data', minSamples 
   }
 
   const clips = Array.isArray(evalReport?.clips) ? evalReport.clips : [];
-  const names = clips.map((c) => c.clip || c.name).filter(Boolean);
-  const text = clips.map((c) => `${c.clip || ''} ${c.note || ''}`).join(' ');
-  // 合成样例只用于验证链路（README「开源验证素材」）。标出来，页面才不会把它当实拍准确率。
-  const synthetic = /合成|make-sample/i.test(text);
+  const clipName = (c) => c.clip || c.name;
+  const names = clips.map(clipName).filter(Boolean);
+  // 合成样例只用于验证链路（README「开源验证素材」）。混跑时**不能**把整份报告标成合成，
+  // 也不能让合成段把实拍指标稀释掉却仍显示「来自标注素材」——分开列出来。
+  const syntheticClips = clips
+    .filter((c) => /合成|make-sample/i.test(`${c.clip || ''} ${c.name || ''} ${c.note || ''}`))
+    .map(clipName).filter(Boolean);
+  const realClips = clips
+    .filter((c) => !syntheticClips.includes(clipName(c)))
+    .map(clipName).filter(Boolean);
+  const synthetic = clips.length > 0 && syntheticClips.length === clips.length;
   const noClips = clips.length === 0;
 
   return {
     generatedAt,
     source: {
       dir,
+      recursive,
       clips: names,
+      realClips,
+      syntheticClips,
       totalFrames: evalReport?.totalFrames ?? 0,
       synthetic,
       note: noClips ? '没有可评估的标注素材（eval-data 为空或没有 *.labels.json）'
         : synthetic ? '合成样例自检，不代表实拍准确率'
-          : '来自标注素材的实测值',
+          : syntheticClips.length
+            ? `来自标注素材的实测值（含 ${syntheticClips.length} 段合成自检）`
+            : '来自标注素材的实测值',
     },
     minSamples,
     paramsHash: evalReport?.paramsHash ?? null,
@@ -114,12 +129,18 @@ export function buildAccuracyReport(evalReport, { dir = 'eval-data', minSamples 
 
 function parseArgs(argv) {
   const out = {
-    dir: 'eval-data', out: 'web/accuracy.json', minSamples: DEFAULT_MIN_SAMPLES,
+    dir: 'eval-data', dirs: [], recursive: false,
+    out: 'web/accuracy.json', minSamples: DEFAULT_MIN_SAMPLES,
     profile: null, quiet: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--dir') out.dir = argv[++i];
+    if (a === '--dir') {
+      const d = argv[++i];
+      out.dirs.push(d);
+      out.dir = out.dirs.join(', ');
+    }
+    else if (a === '--recursive') out.recursive = true;
     else if (a === '--out') out.out = argv[++i];
     else if (a === '--min-samples') out.minSamples = Number(argv[++i]);
     // 有 ROI/场景阈值的动作（operating、refuel 类 profile）必须带 profile，
@@ -127,8 +148,8 @@ function parseArgs(argv) {
     else if (a === '--profile') out.profile = argv[++i];
     else if (a === '--quiet') out.quiet = true;
     else if (a === '-h' || a === '--help') {
-      console.log('用法：node web/test/accuracy-report.mjs [--dir eval-data] [--out web/accuracy.json] '
-        + '[--min-samples 20] [--profile web/profiles/xxx.json]');
+      console.log('用法：node web/test/accuracy-report.mjs [--dir 目录 …] [--recursive] '
+        + '[--out web/accuracy.json] [--min-samples 20] [--profile web/profiles/xxx.json]');
       process.exit(0);
     } else {
       throw new Error(`未知参数：${a}`);
@@ -140,9 +161,12 @@ function parseArgs(argv) {
   return out;
 }
 
-function runEvaluator(dir, profile = null) {
+function runEvaluator(dirs, profile = null, recursive = false) {
   const evalPath = path.join(ROOT, 'web/test/evaluate.mjs');
-  const argv = [evalPath, '--dir', dir, '--json'];
+  const argv = [evalPath];
+  for (const d of dirs) argv.push('--dir', d);
+  if (recursive) argv.push('--recursive');
+  argv.push('--json');
   if (profile) argv.push('--profile', profile);
   return new Promise((resolve, reject) => {
     execFile(process.execPath, argv, {
@@ -165,8 +189,11 @@ function runEvaluator(dir, profile = null) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const evalReport = await runEvaluator(args.dir, args.profile);
-  const report = buildAccuracyReport(evalReport, { dir: args.dir, minSamples: args.minSamples });
+  const dirs = args.dirs.length ? args.dirs : [args.dir];
+  const evalReport = await runEvaluator(dirs, args.profile, args.recursive);
+  const report = buildAccuracyReport(evalReport, {
+    dir: dirs.join(', '), minSamples: args.minSamples, recursive: args.recursive,
+  });
   const outPath = path.resolve(ROOT, args.out);
   await writeFile(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
 

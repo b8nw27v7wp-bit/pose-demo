@@ -72,6 +72,34 @@ console.log('\n[2] repSessions');
   const gs = repSessions(gtl, 'grasp', { mergeMs: 500, minMs: 300 });
   check('拿取按 reach→grasp 切出周期', gs.length === 1 && gs[0].count === 1
     && gs[0].start === 500 && gs[0].end === 1500, JSON.stringify(gs));
+
+  // 主目标离场 >1s：状态机重建、计数归零。回来后的前 N 次拿取必须重新计入，
+  // 不能因为 prevCount 还停在离场前的值而被当成「没增长」。
+  const leave = [
+    { ts: 0, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 500, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 1000, act: { repPhase: { grasp: 'grasp' }, reps: { grasp: 1 } } },
+    { ts: 1500, act: { repPhase: { grasp: 'grasp' }, reps: { grasp: 2 } } },
+    { ts: 2000, empty: true, act: null },
+    { ts: 4500, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 5000, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 5500, act: { repPhase: { grasp: 'grasp' }, reps: { grasp: 1 } } },
+  ];
+  const back = repSessions(leave, 'grasp', { mergeMs: 500, minMs: 300 });
+  check('离场后计数归零，回来后的第一次拿取仍进草稿',
+    back.length === 2 && back[1].count === 1 && back[1].start === 4500 && back[1].end === 5500,
+    JSON.stringify(back));
+
+  // 没有 empty 行、但计数本身回退（段内重置）：同样要从 1 重新起算。
+  const reset = [
+    { ts: 0, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 500, act: { repPhase: { grasp: 'grasp' }, reps: { grasp: 1 } } },
+    { ts: 1000, act: { repPhase: { grasp: 'reach' }, reps: { grasp: 0 } } },
+    { ts: 1500, act: { repPhase: { grasp: 'grasp' }, reps: { grasp: 1 } } },
+  ];
+  const resetSessions = repSessions(reset, 'grasp', { mergeMs: 200, minMs: 300 });
+  check('计数回退按归零处理（两次都能切出）', resetSessions.length === 2,
+    JSON.stringify(resetSessions));
 }
 
 // —— 3. 合成样例上的草稿 ——

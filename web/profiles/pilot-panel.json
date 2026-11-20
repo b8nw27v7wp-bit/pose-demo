@@ -1,0 +1,52 @@
+{
+  "name": "pilot-panel",
+  "model": "full",
+  "note": "试点档（2026-11-20 定稿）：只承诺「固定机位 + 单人 + panel 设备 ROI」下的 operating / drain_sample / near_equipment。设备类别里只让 panel 作为 operating/near 的证据（模型仍出 panel/valve/gauge，valve/gauge 不参与判定）；operating 失败即不判（必须有 panel 框），near 保留 ROI 兜底。multi 关闭；手势/PPE/头部角度/oil_sample/多人泛化都不在本档验收范围。换机位必须重画 ROI、重新标定并重跑 npm run accuracy；当前 operating 的实拍数字来自 58s 演示片 + 8 段硬负例，n 很小，CI 很宽，不能当泛化准确率。",
+  "params": {
+    "perception": {
+      "multi": { "enabled": false, "maxPersons": 3 },
+      "single": { "fallback": true, "fallbackMinScore": 0.45, "target": "largest" },
+      "objects": {
+        "enabled": true,
+        "backend": "onnx",
+        "model": "equipment.onnx",
+        "inputSize": 320,
+        "maxResults": 8,
+        "scoreThreshold": 0.35,
+        "iouThreshold": 0.45,
+        "intervalMs": 150,
+        "labels": ["panel", "valve", "gauge"]
+      }
+    },
+    "signals": {
+      "arm": {
+        "operating": {
+          "roi": { "x": 0.42, "y": 0.08, "w": 0.56, "h": 0.86 },
+          "minElbowVis": 0.21,
+          "minElbowReach": 0.315,
+          "equipmentLabels": ["panel"],
+          "equipmentMinScore": 0.35,
+          "equipmentMaxDist": 0.7,
+          "equipmentFallbackRoi": false,
+          "boxMinHits": 2,
+          "boxMaxAgeMs": 600,
+          "boxRequireInRoi": true,
+          "requireUprightBox": false,
+          "requireValidity": false,
+          "requireGrip": false,
+          "useForearm": false
+        },
+        "nearEquipment": {
+          "minOverlap": 0.5,
+          "equipmentFallbackRoi": true
+        }
+      }
+    },
+    "actions": {
+      "holds": {
+        "operating": 1500,
+        "operatingMaxGap": 600
+      }
+    }
+  }
+}

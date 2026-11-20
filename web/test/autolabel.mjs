@@ -66,8 +66,19 @@ export function repSessions(timeline, action, { mergeMs = 500, minMs = 300 } = {
   let prevTs = null;
   for (const r of timeline) {
     const act = r.act;
-    const phase = act && act.repPhase ? act.repPhase[action] : null;
-    const count = act && act.reps ? act.reps[action] : 0;
+    if (r.empty || !act) {
+      // 主目标离场 / 该帧无判定：状态机已重建，计数器归零。
+      // 不重置 prevCount 的话，重新出现后的前 N 次计数（从 1 开始）永远小于旧值，
+      // 多人回放里「离场 >1s 再回来」的前 N 次拿取就整段丢失。
+      prevCount = 0;
+      downTs = null;
+      prevTs = r.ts;
+      continue;
+    }
+    const phase = act.repPhase ? act.repPhase[action] : null;
+    const count = act.reps ? act.reps[action] : 0;
+    // 段内计数回退（清空/重置）同样视为归零，之后从 1 重新累计。
+    if (count < prevCount) prevCount = count;
     if (phase === startPhase && downTs === null) downTs = r.ts;
     if (count > prevCount) {
       cycles.push([downTs ?? prevTs ?? r.ts, r.ts]);

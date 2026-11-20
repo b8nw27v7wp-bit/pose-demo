@@ -32,7 +32,7 @@
 |---|---|
 | `uprightness_source` | 直立度用的轴：`torso`（躯干） / `head`（上半身构图，鼻→肩） / `none` |
 | `vis` | `{shoulder, hip, knee, ankle, nose}` 分组可见性；界面据此提示「下半身不可见」 |
-| `angle_outliers` | 本帧因角速度过大被剔除的角度名（动作层转成 `unreliable: angle_outlier`） |
+| `angle_outliers` | 本帧因角速度过大被剔除的**关节/姿态**角度名（动作层转成 `unreliable: angle_outlier`）。头部 `head:*` 不进这个清单（没有动作依赖它），只记在 `signals.head.reasons` |
 
 为什么全部用角度和比值：**角度天然与尺度、距离、分辨率无关**，这是跨机位、跨人体尺寸唯一能复用的量。
 像素阈值换一个摄像头就失效，别用。
@@ -110,6 +110,13 @@
 > **本版没有实现** `in_roi` / `near` / `absence` / `cooldown` 四个原语。
 > Demo 目前用不到它们；实现 Python 引擎或扩展动作时再补，不要假设它们在 `signals.js` 里存在。
 
+> **Hold 的断档口径**：`maxGapMs` 表示「允许条件暂时不成立多久」，只给持续事件用
+> （`operating` / `oilSample` / `drainSample`）。其余动作的 Hold 用
+> `actions.holds.maxCallGap`（默认 500ms）检查**两次真值更新之间**的断档：遮挡期间
+> tracker 仍保留 track，但该 track 连续几帧没有判定时，中间没有 `cond=false` 的帧；
+> 不检查调用间隔，未满的 Hold 会在 900ms 遮挡后回来时直接成立（`reach→fist` 可凭空 +1 拿取）。
+> `cond=false` 仍立即重置，不受 `maxCallGap` 放宽。
+
 ### `sequence`：有序阶段（拿取的地基）
 
 `Hold` 只知道「持续了多久」，不知道「先后顺序」；`RepCounter` 只知道「上下穿越」，不知道中间要多一步合手。
@@ -165,7 +172,7 @@
 
 | 条件 | 阈值 | 说明 |
 |---|---|---|
-| 设备 ROI | profile `signals.arm.operating.roi = {x,y,w,h}`（旧矩形）或 `rois = [{id, points:[[x,y],...]}]`（多边形/多区域，归一化 0~1） | **未配置 ROI/检测框时不判**：只剩「伸手」，会拿东西/扶栏杆误报。`rois` 非空时完全忽略旧 `roi`；非空但全部 zone 非法 → fail-closed（不退回矩形） |
+| 设备 ROI | profile `signals.arm.operating.roi = {x,y,w,h}`（旧矩形）或 `rois = [{id, points:[[x,y],...]}]`（多边形/多区域，归一化 0~1） | **未配置 ROI/检测框时不判**：只剩「伸手」，会拿东西/扶栏杆误报。矩形与多边形同为归一化 0~1，越界（如把 0.56 写成 56）或超出画面都判非法，不静默放大。`rois` 非空时完全忽略旧 `roi`；非空但全部 zone 非法 → fail-closed（不退回矩形） |
 | 设备检测框 | profile `operating.equipmentLabels` + 物体检测 | 有框时**优先**：腕/肘到框边 ≤ `equipmentMaxDist·scale`；ROI 只作检测不到时的兜底。默认 0.35，refuel 档实测 0.35/0.5 太紧（正例 1/6），调成 0.7 |
 | 腕在设备区域 | 有检测框：到框边 ≤ `equipmentMaxDist·scale`；无框：像素坐标落在 ROI 内 | 设备区域来自检测框或人工 ROI |
 | 腕-肩距离 | > 0.65 躯干长 | 手臂不是自然垂在身侧 |
@@ -179,6 +186,9 @@
 > `holds.operating 1500ms`、`operatingMaxGap 600ms`。这是在 58s 演示片的 6 正/7 反复核标注上
 > **同集调参**的结果；Hold 修正为「真值帧间隔超过 maxGap 也重置」后重新校准了 maxGap。
 > 当前代码+参数在 563 帧复核导出上：operating TP5/FN1/FP3（段级 R 0.833 / P 0.625）。
+> 2026-11-20 起 `npm run accuracy` 用 `pilot-panel`（panel-only）+ 290 帧 5fps 导出 +
+> 8 段硬负例：operating 3/3/3（R .5 / P .5），near 4/2/3；n<20，页面只显示「样本不足」。
+> 两组数字来自不同导出/fps，不可混用。
 > 样本很少、没有留出集，换机位必须重标重校；不要把它当全局默认。
 
 设备检测器已经接进判据（`docs/equipment-detector.md`），但仓库**不附带**训练好的权重：
@@ -523,6 +533,7 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 |---|---|---|
 | 姿态几何 | bbox 宽/高 < `minAspect`（细长条）、躯干长/框高 > `maxTorsoHeight`、平均置信 < `minScore`、双肩+双髋最低可见性 < `minAnchorVis` | `perception.personGate.*` |
 | 手部包含 | 鼻/双肩/双髋至少 `minAnchors` 个落在同一只手框（外扩 `expand`）内，或手框面积 ≥ 人体框 `maxHandAreaRatio` | `perception.personGate.hand.*` |
+| 骨架绘制 | 髋中点不得高于肩中点（倒置躯干不画；水平/弯腰仍画） | `perception.personGate.drawMinTorsoDrop`（默认 0；null 关闭） |
 
 - 缺 bbox/kp/手数据时 **fail-open**：旧导出和测试夹具不会因为少字段被剔除。
 - 被剔除的人不进入 `persons[]` / `verdicts[]` / 动作判定；带 `owner_track_id` 的手会
@@ -535,6 +546,103 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 - **残余**：既没有手部检出、几何又像人的特写仍可能通过（light_tube 225 帧里 2 帧）。
   仅凭姿态无法区分，要彻底消除需要物体检测的 `person` 证据或分割 mask；当前只在
   采样窗口里短暂出现，不参与 `operating`。
+- **2026-11-18 补**：机场素材观察轮（`runs/refuel-sampling-suite-2026-11-18/`）里，
+  设备/工件特写被补成人的误检大多是「髋点在肩上」（drop < 0，躯干倒置）。这道门只用于
+  **绘制骨架**（`drawMinTorsoDrop=0`）：动作判定仍用完整人物列表，因为逐帧剔除会打断
+  `Hold` 的连续帧——B787 面板实测 `operating` 从 17 次采样掉到 1 次。水平/弯腰（drop≈0）
+  仍画。少数几何上直立的误检（如 A320 取样箱 194.75s、218.75s）仍会漏过，需要手部检出
+  或物体模型补证。真实人物里只有躯干被检成倒置的帧（A320 188.0s）不画骨架——那一帧的
+  骨架本来就是倒的。
+
+## 三·八·六、头部朝向（head）
+
+设备特写、头~胸构图、只有半个头出镜时，躯干/髋/膝可能完全不可见，姿态层判不了站/坐；
+但头部的鼻/眼/耳（`persons[].kp_head`）还在。`signals.head` 只吃这 9 点（加可选的
+`kp_world`），**不依赖躯干、髋、膝**，因此这些构图下仍能给出头部朝向；尺度/几何门
+不通过时角度为 `null`，但不会因为躯干不可见而整段没有头信号。
+
+| 字段 | 含义 |
+|---|---|
+| `visible` / `points` | 头部点是否够用；可见的头部点数（9 点中）。`visible` 只表示“有头点”，角度可能因门控为 `null` |
+| `face_px` | 实际使用的眼对/耳对像素距离；小于 `minPairPx` 时角度置 `null` |
+| `source` | 本帧首选取源：`2d` / `2d_ear` / `3d` / `null`；逐轴看 `yaw_source` / `pitch_source` / `roll_source` |
+| `confidence` | 0~1，点数、尺度、眼对质量、门控惩罚的乘积；不是概率 |
+| `yaw` / `pitch` / `roll` | 角度（度），可为 `null`；符号见下。2D 是近似度，配 `yaw_approx` / `pitch_approx` / `roll_approx` |
+| `reliable` | `{yaw,pitch,roll}`：幅度是否可信。饱和、耳对回退时为 `false`；方向仍可能可用 |
+| `yaw_2d` / `pitch_2d` / `roll_2d` | 2D 原始量：`yaw_2d` 归一化到约 [-1,1]，`pitch_2d` 是以正视 0.45 眼距为基线的归一化值，`roll_2d` 是**度**（约 -90~90，不是比值）；诊断用 |
+| `yaw_dir` / `pitch_dir` / `dir` | 量化方向：`left/right/front`、`up/down/front`，`dir` 为组合（`left_down` 等），left/right 指受试者自身 |
+| `reasons` | `no_head_points` / `few_points` / `no_face_pair` / `no_nose` / `no_eye_geometry` / `face_too_small` / `nose_geometry` / `pair_disagree` / `roll_extreme` / `yaw_saturated` / `pitch_saturated` / `visibility_missing` / `angle_outlier`；开了 `use3d` 时还可能有 `no_world_3d` / `no_world_pitch` |
+
+**符号**：全部按**受试者自身**的左右，和页面是否镜像无关。`yaw` 正=受试者向自己的右侧
+转头，负=左；`pitch` 正=低头，负=抬头；`roll` 正=受试者左侧更低（向自己的左侧倾），
+负=右侧更低。`dir` 的 left/right 同样是受试者自身。页面默认水平镜像显示
+（`.stage.mirror`），但 kp 是原始视频坐标；统一用解剖左右才不会在镜像后反。
+
+> **2026-11-20 符号变更**：此前的 `signals.head.yaw` 用原始画面右为正；现在改为受试者
+> 右为正。旧导出重放时按旧语义，不要和新数据混在一起做统计。
+
+**2D（默认）**：眼/耳线给 `roll`；把鼻/眼/耳去倾斜后，鼻相对脸中心（眼或耳中点）的
+水平偏移除以脸半宽给 `yaw_2d`，再 `asin` 成近似度数；鼻-眼垂直距离 / 眼距给
+`pitch_2d`（正视基线 0.45），按 ±45° 线性映射成近似度数并标 `pitch_approx=true`。
+耳对回退乘 `earYawGain`（默认 2.4，耳距约为眼距的 2.4 倍），并标 `2d_ear`、
+`yaw_approx=true`、`reliable.yaw=false`；2D 耳对不给 pitch（没有眼距基线）。
+**3D（可选，profile 显式 `use3d`）**：`yaw` 取「头自身左右轴（眼/耳线）」相对相机像平面的
+转角——先按 roll 把横向分量还原到水平面，再取 `atan2(latZ, |lat|)`（正=受试者向右）。
+**不能**用鼻子相对眼线的横向/前向分量：真人转头是刚体旋转，眼线跟着转、鼻子相对眼线的几何
+不变，那个量在转 30°/60° 时都≈0（2026-11-20 审核发现并改正；旧测试只挪鼻点，掩盖了问题）。
+`pitch` 用眼→耳中点高差；`roll` 用眼/耳线。缺鼻时 yaw 仍为 `null`（与 2D 口径一致）。
+2026-11-19 在 B787/变压器实拍上复核发现 Pose 的 world **面部**点噪声很大（同一姿势 yaw 在
+±150° 之间跳），所以默认不用 3D；保留实现只给需要实验的 profile。2D 的 yaw/pitch 是投影
+近似，不是标定过的解剖角。
+
+**可信度门控**（2026-11-20 实拍复核后加）：门控不是“调阈值”，是承认 Pose 的头部点
+在背身、帽檐、远处小脸时并不可信。6 段 refuel/B787/A320/变压器素材、1143 个
+person-frame 的实测：眼距中位只有 6.3 px，63% < 10 px；未加门控时 39% 帧 yaw 饱和、
+42% pitch 饱和。背身/帽檐样例（0.1s，戴安全帽和耳罩、看不到脸）仍给 visibility 0.99、
+yaw −64° / pitch 45° / 置信 0.72；加门控后三轴全 `null`、置信 0.16。
+
+| 门 | 默认 | 行为 |
+|---|---|---|
+| 尺度 | `minPairPx=10` / `goodPairPx=20` | 眼对/耳对 < 10 px → 三轴 `null` + `face_too_small`；置信按 `face_px/20` 衰减 |
+| 鼻-眼几何 | `noseDropMin=-0.3` / `noseDropMax=1.8` | 去倾斜后 `(鼻y-眼中心y)/眼距` 越界 → 三轴 `null` + `nose_geometry`（背身样例是 2.9） |
+| 眼耳一致性 | `maxPairDisagree=105°` | 眼对与耳对独立 yaw 差 > 105° → `yaw=null` + `pair_disagree`（实拍 P90≈105°，背身样例 154°） |
+| roll 上限 | `maxRoll=75°` | `abs(roll)` 越界 → `roll=null` + `roll_extreme` |
+| 旧数据 | — | `kp_head` 只有 `[x,y]` 时按可见处理，并标 `visibility_missing` |
+
+profile 里的这些阈值在加载时（`validateParams`）做值域校验：`noseDropMax` 必须大于
+`noseDropMin`、四组滞回里 enter 必须严格大于 exit（`yawEnter/yawExit`、
+`pitchEnter/pitchExit`、`yaw2dEnter/yaw2dExit`、`pitch2dEnter/pitch2dExit`），且
+**量纲对得上**——3D 两组是度（0–90），2D 两组是归一化量（0–1），把度数写进 2D 键、
+或写成负数都会直接报错（否则 2D 永远达不到阈值，方向恒 `front`）。另有
+`goodPairPx > 0` 且不小于 `minPairPx`、`maxPairDisagree` 在 0–180、`dirHoldMs ≥ 0`、
+`minPoints` 是 1–9 的整数。写错时直接抛错，而不是让三轴静默恒 `null`（区间颠倒）或
+方向逐帧翻转（enter ≤ exit）——和放油取样参数值域校验同一口径。
+
+门控后约一半的 person-frame 三轴全 `null`。这是刻意的：那些帧的角度是噪声，宁可没有。
+`headPoseText` 会把“太小/几何不可用/坏点”直接写出来，不给伪精度。
+
+**部分可见**：缺鼻时 yaw 为 `null`（不能定左右）；3D 下眼-耳几何仍可给 pitch/roll，
+2D 下没有眼距基线，pitch 也为 `null`。只有单侧眼/耳时没有 face pair，角度为 `null`，
+只报告 `visible/points`；头部完全出画时 `visible=false`，绝不拿躯干/肩去猜头。
+
+**方向滞回 + 去抖**：2D 用原始归一化量 `yaw2dEnter/yaw2dExit`（0.3/0.18）、
+`pitch2dEnter/pitch2dExit`（0.25/0.12）；3D 用度数 `yawEnter/yawExit`（15°/8°）、
+`pitchEnter/pitchExit`（12°/6°）。方向再经 `dirHoldMs`（默认 200 ms）去抖：首次获得
+方向立即生效，切换/丢失要稳定 200 ms。方向只影响 UI/导出，不参与动作 Hold。
+某一轴被门控置空（如 yaw 因 `pair_disagree` 不可用）时，方向词只报另一轴（`down`），
+不会拼出 `null_down` 这种导出/UI 都非法的标签；两轴都不可用时为 `null`。
+头部角度与关节角共用 One Euro 平滑和角速度坏点门（单帧 >1500°/s 判 `angle_outlier`，
+不沿用旧值），不像旧版只平滑不剔坏点。但头部坏点只写进 `head.reasons`，**不**进
+`signals.angle_outliers`：后者是「动作层 unreliable」的输入，而没有任何动作依赖头部角度，
+混进去会把姿势完全正常的帧也标成「角度坏点」。
+
+**限制**：门控只能挡住“明显不对”的样本，不能证明脸朝向相机；背身/侧脸/帽檐/口罩仍有
+落在门控内侧的可能。没有专用人脸模型，Pose 的头部点来自人物检测，设备/工件被误检成
+人时也会给头朝向——看 `reliable`、`reasons`、`confidence`，不要只看 `dir`。2D 的
+yaw/pitch 是投影近似、未用实拍真值校准，只适合方向和量级；侧脸接近 90° 时符号和幅度
+都不可靠，门控会尽量把它置 `null`。3D 面部点噪声大，除非自己用实拍验证过，否则不要
+打开 `use3d`。这不是动作识别，只是朝向信号；需要「低头看设备」之类的动作时，在动作层
+基于 `head.pitch/dir` 再加保持窗，并先看 `reliable`。
 
 ## 三·九、判定不可靠的原因（误差识别）
 
@@ -546,7 +654,7 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 | `low_confidence` | 置信门控失败（§三·五） | 动作层冻结，沿用上一帧结论 |
 | `extrapolated` | 有短时遮挡外推点（§一·五） | 相关计数冻结 |
 | `bone_blocked` | 骨骼长度一致性判某肢不可靠 | 相关 3D 信号为 NaN，手臂动作可能不成立 |
-| `angle_outlier` | 本帧角度因角速度过大被剔除（§三 第 10 条） | 该角度为 NaN，依赖它的判定本帧不成立 |
+| `angle_outlier` | 本帧角度因角速度过大被剔除（§三 第 10 条）；头部 `head:yaw` / `head:pitch` / `head:roll` 共用同一道门 | 该角度为 NaN/`null`，依赖它的判定本帧不成立；头部帧的 `head.reasons` 会带 `angle_outlier`，但**不**把整帧标成 `unreliable`（头部角度不参与动作判定） |
 
 界面同时显示画面内置信与「下半身不可见」，用来区分「人不可信」和「画面里没有腿」。
 这几项都是**弃权**，不是猜测：宁可这一帧不判，也不让坏点把计数带偏。
@@ -570,6 +678,10 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 | `uprightness` 上半身直立 | > 0.75 | 躯干偏离竖直 < ≈41° | `actions.posture.upper.uprightGt` |
 | `uprightness` 上半身前倾 | 0 ~ 0.75 | 前倾；≤0（躯干水平/倒置）不判，可能是躺卧或髋点漂移 | `actions.posture.upper.leanGt` |
 | 上半身框高宽比 | ≥ 0.9 | 上半身框通常高于宽；横向大框多半是手臂/设备特写被凑成人（refuel 实测 220×147） | `signals.upperBody.minAspect` |
+| 头部可见 | 头部 9 点中 ≥2 点可见，且鼻/眼对/耳对至少一个 | 只有鼻+单眼时能确认「有头」，但定不了左右朝向 | `signals.head.minPoints` / `visMin` |
+| 头部方向 | 2D：yaw 0.3/0.18、pitch 0.25/0.12（原始归一化量）；3D：yaw 15°/8°、pitch 12°/6°（度） | 阈值附近抖动用滞回，再过 `dirHoldMs=200ms` 去抖；方向只是状态，不参与动作 Hold | `signals.head.*` |
+| 头部角度门控 | 眼对/耳对 ≥10px；鼻-眼 drop ∈ [-0.3, 1.8]；眼耳 yaw 差 ≤105°；`abs(roll) ≤ 75°` | 任一越界 → 对应轴（或三轴）置 `null`，不输出伪角度 | `signals.head.minPairPx/noseDrop*/maxPairDisagree/maxRoll` |
+| 头部角速度坏点 | >1500°/s 且间隔 ≤250ms | 与关节角同一道门；本帧 `head.yaw/pitch/roll` 为 `null`，`reasons` 带 `angle_outlier` | `signals.angleJump.*` |
 | `leg_vertical` 站立 | > 0.8 | 踝明显在髋下方 | `actions.posture.stand.legVerticalGt` |
 | `leg_vertical` 下蹲姿态（已下线） | > 0.85 | 坐姿的腿不再竖直向下 | 仅用于区分坐/站 |
 | `leg_vertical` 躺卧（已下线） | < 0.8 且 `uprightness` < 0.45 | 两个条件必须同时满足 | — |
@@ -580,7 +692,7 @@ UI 上要显示这一点，否则用户会怀疑「为什么我蹲了他没数�
 | 关节角突变 | > 1500°/s 且间隔 ≤ 250 ms | 33 ms 内跳 110°≈3333°/s（坏点）；100 ms 内跳 100°=1000°/s（真实下蹲） | `signals.angleJump.maxRate` / `maxDtMs` |
 | 左右侧滞回 | 0.15 | 另一侧可见性要高出 0.15 才换侧，防两侧抖动 | `signals.sideHysteresis` |
 | 上半身尺度换算 | 肩宽 × 1.4 | 髋不可信时用肩宽估躯干长；实测肩宽/躯干长 ≈1.25~1.55 | `signals.shoulderToTorso` |
-| 人物有效性门 | bbox 宽/高 ≥0.12、躯干/框高 ≤1.4、锚点可见性 ≥0.4、手框覆盖全身 | 低清晰度特写里「手+取样管」被补成人的几何特征；真实人物 0% 误杀（4 段本机素材） | `perception.personGate.*` |
+| 人物有效性门 | bbox 宽/高 ≥0.12、躯干/框高 ≤1.4、锚点可见性 ≥0.4、手框覆盖全身；骨架另要求髋不低于肩 | 低清晰度特写里「手+取样管」被补成人的几何特征；真实人物 0% 误杀（4 段本机素材；2026-11-18 机场素材复核：站立/坐/蹲 0.75~1.0，误检多为负值） | `perception.personGate.*` / `drawMinTorsoDrop` |
 | 前/侧平举保持 | 300 ms | 走路摆臂的瞬时命中只持续 ~250 ms | `actions.holds.front` / `side` |
 | 前/侧平举伸直度 | 3D 腕-肩距离 / 躯干长 > 0.85 | 弯臂横在胸前约 0.5~0.8，必须基本伸直才算平举 | `signals.arm.azimuth.minReach` |
 | 腕部 ROI | 1.8 × 躯干长（64~480 px） | 全身构图手只有几十像素，放大后再检；中心归属另行判定 | `signals.hand.roi.mul` / `minPx` / `maxPx` |
@@ -732,6 +844,8 @@ node web/test/signal-compare.mjs --a front.frames.json --b side.frames.json --ac
 ```
 
 `--action` 会自动找同名 `front.labels.json` / `side.labels.json`；没有 labels 时只做全帧分布对比。
+动作匹配与评估器同口径：`arm_raised` 与 `armRaised`（id/flag）等价，`!动作` 与
+`expect:false` 的反例窗口**不参与**正例采样（否则均值/分位被反例污染）。
 输出每套信号的分布与**跨素材重合度**（1=完全重合），以及 2D/3D 的差值。
 重合度高不代表信号正确，它只回答「换机位后分布漂不漂」，必须和 recall/precision 一起看。
 

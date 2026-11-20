@@ -47,14 +47,17 @@ export function offsetHand(hand, dx, dy) {
 }
 
 /**
- * 裁图里检出的手属于哪一侧：比较它的腕点到该人所有姿态腕点的距离，取最近的那个。
+ * 裁图里检出的手属于哪一侧：比较它的腕点到该人所有**可见**姿态腕点的距离，取最近的那个。
  * 手靠得近时（双手在胸前），裁右腕的框里可能只检出左手——只有靠这个归属判断才能发现。
+ * 不可见腕点的坐标是模型猜的（被遮挡时常常落在身体中线上），不能让它抢走归属：
+ * 否则「裁右腕、检出右手」会被判成裁错了侧而整只丢弃。可见性口径与 wristSideFor 一致（0.3）。
  * @returns {'L'|'R'|null}
  */
-export function nearestWristSide(x, y, wrists) {
+export function nearestWristSide(x, y, wrists, visMin = 0.3) {
   let best = null;
   let bestD = Infinity;
   for (const q of wrists || []) {
+    if ((q.vis ?? 0) < visMin) continue;
     const d = Math.hypot(q.x - x, q.y - y);
     if (d < bestD) { bestD = d; best = q; }
   }

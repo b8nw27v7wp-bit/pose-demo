@@ -8,7 +8,7 @@
 > Python 服务端引擎与 YAML 规则仍只在 `PLAN.md` 的路线中，**本版没有实现**。
 > 阈值是量级参考，尚未用实拍素材完成校准；具体验证范围见「初始版验证范围」。
 > **动作集已收敛**：躺卧、下蹲、深蹲/俯卧撑计数已下线（需要全身或地面机位，桌面摄像头判不了），
-> 当前注册表是 **2 个静态姿态 + 2 个上半身推断姿态 + 6 个面板手臂动作 + 3 个隐藏可标注
+> 当前注册表是 **2 个静态姿态 + 2 个上半身推断姿态 + 7 个面板手臂动作 + 3 个隐藏可标注
 > 手臂动作 + 5 个已下线手臂动作 + 1 个上下文事件（在设备旁）+ 8 种手势 +
 > 1 个在用计数（拿取）+ 1 个已下线计数（鼓掌）**。理由与恢复方式见「能识别什么」。
 
@@ -47,6 +47,7 @@ web/                    浏览器 Demo（纯静态，无构建链）
   js/hands.js           L1 手部适配：MediaPipe Hand（21 点/手）+ 腕部 ROI 补检
   js/handroi.js         腕部 ROI 的几何（纯函数，可单测）
   js/geometry.js        设备多边形 ROI / 人框有效性 / 头部关键点（纯函数，可单测）
+  js/headpose.js        头部朝向 yaw/pitch/roll（只看鼻/眼/耳，不依赖躯干；含尺度/几何门控，纯函数可单测）
   js/handshape.js       手势分类（纯函数，可单测）
   js/signals.js         L2 信号层：One Euro、2D/3D 角度、Hold、RepCounter、骨骼一致性、遮挡外推
   js/stats.js           分布统计（分位 / 重合度，只给评估工具用）
@@ -84,6 +85,18 @@ serve.py                本地静态服务器
 挥手 / 抱臂 / 叉腰 / 前平举 / 侧平举已下线——引擎历史数据仍可评估，界面与新增标注不再出现）
 **上下文**：在设备旁（`near_equipment`，人体框与设备 ROI/检测框重叠；不要求手在设备上）
 **手势**（每只手单独识别）：握拳 / 张开 / 剪刀手 / 指方向 / 竖拇指 / OK / 手枪 / 摇滚
+**头部朝向**（`yaw` / `pitch` / `roll`）：只看头部鼻/眼/耳 9 点，**不依赖躯干、髋、膝**，
+所以设备特写、头~胸构图、只有半个头出镜时也能输出。**符号按受试者自身**：`yaw` 正=向右，
+`pitch` 正=低头，`roll` 正=左侧更低，与页面镜像无关。默认用 2D（Pose 的 world 面部点实测
+噪声很大，同一姿势 yaw 会跳 ±150°；3D 只在 profile 显式 `use3d` 时启用）。2D 的 `yaw/pitch`
+是近似度（导出标 `yaw_approx/pitch_approx`）。带可信度门控：眼对/耳对 < 10px、鼻-眼几何
+异常、眼对与耳对 yaw 不一致、`|roll| > 75°` 时角度置 `null`；`reliable` 逐轴说明幅度是否
+可信。方向给出正前 / 左 / 右 / 上 / 下及组合（如左下），阈值带滞回 + 200ms 去抖；面板
+「信号」里显示「头部朝向」，导出在 `signals.head`。头部完全出画或可见点不足时输出
+`visible=false`，不会拿躯干猜头；实拍里背身/帽檐帧的角度会被门控挡掉。profile 里的头部
+阈值（`signals.head.*`）在加载时做值域校验：区间颠倒、enter ≤ exit、尺度门自相矛盾会
+直接报错，不会让头部信号静默恒 null（与放油取样参数值域校验同一口径）。
+
 **计数**：拿取（鼓掌计数已下线）
 
 **操作设备（阀门/仪表）** 是「持续在做」的事件，不是瞬时手势：任一侧手腕进入 profile 配置的
@@ -96,6 +109,10 @@ ROI 支持旧矩形 `roi: {x,y,w,h}` 和新的多边形/多区域 `rois: [{id, p
 （`?profile=/web/profiles/refuel.json`，保持窗 1500ms、肘兜底 `minElbowVis 0.21 /
 minElbowReach 0.315`；563 帧复核导出上 TP5/FN1/FP3，段级 R 0.833 / P 0.625）和
 `web/profiles/refuel-polygon.json`（与 refuel 矩形等价的多边形接线示例）。换机位必须重标重校。
+
+> **2026-11-20 起以 `web/accuracy.json` 为准**：`npm run accuracy` 改为读 `eval-data/incoming`
+> （递归）并带 `pilot-panel` profile，用当前 290 帧 5fps 导出 + 8 段硬负例；当前 operating
+> 3TP/3FN/3FP（R .5 / P .5），near 4/2/3。上面的 5/1/3 与 3/3/2 都是 563 帧旧导出，两组数字不可混用。
 
 **在设备旁（`near_equipment`）** 是独立的上下文事件，**不要**把它并进 `operating`：它只回答
 「人在设备区域里」，人体框 ≥50% 落在 ROI/设备框内（refuel 档）、两肩可见、保持 1s。refuel 上它
@@ -114,6 +131,11 @@ MediaPipe 会把「手 + 取样管/瓶子」补成一个完整的人（鼻/肩/�
    关键点平均置信 < `minScore`，或双肩+双髋最低可见性 < `minAnchorVis`；
 2. 手部包含：鼻/双肩/双髋里至少 `minAnchors` 个落在同一只手框（外扩 `expand`）内，
    或手框面积 ≥ 人体框的 `maxHandAreaRatio`。
+
+另有一道**只作用于骨架绘制**的倒置门：髋中点高于肩中点（躯干倒置）的人不画骨架
+（`perception.personGate.drawMinTorsoDrop=0`，水平/弯腰仍画）。它不参与动作判定——
+逐帧剔除会打断 `Hold` 的连续帧，B787 面板实测把 `operating` 从 17 次采样打到 1 次；
+需要连动作一起过滤的 profile 可显式打开 `minTorsoDrop`（默认 `null`）。
 
 拿不到 bbox/kp/手数据时 **fail-open**（旧数据/测试夹具不因少字段被剔除）；profile 写
 `perception.personGate.enabled=false` 可关闭。阈值来自 4 段真实人物素材 + light_tube
@@ -198,29 +220,48 @@ MediaPipe 会把「手 + 取样管/瓶子」补成一个完整的人（鼻/肩/�
 伸手只认「张开」，指向只认「指方向/手枪」，两者不再同时亮。文案与判据同源于
 `web/js/armhint.js`，改判据时要一起改。
 
-点面板右侧的**「准确率」**展开 7 项（6 个面板手臂动作 + 在设备旁）的**实测召回/精确率**（来自评估报告，见下文
+点面板右侧的**「准确率」**展开 8 项（7 个面板手臂动作 + 在设备旁）的**实测召回/精确率**（来自评估报告，见下文
 「量化动作准确率」）。每个方向样本 <20 段（手势为帧）时不报百分比；没有报告或没有标注数据时显示「未评估」——
 不拿规则自估或合成样例冒充实拍准确率。
+
+## 试点范围（pilot-panel）
+
+2026-11-20 起，对外演示/试点默认用 `web/profiles/pilot-panel.json`，把口径收敛到能拿证据的部分：
+
+- **在范围内**：固定机位、单人、**panel** 设备 ROI 明确的 `operating` / `drain_sample` /
+  `near_equipment`；姿态与上半身构图只作上下文。
+- **不在范围内**：多人、8 类手势精度、PPE 准确率、头部角度精度、`oil_sample`、
+  valve/gauge 作为主判据、跨机位/换人泛化。引擎仍会算这些信号，但不得写进验收。
+- **当前证据**：`npm run accuracy` / `npm run eval` 固定读 `eval-data/incoming`（递归）并带
+  `pilot-panel`；当前 583 帧、9 段（1 段 58s 正例演示 + 8 段硬负例）。operating
+  3TP/3FN/3FP（R .5 / P .5），near 4/2/3（R .667 / P .571），**n<20，页面只显示「样本不足」**。
+- **升级条件**：按 [`docs/data-collection.md`](docs/data-collection.md) 补 **2 人 × 2 机位、
+  每个动作 ≥40 正/20 反**，带 `camera` / `subject` 字段，用 `deterministic-replay.mjs` 固定 fps
+  复跑；头部角度另用 `web/test/headpose-eval.mjs` 报分档/弃权/MAE。达不到就不扩大承诺。
 
 ## 验证
 
 ```bash
-npm test                            # 22 槽位 + 58 几何 + 26 设备框 + 34 operating + 39 油样/放油取样 + 310 逻辑 + 45 动作提示 + 37 准确率 + 310 评估器 + 46 难例 + 19 自动标注 + 23 清单 + 113 多人 + 31 ONNX + 54 PPE + 19 PPE 评估；合计 1186 项
+npm test                            # 22 槽位 + 66 几何 + 90 头部朝向 + 14 头部角度评估 + 26 设备框 + 36 operating + 39 油样/放油取样 + 324 逻辑 + 49 动作提示 + 37 准确率 + 338 评估器 + 46 难例 + 21 自动标注 + 27 清单 + 7 信号对比 + 133 多人 + 31 ONNX + 54 PPE + 25 PPE 评估；合计 1385 项
 node web/test/slot-test.mjs         # 22 项：估计器槽位的同 key 复用、换 key 重建、并发创建先后完成都不覆盖、close 作废在途创建、失败不污染槽位、superseded 标记
-node web/test/geometry-test.mjs     # 58 项：旧矩形规整、多边形配置/点内测试/面积/矩形裁剪、多 zone 最大重叠、resolveRegions 优先级与 fail-closed、人框有效性、头部 9 点换算、人物有效性门（细长条/躯干过长/锚点不可见、整块身体落在手框里、缺字段 fail-open）
-node web/test/logic-test.mjs        # 310 项：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立 vs 上半身直立/前倾）/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/统计/拿取阶段机（含 releaseMs 闭锁）/注册表 flag 一致/上半身构图/腕部 ROI/手归属/平举物理门/换侧滞回/角度突变剔除/不可靠原因/手-臂对应/手型与左右侧绑定/操作设备掉帧容忍（含引擎漏调用的大间隔）/设备框与 ROI 的 union/fail-closed/多边形 ROI/人框有效性/operating 不成立时不报 zone
-node web/test/armhint-test.mjs      # 44 项：15 个动作的提示覆盖、手部关闭/未加载/未检出、无 3D/配置关闭、置信不足、多动作提示优先级、准确率文案（提示行与 tooltip）、左右手粒度、无画面时按 profile 标 ROI/检测框不可用（detector-only 还要求物体检测已开且就绪）、人框有效性文案node web/test/accuracy-test.mjs     # 37 项：flag→id 映射、n/95%CI 保留、样本不足不报百分比（含段数与 TP/FN/FP）、未评估、合成来源标记、profile/数据源目录透传、档位边界、报告加载容错、参数指纹过期检测、多 track 池化
-node web/test/eval-test.mjs         # 310 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样、多人逐 track 与 label.track/uid、旧单人回归、物体模型指纹与跨模型 baseline 拒绝、多 track baseline/sweep/A-B、逐 track 抖动与姿态混淆矩阵、帧尺寸透传、objects 接线与 operating 离线回放、上下文事件不计入 noArm/none、kp_head/多边形回放、放油取样参数值域校验）
+node web/test/geometry-test.mjs     # 66 项：旧矩形规整（含归一化值域 fail-closed）、多边形配置/点内测试/面积/矩形裁剪、多 zone 最大重叠、resolveRegions 优先级与 fail-closed、人框有效性、头部 9 点换算、人物有效性门（细长条/躯干过长/躯干倒置的绘制门/锚点不可见、整块身体落在手框里、缺字段 fail-open）
+node web/test/headpose-test.mjs     # 90 项：头部朝向 yaw/pitch/roll 的 2D 默认与 3D 显式开关（含 yaw_3d/pitch_3d/roll_3d 诊断字段与刚性转头）、受试者左右符号、侧倾、部分头点（缺鼻/单眼）、尺度门/鼻-眼几何门/眼耳一致性门/roll 上限门、缺 visibility（2D/3D 同口径）、耳对回退、2D/3D 阈值分开、方向滞回与去抖、单轴不可用不拼 null、UI 文案
+node web/test/headpose-eval.mjs --self-test  # 14 项：头部角度分档评估、弃权/覆盖率（含角度为 null 但方向仍在去抖保持窗内时算弃权）、roll 容差、MAE/P90、秒/毫秒标注、未知分档报错、无 signals.head 警告
+node web/test/logic-test.mjs        # 324 项：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立 vs 上半身直立/前倾）/置信冻结/手势分类/可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/统计/拿取阶段机（含 releaseMs 闭锁）/注册表 flag 一致/上半身构图/腕部 ROI/手归属/平举物理门/换侧滞回/角度突变剔除/不可靠原因/手-臂对应/手型与左右侧绑定/操作设备掉帧容忍（含引擎漏调用的大间隔）/设备框与 ROI 的 union/fail-closed/多边形 ROI/人框有效性/operating 不成立时不报 zone/头部时序与坏点门
+node web/test/armhint-test.mjs      # 49 项：15 个动作的提示覆盖、手部关闭/未加载/未检出、无 3D/配置关闭、置信不足、多动作提示优先级、准确率文案（提示行与 tooltip）、左右手粒度、无画面时按 profile 标 ROI/检测框不可用（detector-only 还要求物体检测已开且就绪）、人框有效性文案
+node web/test/accuracy-test.mjs     # 37 项：flag→id 映射、n/95%CI 保留、样本不足不报百分比（含段数与 TP/FN/FP）、未评估、合成来源标记、profile/数据源目录透传、档位边界、报告加载容错、参数指纹过期检测、多 track 池化
+node web/test/eval-test.mjs         # 338 项：评估器自身对不对（反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson、门槛、扫描、A/B、时延、抖动、meta、目录配对与递归配对、hands replay、每 20 次计数误差、video_time 回绕、手势帧级指标/弃权/归属、仅 none 段的手势误报、分位→profile/LOSO/重采样、多人逐 track 与 label.track/uid、旧单人回归、物体模型指纹与跨模型 baseline 拒绝、多 track baseline/sweep/A-B、逐 track 抖动与姿态混淆矩阵、帧尺寸透传、objects 接线与 operating 离线回放、上下文事件不计入 noArm/none、kp_head/多边形回放、放油取样/头部朝向/operating 结构参数校验（含 2D/3D 量纲）、pilot-panel 口径、审核 P0 回归（多人段缺 track、按 track 拟合、baseline 回退与未匹配、多次拿取草稿、BOM JSONL））
 node web/test/hardcase-test.mjs     # 46 项：前后窗口边界、video_time/ts 两种 label 时间基、非法动作、空窗口、!动作/noArm 反例导出、尾部锚点（区分播完与暂停）
 node web/test/equipment-test.mjs    # 26 项：设备框时序确认/过期/重帧去重、线段到框距离、单人道主目标选择
-node web/test/operating-test.mjs    # 34 项：operating 的 gate 诊断、框时序、ROI 约束、前臂/握持/人形门、nearEquipment 独立兜底开关
+node web/test/operating-test.mjs    # 36 项：operating 的 gate 诊断、框时序、ROI 约束、前臂/握持/人形门、nearEquipment 独立兜底开关、fail-closed 下的框有效期校验
 node web/test/sampling-test.mjs     # 39 项：油样取样（oil_sample）与「手在头部」的边界、3D 方位角门、保持窗；放油取样（drain_sample）的蹲姿/双手靠拢/膝角上下限/单膝跪地不随可见度翻转/遮挡期间不拆成单手/接近站立需前倾
-node web/test/autolabel-test.mjs    # 19 项：区间合并/丢弃、计数周期、草稿内容与自评全通过、注册表覆盖
-node web/test/manifest-test.mjs     # 23 项：清单字段与文件校验（含 heavy 档位）、覆盖度、计数与反例、动作 id/flag 等价、清单骨架、注册表覆盖
-node web/test/multi-test.mjs        # 113 项：跟踪 id 稳定/防换 id/超时换 id、每人独立状态机与 gap 重置、手部归属（bbox 内/腕部外扩 + 次近人 margin + 整帧左右侧按腕点纠正）、逐 track 手势去抖隔离、ROI 预算与 minScalePx、PPE 标签/几何/unknown 语义/持续门槛、平铺几何、运动/外观/最优分配、物体框坐标（像素/归一化）、导出上限与 meta 接线、face/hand 区域
+node web/test/autolabel-test.mjs    # 21 项：区间合并/丢弃、计数周期（含离场重计数与计数回退）、草稿内容与自评全通过、注册表覆盖
+node web/test/manifest-test.mjs     # 27 项：清单字段与文件校验（含 heavy 档位）、覆盖度、计数与反例（上下文动作不记 none/noArm）、labels 解析失败、动作 id/flag 等价、清单骨架、注册表覆盖
+node web/test/signal-compare-test.mjs  # 7 项：动作 id/flag 等价、反例窗口不进正例采样、三种时间写法
+node web/test/multi-test.mjs        # 133 项：跟踪 id 稳定/防换 id/超时换 id（含先 prune 再匹配）、每人独立状态机与 gap 重置、流水线上限只淘汰过期项、手部归属（bbox 内/腕部外扩 + 次近人 margin + 整帧左右侧按腕点纠正）、逐 track 手势去抖隔离、ROI 预算与 minScalePx、PPE 标签/几何/unknown 语义/持续门槛、平铺几何、运动/外观/最优分配、物体框坐标（像素/归一化）、导出上限与 meta 接线、face/hand 区域
 node web/test/onnx-test.mjs         # 31 项：YOLOv8 输出解码（[C,N]/[N,C]）、逐类别 NMS、letterbox 逆变换、形状/缺省参数校验、sidecar 类别顺序/inputSize/缺失校验、生成脚本的 --labels 路径/注释解析
 node web/test/ppe-test.mjs          # 54 项：track_uid 稳定与旧数据回退、PPE 计时随 id 变化、requirePositive 窗口护栏（按帧去重）、reason_code（no_positive/config_mismatch/occluded/no_hand）、头部 face 区域、手套 hand 区域（含 fallbackWrist=false）、hands 透传、短 kp_head 兜底
-node web/test/ppe-eval.mjs --self-test  # 19 项：PPE 事件评估骨架（多 track、unknown 暂停/弃权、label.track 中途进场与 uid 绑定、bbox 失配、段级 camera 分组、旧数据明确报错）
+node web/test/ppe-eval.mjs --self-test  # 25 项：PPE 事件评估骨架（多 track、unknown 暂停/弃权、label.track 中途进场与 uid 绑定、bbox 失配、段级 camera 分组、旧数据明确报错、告警事件按 clip 匹配）
 ```
 
 页面级（需要 serve.py 已启动）：
@@ -231,6 +272,7 @@ node web/test/headless-check.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test
 node web/test/headless-multi.mjs "http://127.0.0.1:8799/web/?src=/data/pose-test-two.webm"  # 多人 + 物体检测 + 关物体后导出指纹（23 项）
 node web/test/headless-pose-switch.mjs "http://127.0.0.1:8799/web/"  # 快速连切模型：先发请求被取代并释放，最终槽位是最后一次请求（11 项）
 node scripts/pose-screenshots.mjs   # 用 data/ 现有素材跑姿态识别并截图：多人/单人图片与视频 + refuel 演示片，结果写到 runs/pose-test-<日期>/（截图含人脸，runs/ 不进 git）
+node scripts/refuel-sampling-suite.mjs   # 加油/油样采样观察轮：8 段既有素材按 INDEX 的取样窗口跑 Demo，逐段记录动作/设备框并整页截图，输出 runs/refuel-sampling-suite-<日期>/（testset.json + report.md；可 --only 跑单段，素材版权见 eval-data/airport-refuel/INDEX.md）
 node scripts/deterministic-replay.mjs <srcUrl> <profileUrl> <outName> --fps=10   # 确定性逐帧回放：固定媒体时间 seek，两次导出逐帧内容 sha256 一致（感知层 A/B 用，见 docs/eval.md）
 node web/test/headless-ppe-onnx.mjs # 自训 PPE 冒烟模型：ONNX 后端加载、labels 对齐、no_helmet 不被当正类（需 web/models/ppe_smoke.onnx）
 node web/test/throughput-probe.mjs  # 吞吐探针：应用自报 fps、实测帧/s、pose/hands/objects/draw 各阶段毫秒
@@ -339,21 +381,42 @@ node web/test/evaluate.mjs --dir eval-data --compare web/profiles/a.json web/pro
 node web/test/evaluate.mjs --dir eval-data --sweep actions.reps.clap.down
 
 # 8. 把准确率回显到 Demo（页面「动作与手势」→「准确率」）
-npm run accuracy                    # 读 eval-data/ → 写 web/accuracy.json
+npm run accuracy                    # 读 eval-data/incoming（递归）+ pilot-panel → 写 web/accuracy.json
+#    等价于：
+#    node web/test/accuracy-report.mjs --dir eval-data/incoming --recursive \
+#      --profile web/profiles/pilot-panel.json --out web/accuracy.json
+# 9. 头部角度分档评估（没有真值时只报覆盖率/弃权；有 yawDeg 等真值时加报 MAE）
+node web/test/headpose-eval.mjs --input <frames.jsonl> --labels <head.labels.json> --report head.md
 ```
 
 页面只显示**这个文件里的实测值**，不自己估。手臂动作按**标注段**计样本（TP/FN/FP 都是一个段是否命中），
 每个方向样本 <20 段时不报百分比（n=1 的 100% 会骗人）；手势是帧级指标。
 没有报告或没有标注数据时显示「未评估」。合成样例会被标成「合成样例自检」，不会冒充实拍准确率。
 
+`npm run accuracy` / `npm run eval` 的默认口径（2026-11-20 起）是 **`eval-data/incoming` 递归 + `pilot-panel`**：
+当前包含 290 帧 58s 演示导出（`eq-check-2026-11-16.jsonl`，labels 用同一段视频的
+`eq-check-2026-11-16.labels.json`）和 8 段 `incoming/neg-eq` 硬负例。`web/accuracy.json` 的
+`paramsHash` 与 `pilot-panel` 一致；页面只有在选同一个 profile 时才不应提示“参数指纹过期”。
+这份 labels 是 58s 演示片的标注，当前工作区从旧目录复制同名副本：
+
+```bash
+cp eval-data/refuel/refuel-operating.labels.json \
+   eval-data/incoming/eq-check-2026-11-16.labels.json
+```
+
+新机位/新素材不要复制；按 `docs/data-collection.md` 重新标注并在 labels 顶层写 `camera`/`subject`。
+
 带设备 ROI/场景阈值的素材（如 `operating`）必须把同一个 profile 传给评估器，否则回放时没有 ROI：
 
 ```bash
 node web/test/accuracy-report.mjs \
-  --dir eval-data/refuel/eval \
-  --profile web/profiles/refuel.json \
+  --dir eval-data/incoming --recursive \
+  --profile web/profiles/pilot-panel.json \
   --out web/accuracy.json
 ```
+
+跨机位时把 `camera` 写进 labels（clip 级或段级）；评估报告的 `groups.camera` 会按机位分组并给出跨组退化。
+`--dir` 可重复，`--recursive` 只返回有同名 `.labels.json` 的配对；`eval-data` 里的视频/训练图不会被当成评估样本。
 
 `autolabel` 只生成正例；反例必须人工补，否则 precision 恒为 1（见 `docs/data-collection.md` §六）。
 新素材（新机位/新人员）的接入、ROI 重画、接触表复核与 `near_equipment` 标注口径见
@@ -523,20 +586,22 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 
 以下结论来自当前仓库的自动化测试、合成样例与样例视频；**不代表实拍准确率**。
 
-- 几何单测 **58/58**：旧矩形规整、多边形点内测试/面积/矩形裁剪、多 zone 最大重叠、
+- 几何单测 **63/63**：旧矩形规整、多边形点内测试/面积/矩形裁剪、多 zone 最大重叠、
   `resolveRegions` 优先级与 fail-closed、人框有效性、头部 9 点换算、人物有效性门
-  （细长条/躯干过长/锚点不可见、整块身体落在手框里、缺字段 fail-open）
-- 逻辑单测 **300/300**：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立 vs 上半身直立/前倾）/置信冻结/手势分类/
+  （细长条/躯干过长/躯干水平或倒置/锚点不可见、整块身体落在手框里、缺字段 fail-open）
+- 逻辑单测 **319/319**：角度/滤波/滞回/计数门控/姿态互斥（坐 vs 站立 vs 上半身直立/前倾）/置信冻结/手势分类/
   可见性门控/抱臂抗转身/手部映射/3D 与 2D 逐侧退回/挥手同侧/骨骼一致性/外推/自适应周期/
   上半身构图/腕部 ROI/手-臂对应/换侧滞回/角度突变剔除/不可靠原因/手型与左右侧绑定/多边形 ROI/人框有效性
-- 动作提示单测 **44/44**：15 个注册动作的 tooltip 全覆盖（面板只显示当前 6 个）；手部模型关闭/未加载/未检出、无 3D、
+- 动作提示单测 **45/45**：15 个注册动作的 tooltip 全覆盖（面板只显示当前 7 个）；手部模型关闭/未加载/未检出、无 3D、
   配置关闭 3D、置信不足各有提示；无画面时也按 profile 标出 operating 的 ROI 不可用；多动作同时亮时按可信度最低的那个讲；
   提示行与 tooltip 都能带出实测准确率或「未评估」，并标出是哪只手。
-  无头页面确认 6 条动作 tooltip、提示行与准确率明细（7 行）真的渲染，且 1440×900 仍无整页滚动
+  无头页面确认 7 条动作 tooltip、提示行与准确率明细（8 行）真的渲染，且 1440×900 仍无整页滚动
+- 头部朝向 **84/84** + 角度评估自测 **13/13**：2D/3D 符号、尺度/几何/眼耳一致性/roll 门控、耳对回退、
+  方向滞回与去抖、缺 visibility；角度评估的分档/弃权/覆盖率/MAE/秒与毫秒标注。**全部是合成几何，没有实拍角度真值**。
 - 准确率单测 **37/37**：评估报告 flag→动作 id 映射、n/95%CI 原样保留、样本不足不报百分比但保留段数/TP/FN/FP、
   没有数据写「未评估」、合成来源标记、档位边界、报告加载的 404/格式错误/网络异常容错、
   参数指纹不一致时标记报告过期
-- 评估器单测 **301/301**：反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson 区间、
+- 评估器单测 **317/317**：反例语法、计数误报、失败区间、自动标注、混淆矩阵、分组、Wilson 区间、
   门槛、灵敏度扫描、A/B、时延与抖动、`video_time` 回绕、手势帧级指标/弃权/归属、
   分位→profile、LOSO、帧率重采样、多人逐 track 回放与 `label.track` 绑定、旧单人数据回归
 - 难例/自动标注/清单单测 **46 + 19 + 23**：窗口边界、两种 label 时间基、反例导出、
@@ -579,9 +644,11 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
 ## 已知限制（需要实机或实拍才能消除）
 
 - **真实动作准确率没有数字**：举手/伸手/持物/指向/操作设备/在设备旁、拿取计数、8 种手势的识别率目前只有合成信号
-  单测和评估器自测，**没有任何实拍素材跑过**。这正是 `docs/eval.md` 与
+  单测和评估器自测，**没有任何带逐帧标注的实拍素材跑过**（2026-11-18 的采样观察轮只记录「能输出什么」，
+  不算准确率，见下一条）。这正是 `docs/eval.md` 与
   `docs/data-collection.md` 要解决的问题，也是本版最大的空白。
   页面上的「准确率」因此只显示「未评估 / 样本不足(n=…)」，跑完 `npm run accuracy` 才会变成实测值；
+  当前 pilot 报告 operating/near 的 n=6/7，仍显示「样本不足」，要到 n≥20 才显示百分比；
   这是刻意设计，不是没接上。
 - 摄像头实时路径没有在自动化里跑过（无头浏览器无法给摄像头）。
 - 帧率数字来自无头环境，不代表真机；请在自己机器上开 DevTools 看。
@@ -604,6 +671,22 @@ profile 还可以写 `"model": "lite"` 声明阈值校准所用的姿态模型�
   的下载素材做了跨分镜重训：panel 的 val mAP50 0.99、浏览器端能稳定出框；
   valve/gauge 的 val 指标被「分镜框套整段运动镜头」拖低（仪表 12s 内漂移 40–140px），
   定性推理仍能检出。见 `docs/equipment-detector.md` §10。
+- **2026-11-18 加油采样观察轮**：`scripts/refuel-sampling-suite.mjs` 把 8 段既有素材在无头 Chrome 里
+  实播一遍（素材窗口见 `eval-data/airport-refuel/INDEX.md`）。`operating` + 设备框在演示片、B787 面板、
+  A320 取样箱、液压阀上都有输出；但 `oil_sample` 在 B787 举罐 / 军航举瓶上 **0 命中**，
+  `drain_sample` 在变压器深蹲取样上 **0 命中**（83% 采样腿不可见，有膝角读数的 94 次里 75 次 <60°，
+  被规则的下限有意排除）。另记录 2 次瞬时误报（面板前抬手触发 `oil_sample` 1 次；仪器特写被凑成人后
+  触发「举手/双手高举」1 次）。截图与逐次采样在 `runs/refuel-sampling-suite-2026-11-18/`（不进 git）。
+  2026-11-19 补：误检骨架加了**只作用于绘制**的倒置门（`personGate.drawMinTorsoDrop=0`），
+  设备/手部特写不再画倒置骨架；动作判定不受影响（逐帧剔除会打断 Hold）。前后对比见
+  `runs/refuel-sampling-suite-2026-11-18-gated/`。
+- **头部朝向默认是 2D 投影近似**：`yaw/pitch` 不是标定过的解剖角（导出标
+  `yaw_approx`/`pitch_approx`），侧脸接近 90° 时符号和幅度都不可靠。已加可信度门控
+  （眼对/耳对 <10px、鼻-眼几何异常、眼耳 yaw 不一致、`|roll|>75°` 时角度置 `null`）：
+  实拍 6 段素材、1143 个 person-frame 里约一半帧三轴为 `null`——远处小脸、背身、帽檐帧
+  本来就不该给伪角度。门控不能证明脸朝向相机；头点来自人物检测，设备/工件被误检成人时
+  也会给头朝向，需结合 `reliable`/`reasons`/`confidence` 判断。Pose 的 world 面部点
+  实测噪声很大，3D 只在 profile 显式 `use3d` 时启用。
 - 物体检测的 GPU delegate 对该模型会 trap（wasm divide by zero，且会污染整个运行时），
   默认走 CPU；换自训模型后需要自己验证能否上 GPU。
 - 多人**姿态/手势**已能按 track 评估（`evaluate.mjs` 的逐 track 回放与 labels 的 `track` 字段）；

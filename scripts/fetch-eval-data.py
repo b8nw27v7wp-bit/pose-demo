@@ -74,8 +74,16 @@ def list_files(h, repo):
     return h.list_repo_files(repo_id=repo, repo_type="dataset")
 
 
+# 所有下载失败都记在这里：清单会写 failed 数并把退出码改成非 0，
+# 否则「部分帧失败 → mp4 截断 → manifest 声称完整 → exit 0」会让下游帧号静默错位。
+DOWNLOAD_FAILURES = []
+
+
 def download(h, repo, files, dest, subdir=None):
-    """按文件列表下载（只取需要的子集，不下整仓）。返回成功下载的本地路径。
+    """按文件列表下载（只取需要的子集，不下整仓）。
+
+    @returns {{paths:list, failed:list}} failed 是 [(file, error), ...]；
+    调用方必须把 failed 写进清单或据此中止产物，不能只打一行 [skip]。
 
     并发下载：MOT17 是一帧一个 jpg，串行走镜像每个文件都要一次 TLS 握手，
     实测 600 帧要十几分钟；8 线程并行的瓶颈变成镜像带宽。
@@ -83,11 +91,14 @@ def download(h, repo, files, dest, subdir=None):
     from concurrent.futures import ThreadPoolExecutor
     target = os.path.join(dest, subdir or repo.split("/")[-1])
     done = 0
+    failed = []
 
     def one(f):
         try:
             return h.hf_hub_download(repo_id=repo, filename=f, repo_type="dataset", local_dir=target)
         except Exception as e:
+            failed.append((f, str(e)))
+            DOWNLOAD_FAILURES.append((repo, f, str(e)))
             print(f"  [skip] {f} — {e}")
             return None
 
@@ -99,7 +110,7 @@ def download(h, repo, files, dest, subdir=None):
                 out.append(p)
             if done % 50 == 0:
                 print(f"    … {done}/{len(files)}", flush=True)
-    return out
+    return {"paths": out, "failed": failed}
 
 
 def pick_mot17(files, seq, frames):
@@ -256,15 +267,24 @@ def main():
             if not want:
                 print(f"  {seq}: 没找到 img1，跳过")
                 continue
-            got = download(h, MOT17, want, dest, subdir=f"mot17/{seq}")
+            want_imgs = [f for f in want if f.endswith('.jpg')]
+            r = download(h, MOT17, want, dest, subdir=f"mot17/{seq}")
+            got = r["paths"]
             src = os.path.join(dest, "mot17", seq, "val", seq, "img1")
             mp4 = os.path.join(dest, "mot17", f"{seq}.mp4")
-            ok = frames_to_mp4(src, mp4)
+            failed_imgs = [f for f, _ in r["failed"] if f.endswith('.jpg')]
+            # 帧文件缺一块时不能合成 mp4：ffmpeg 按现有文件顺序编码，帧号会整体前移，
+            # 下游按帧号对齐 gt 就全错了。宁可没有 mp4，也不产出静默错位的产物。
+            ok = False if failed_imgs else frames_to_mp4(src, mp4)
+            if failed_imgs:
+                print(f"  [warn] {seq}: {len(failed_imgs)}/{len(want_imgs)} 帧下载失败，跳过 mp4（否则帧号错位）")
             manifest["datasets"].setdefault("mot17", {
                 "repo": MOT17, "license": "CC BY-NC-SA 3.0（非商用，研究/验证用）",
                 "sequences": {},
             })["sequences"][seq] = {
-                "images": len([f for f in want if f.endswith('.jpg')]),
+                "images": len(want_imgs) - len(failed_imgs),
+                "images_requested": len(want_imgs),
+                "failed": len(r["failed"]),
                 "mp4": os.path.relpath(mp4, dest) if ok else None,
                 "gt": any(f.endswith("gt.txt") for f in want),
             }
@@ -281,12 +301,16 @@ def main():
         labels = [f.replace("/images/", "/labels/").rsplit(".", 1)[0] + ".txt" for f in imgs]
         label_set = set(files)
         labels = [f for f in labels if f in label_set]
-        download(h, PPE, imgs, dest)
-        download(h, PPE, labels, dest)
+        r_imgs = download(h, PPE, imgs, dest)
+        r_labels = download(h, PPE, labels, dest)
         download(h, PPE, [f for f in files if f == "data.yaml"], dest)
         manifest["datasets"]["ppe"] = {
             "repo": PPE, "license": "Roboflow 导出，许可见数据集页（多为 CC BY 4.0）",
-            "images": len(imgs), "labels": len(labels),
+            # 记实际下到的数量：失败时清单声称「想要多少」会让后续训练/评估以为数据完整。
+            "images": len(imgs) - len(r_imgs["failed"]),
+            "images_requested": len(imgs),
+            "labels": len(labels) - len(r_labels["failed"]),
+            "failed": len(r_imgs["failed"]) + len(r_labels["failed"]),
             "splits": {"train": len(imgs_train), "test": len(imgs_test)},
             "classes": "boots/gloves/hardhat/no_boots/no_gloves/no_hardhat/no_vest/person/vest",
         }
@@ -304,11 +328,15 @@ def main():
     label_set = set(files)
     # 类别名通常只在 data.yaml 里。不下它，抽到的 labels 就是一堆 0/1，训练时只能靠猜。
     yamls = [f for f in files if f.endswith(("data.yaml", "dataset.yaml"))]
-    got = download(h, HELMET, sample + [f for f in labels if f in label_set] + yamls, dest)
+    want_helmet = sample + [f for f in labels if f in label_set] + yamls
+    rh = download(h, HELMET, want_helmet, dest)
     manifest["datasets"]["helmet"] = {
         "repo": HELMET, "license": "MIT",
-        "images": len(sample), "sampled_from": len(imgs), "step": step,
-        "labels": len([f for f in labels if f in label_set]),
+        "images": len(sample) - len([f for f, _ in rh["failed"] if f in set(sample)]),
+        "images_requested": len(sample), "sampled_from": len(imgs), "step": step,
+        "labels": len([f for f in labels if f in label_set])
+        - len([f for f, _ in rh["failed"] if f in label_set]),
+        "failed": len(rh["failed"]),
         "data_yaml": yamls[0] if yamls else None,
         "classes_known": bool(yamls),
     }
@@ -325,18 +353,31 @@ def main():
     label_set = set(files)
     labels = [f for f in labels if f in label_set]
     extra = [f for f in files if f.endswith(("data.yaml", "README.dataset.txt"))]
-    got = download(h, CONSTRUCTION, sample + labels + extra, dest)
+    rc = download(h, CONSTRUCTION, sample + labels + extra, dest)
     manifest["datasets"]["construction_ppe"] = {
         "repo": CONSTRUCTION, "license": "MIT",
-        "images": len(sample), "sampled_from": len(imgs), "step": step,
-        "labels": len(labels),
+        "images": len(sample) - len([f for f, _ in rc["failed"] if f in set(sample)]),
+        "images_requested": len(sample), "sampled_from": len(imgs), "step": step,
+        "labels": len(labels) - len([f for f, _ in rc["failed"] if f in set(labels)]),
+        "failed": len(rc["failed"]),
     }
     print(f"  从 {len(imgs)} 张里按 step={step} 抽了 {len(sample)} 张")
 
+    # 部分失败必须反映在清单与退出码里：否则 mp4 截断、manifest 声称完整、exit 0，
+    # 下游会以为数据齐全（mot17 帧号错位最隐蔽）。
+    if DOWNLOAD_FAILURES:
+        manifest["failed"] = {
+            "count": len(DOWNLOAD_FAILURES),
+            "files": [f"{repo}/{f}" for repo, f, _ in DOWNLOAD_FAILURES[:20]],
+        }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print(f"\n完成。清单：{path}")
     print("提示：这些素材只用于验证链路与后续训练，不代表本项目在真实场景的准确率。")
+    if DOWNLOAD_FAILURES:
+        print(f"[warn] {len(DOWNLOAD_FAILURES)} 个文件下载失败（清单 failed 字段已记录）。"
+              "重跑本命令或 --repair-labels 补齐后再使用这批素材。")
+        return 1
     return 0
 
 

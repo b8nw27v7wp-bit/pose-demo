@@ -87,6 +87,18 @@ console.log('\n[3] Hold');
   const hgZero = new Hold(400, 0);
   hgZero.update(true, 0);
   check('maxGap=0 不受调用间隔影响', hgZero.update(true, 4999) === true);
+
+  // maxCallGapMs：只针对「引擎根本没被调用」的断档。遮挡 900ms 期间没有 false 帧，
+  // 不检查调用间隔时未满的 Hold 会在回来时直接成立（reach→fist 凭空 +1 拿取）。
+  const hcg = new Hold(400, 0, 250);
+  hcg.update(true, 0);
+  check('真值帧断档 >maxCallGap → 重新计时', hcg.update(true, 600) === false);
+  check('断档内更新仍可累计',
+    hcg.update(true, 800) === false && hcg.update(true, 1050) === true);
+  const hcgFalse = new Hold(400, 0, 250);
+  hcgFalse.update(true, 0);
+  check('false 帧仍立即重置（callGap 不放宽 cond=false）',
+    hcgFalse.update(false, 100) === false && hcgFalse.update(true, 150) === false);
 }
 
 // —— 4. RepCounter 滞回 / 最小周期 / abort ——
@@ -1445,12 +1457,22 @@ console.log('\n[27] 腕部 ROI');
 
   // 双手靠得近时，裁右腕的框里可能只检出左手：归属判据必须能识破
   const wristPts = [
-    { side: 'L', x: 270, y: 142 },
-    { side: 'R', x: 232, y: 186 },
+    { side: 'L', x: 270, y: 142, vis: 0.9 },
+    { side: 'R', x: 232, y: 186, vis: 0.9 },
   ];
   check('检出腕点靠近左腕 → 左', nearestWristSide(263, 140, wristPts) === 'L');
   check('检出腕点靠近右腕 → 右', nearestWristSide(240, 190, wristPts) === 'R');
   check('没有腕点 → null', nearestWristSide(1, 1, []) === null);
+  // 被遮挡的腕点坐标不可信：哪怕更近也不能抢走归属（与 wristSideFor 的 0.3 口径一致）
+  const occluded = [
+    { side: 'L', x: 270, y: 142, vis: 0.1 },
+    { side: 'R', x: 232, y: 186, vis: 0.9 },
+  ];
+  check('被遮挡的最近腕点不参与归属', nearestWristSide(268, 143, occluded) === 'R');
+  check('腕点全被遮挡 → null', nearestWristSide(268, 143, [
+    { side: 'L', x: 270, y: 142, vis: 0.1 },
+    { side: 'R', x: 232, y: 186, vis: 0.2 },
+  ]) === null);
 }
 
 // —— 28. 稳健性：角度突变剔除 / 换侧滞回 / 换侧中止计数 / 不可靠原因 ——
@@ -1845,6 +1867,41 @@ console.log('\n[32] 多边形 ROI 与人框有效性');
   }).update(opPerson(standKp, { bbox: [50, 150, 60, 160] }), 1000);
   check('validity 默认关闭 → 旧行为（小框也 true）',
     offBox.arm.near_equipment === true && offBox.arm.near_equipment_validity === null);
+}
+
+// —— 33. 头部朝向的时序接入（平滑 / 坏点门）——
+console.log('\n[33] 头部朝向时序');
+{
+  // 9 点头：受试者左眼在原始图右侧（x 更大）；眼距 20px，鼻-眼 drop≈0.45。
+  const headKp = (noseX) => [
+    [noseX, 89, 1],
+    [110, 80, 1], [110, 80, 1], [110, 80, 1],
+    [90, 80, 1], [90, 80, 1], [90, 80, 1],
+    [130, 85, 1], [70, 85, 1],
+  ];
+  const withHead = (noseX) => ({ ...person(standKp), kp_head: headKp(noseX) });
+  const se = new SignalEngine();
+  const a = se.update(withHead(95), 1000);
+  check('头部信号接入信号层', a.head.visible && near(a.head.face_px, 20, 0.01),
+    `face_px=${a.head.face_px}`);
+  check('2D yaw 向右为正', a.head.yaw > 20 && a.head.yaw_source === '2d',
+    `yaw=${a.head.yaw}`);
+  check('yaw 标近似、幅度可信', a.head.yaw_approx === true && a.head.reliable.yaw === true);
+  // 33ms 内从 +30° 跳到 -30° = 1818°/s > 1500：单帧坏点，不给滤波器、不沿用旧值。
+  const b = se.update(withHead(105), 1033);
+  check('单帧 60° 跳变被剔除', b.head.yaw === null, `yaw=${b.head.yaw}`);
+  check('原因含 angle_outlier', b.head.reasons.includes('angle_outlier'),
+    b.head.reasons.join(','));
+  check('坏点帧 reliable.yaw=false', b.head.reliable.yaw === false);
+  // 头部坏点只进 head.reasons，不进动作层清单：否则动作层会把整帧标成 unreliable，
+  // 而姿态/手臂角度这一帧完全正常，也没有动作依赖头部角度。
+  check('头部坏点不进动作层 angle_outliers', !b.angle_outliers.includes('head:yaw'),
+    b.angle_outliers.join(','));
+  // 新值持续超过 maxDtMs(250ms) 后接受；One Euro 几帧内收敛到左侧。
+  let c = null;
+  for (let i = 0; i < 10; i++) c = se.update(withHead(105), 1400 + i * 40);
+  check('新值持续 >250ms 后接受', Number.isFinite(c.head.yaw), `yaw=${c.head.yaw}`);
+  check('接受后方向翻到左', c.head.dir === 'left', c.head.dir);
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

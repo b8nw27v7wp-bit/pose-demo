@@ -7,6 +7,12 @@ PLAN §12.3 的 A（评估集）与 B（阈值拟合）落地在这份文档 + `
 
 采集协议（机位/光照/人数/反例）见 `docs/data-collection.md`，这里只列命令。
 
+> 下面的 `--dir eval-data` 是通用写法。本仓库的真实标注在 `eval-data/incoming`、
+> `refuel/eval`、`negative/eval` 等子目录；默认请用 `npm run eval` / `npm run accuracy`
+> （已带 `--recursive` 和 `pilot-panel`）。直接 `--dir eval-data` 只会扫到顶层的合成样例。
+> 也不要把 `--recursive` 指向 `eval-data` 根目录：`incoming/neg-eq` 与 `negative/eval`
+> 是同一批负例的不同 fps 导出，会重复计数（评估器会按重复 clip 名告警）。
+
 ```bash
 # 1. 录素材（这一步只能人来做：摄像头前做动作，录屏或用 Demo 上传视频）
 #    Demo 里点「导出」得到 .jsonl（一行一帧），放到 eval-data/a.jsonl
@@ -39,8 +45,25 @@ node web/test/evaluate.mjs --dir eval-data --min-recall 0.9 --min-precision 0.85
 node web/test/evaluate.mjs --input eval-data/a.jsonl --labels eval-data/a.labels.json --json
 ```
 
-`--dir` 同时认 `.json`（旧版 `{frames}` 容器）和 `.jsonl`（当前导出格式）；
+`--dir` 同时认 `.json`（旧版 `{frames}` 容器）和 `.jsonl`（当前导出格式，含 Windows 编辑器
+另存的「UTF-8 with BOM」）；
 `*.labels.json` 与 `*.labels.draft.json` 不会被当成帧文件。
+
+`--dir` 可以重复；`--recursive` 会递归子目录，但**只返回有同名 `.labels.json` 的配对**，
+不会把 `eval-data` 下的视频/训练图当成样本。同一目录里 `a.jsonl` 与 `a.frames.json`
+是同一段素材的两种导出，只配对一次（优先当前 JSONL）；Windows 上 labels/帧按大小写
+不敏感配对，同一份 labels 不会因多个帧别名被重复计数。当前试点口径直接跑：
+
+```bash
+npm run eval
+# 等价：node web/test/evaluate.mjs --dir eval-data/incoming --recursive \
+#   --profile web/profiles/pilot-panel.json
+```
+
+> **2026-11-20 当前口径**：`pilot-panel`（固定机位/单人/panel-only）在 583 帧、9 段
+> （1 段 58s 正例演示 + 8 段硬负例）上：operating 3TP/3FN/3FP（R .5 / P .5），
+> near_equipment 4/2/3（R .667 / P .571）。n<20，页面只显示「样本不足」；
+> 这组数字只说明“规则在这批素材上可用”，不是泛化准确率。
 
 想先确认工具本身是好的，用合成样例（**不是实拍，不能用来定阈值**）：
 
@@ -48,6 +71,22 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --labels eval-data/a.labels
 node web/test/make-sample.mjs
 node web/test/evaluate.mjs --dir eval-data
 ```
+
+## 试点验收口径（2026-11-20）
+
+对外演示/试点默认用 `web/profiles/pilot-panel.json`，验收只覆盖能拿证据的部分：
+
+- **在范围内**：固定机位、单人、panel 设备 ROI 明确的 `operating` / `drain_sample` /
+  `near_equipment`；姿态与上半身只作上下文。
+- **不在范围内**：多人、8 类手势精度、PPE 准确率、头部角度精度、`oil_sample`、
+  valve/gauge 作为主判据、跨机位/换人泛化。引擎仍会算这些信号，但不得写进验收。
+- **验收数字**：每个方向 n≥20 才报百分比；同时报 Wilson 95%CI、事件时延/抖动、误报/小时。
+  当前 `web/accuracy.json` 只有 operating/near 两项有数据，n=6/6、7，**样本不足**。
+- **跨机位**：labels 写 `camera`（clip 级或段级），报告按机位分组并给跨组退化；
+  PPE 用 `ppe-eval.mjs` 的 `target×camera` 分组。换机位必须重画 ROI、重标、重跑。
+- **A/B 与帧率**：一律用 `scripts/deterministic-replay.mjs` 固定 fps 导出后再比；
+  同一段素材 10fps/5fps 的 operating 数字可能差一截（旧 563 帧导出 TP5/FN1/FP3，
+  当前 290 帧 5fps 导出 TP3/FN3/FP3），不能混用。
 
 ## 报告包含什么
 
@@ -74,7 +113,8 @@ Demo 的「动作与手势 → 准确率」读的是 `web/accuracy.json`，由�
 
 ```bash
 npm run accuracy
-# 等价：node web/test/accuracy-report.mjs --dir eval-data --out web/accuracy.json --min-samples 20
+# 等价：node web/test/accuracy-report.mjs --dir eval-data/incoming --recursive \
+#   --profile web/profiles/pilot-panel.json --out web/accuracy.json --min-samples 20
 ```
 
 - 动作 id 用 `js/actions.js` 注册表映射（评估器 summary 里的 `armRaised` → 页面 `arm_raised`），
@@ -82,9 +122,52 @@ npm run accuracy
 - `recall` / `precision` / `nRecall` / `nPrecision` / 95%CI 原样带过去；**每个方向 n < min-samples
   不报百分比**，页面显示「样本不足(n=…)」；没有数据的动作显示「未评估」。
 - 合成样例（clip 名/备注含「合成」或 `make-sample`）会标 `source.synthetic=true`，
-  页面写「合成样例自检，不代表实拍准确率」。
+  页面写「合成样例自检，不代表实拍准确率」；实拍与合成混跑时 `source.realClips` /
+  `syntheticClips` 分开列，不会把整份报告标成合成。
+- `paramsHash` 来自评估器使用的 profile。页面选同一个 profile 时指纹一致；换 profile 或改阈值后
+  不重跑，页面会提示「报告参数与当前不一致」。
+- `--dir` 可重复、可加 `--recursive`。默认不用 `--dir eval-data` 一把抓：那样只会扫到顶层的
+  合成样例，真实标注在 `incoming/neg-eq`、`refuel/eval` 等子目录里。
+- 当前 `eval-data/incoming/eq-check-2026-11-16.labels.json` 是 58s 演示片 labels 的副本
+  （同一段视频，时间基一致）；换机器时从 `eval-data/refuel/refuel-operating.labels.json`
+  复制同名即可。新机位/新素材必须重新标，不要复制。
 - `web/accuracy.json` 是生成物，已 gitignore；素材或阈值变了要重跑。
 - 页面不自己估准确率，也不把逻辑单测通过率当成准确率。
+
+## 头部角度分档评估（headpose-eval）
+
+头部朝向不是动作 TP/FN，口径是「这一段 yaw/pitch/roll 分档对不对、没把握时有没有弃权、
+有真值时角度 MAE 多大」。工具直接读 Demo 导出的 `signals.head`，不重新跑模型；
+改了 `headpose.js` 后先重新导出再评。
+
+```bash
+node web/test/headpose-eval.mjs \
+  --input eval-data/a.jsonl --labels a.headlabels.json \
+  --report eval-data/head.md --json
+```
+
+labels 段格式（和主 labels 共用文件，`action:"head"`）：
+
+```json
+{
+  "name": "a", "camera": "front", "subject": "P1",
+  "segments": [
+    { "action": "head", "startSec": 1.0, "endSec": 3.0,
+      "yaw": "left", "pitch": "down", "roll": "level",
+      "yawDeg": -30, "pitchDeg": 12, "rollDeg": 3 }
+  ]
+}
+```
+
+- `yaw`: `left|right|front|any`；`pitch`: `up|down|front|any`；`roll`: `left|right|level|any`。
+  `left/right` 按受试者自身；`roll` 的 `level` 容差由 `--roll-tol`（默认 ±10°）决定。
+- `yawDeg/pitchDeg/rollDeg` 可选；给了才报 MAE/P90，没给只报分档与弃权。
+- 报告同时给 **recall（弃权算错）** 和 **accuracy（有输出时）**，以及每个轴的弃权率。
+  没有 `signals.head` 的帧会明确警告（旧导出/head 未接入），不会当成 0 分。
+- 自测：`node web/test/headpose-eval.mjs --self-test`（14 项，已进 `npm test`）。
+- 弃权按**角度**判：`head.yaw`/`pitch`/`roll` 为 `null` 的帧算弃权，即使 `yaw_dir`/`pitch_dir`
+  仍在去抖保持窗内（`dirHoldMs` 默认 200ms）——不许把上一次的方向当成这一帧的输出。
+  **目前没有任何实拍头部角度真值**；这个工具是让后续采集能直接产出数字，不是已有精度。
 
 ## 自动生成标注草稿
 
@@ -269,7 +352,9 @@ node web/test/manifest-check.mjs --manifest eval-data/manifest.json
 node web/test/manifest-check.mjs --init --dir eval-data   # 扫帧文件生成待填骨架
 ```
 
-字段与完成标准见 `docs/data-collection.md` §一/§八。退出码 0/2/1，可直接进 CI。
+字段与完成标准见 `docs/data-collection.md` §一/§八。退出码可直接进 CI：
+**1 = 文件有错**（清单校验失败，或 labels 读不出/JSON 语法错误——截断的文件不会按 0 样本
+静默统计），**2 = 覆盖度未达标**（清单没错，只是样本量/人物/机位不够），0 = 达标。
 
 ## 指标口径
 
@@ -461,6 +546,9 @@ node web/test/evaluate.mjs --dir eval-data --baseline base.json --max-drop 0.05
 - **多人素材按 (track, action) 比对**：baseline、灵敏度扫描、A/B 对比与 LOSO 的每一行都
   带 `track`，同名动作的不同 track 不会互相覆盖；只按动作建键会让后一条 track 盖掉前一条，
   回归检测会假绿（旧报告没有 `track` 字段时仍按动作比对）。
+- 精确键 `(action, track)` 查不到时，若该动作在 baseline 里**只有一行**就回退到它（兼容旧单人
+  报告）；多 track 的基线不做回退，避免把某一条随机对到当前行上。当前报告与 baseline
+  **一条都没匹配上**时，报告列为「baseline 未匹配」并判未达标——不能让格式变化静默全绿。
 - **跨模型基线**：数据的 `meta.objects.modelHash` 与 baseline 报告里的不同时，默认拒绝比较并报错；
   确认要比较（例如只改了阈值）才加 `--allow-model-change`。旧报告没有 `objects` 段时不做判断。
 - 报告头会打印 `物体模型：backend/model @inputSize sha256:… labels:…`；同一批素材混用两套物体模型
