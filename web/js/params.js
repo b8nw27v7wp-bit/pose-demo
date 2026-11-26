@@ -52,6 +52,21 @@ export const DEFAULT_PARAMS = {
     // 被模型当成人（refuel 样例实测：手+油枪特写 bbox 220×147、scale 100，被凑成躯干）。
     // minAspect = 高/宽 的下限；bbox 缺失时不设门。
     upperBody: { minAspect: 0.9 },
+    // 人体朝向（正面/背面/侧对）：肩线方向 + 肩宽/躯干长。背对相机时 MediaPipe 仍可能
+    // 给高可见度的鼻/眼点，但头部几何不可信；朝向只信躯干。yaw 符号：0=正对镜头，
+    // ±180=背对，正=面向画面右。见 docs/signals.md §三·八·七 与 js/bodyfacing.js。
+    // 用途：把相机方位角换算成受试者自身方位（油样取样「手在身体前方」、背身的前伸/指向）。
+    bodyFacing: {
+      enabled: true,
+      visMin: 0.3,        // 0~1，肩点可见性下限
+      frontMax: 45,       // |yaw| ≤ 此值 → 正面（度）
+      backMin: 135,       // |yaw| ≥ 此值 → 背面（度）；两者之间为侧对
+      sideRatio: 0.3,     // 2D 肩宽/躯干长 < 此值 → 侧对（实测侧面 P90≈0.27、正面 P50≈0.51）
+      sideNoseRatio: 0.08,// 侧对时 |鼻 x - 肩中线 x|/躯干长 超过此值才定「面向画面左/右」
+      // 低于此置信度只报告朝向、不参与方位角换算（宁可退回相机口径，也别用坏肩线转角度）
+      minConfidence: 0.35,
+      holdMs: 200,        // 朝向状态去抖：稳定这么久才切换（只影响 UI/导出）
+    },
     // 头部朝向（yaw/pitch/roll）：不依赖躯干/髋，只有头部 9 点也能判。
     // 用于设备特写、头~胸构图、只有半个头出镜的场景。
     // 符号按受试者自身：yaw 正=向右，pitch 正=低头，roll 正=左侧更低（与画面镜像无关）。
@@ -257,7 +272,10 @@ export const DEFAULT_PARAMS = {
       releaseMs: 200,         // 张手后多久确认「放下」
     },
     gesture: {
-      streak: 3,        // 手势要连续命中几帧才切换（治「张开→剪刀手」来回闪）
+      // 手势要累计命中几次才切换（治「张开→剪刀手」来回闪）。
+      // 判不出来（unknown）的帧在 keepMs 内跳过、不清零——遮挡一两帧不该把稳定手型打回「—」；
+      // 换成另一个手势才清零，所以交替手势仍然切不过去。
+      streak: 3,
       // 稳定状态保持多久由 HandShapeStabilizer 的 keepMs（默认 250ms）决定；
       // 之前这里加过一个 edgeKeepMs，但没有任何代码读它，已删除。
     },
@@ -417,7 +435,20 @@ export const DEFAULT_PARAMS = {
 
   actions: {
     posture: {
-      // 只保留站/坐：躺卧与下蹲需要膝、踝同时可见，桌面机位/上半身构图判不了。
+      // 蹲下：膝明显弯曲、**髋明显下沉**（踝-髋竖直距离 / 躯干长 < 0.8）、躯干不接近水平。
+      // 背身时 2D 膝角会被透视压扁，信号层默认优先用 world 3D 膝角（见 docs/signals.md §三·八·八）。
+      // 「坐 vs 蹲」用 legVerticalLt（<0.8）区分：坐在椅子上踝-髋竖直距离≈小腿长
+      // （比值约 0.9~1.0），深蹲/半蹲时髋明显下沉（0~0.7）。低凳坐着髋同样很低，
+      // 几何上无法与蹲分开——这是已知歧义。
+      // hipKneeDropGt：髋比膝高出太多（单膝跪地/弓步）不算蹲；用 3D 优先、2D 退回。
+      crouch: {
+        minMs: 350, streak: 4,
+        kneeGt: 20, kneeLt: 135,
+        uprightnessGt: 0.2,
+        legVerticalLt: 0.8,
+        hipKneeDropGt: -0.8,
+      },
+      // 站/坐需要膝、踝同时可见；桌面机位/上半身构图判不了时保持 null。
       sit: { minMs: 450, streak: 5, kneeGt: 55, kneeLt: 135, uprightnessGt: 0.5, legVerticalLt: 1.05 },
       stand: { minMs: 350, streak: 4, uprightnessGt: 0.8, kneeGt: 150, legVerticalGt: 0.8 },
       // 上半身构图（肩+髋可见、膝/踝不可见）：只判躯干朝向，不冒充站/坐。
@@ -642,6 +673,104 @@ function validateHeadParams(head = null) {
 }
 
 /**
+ * 人体朝向（`signals.bodyFacing`）的值域校验。
+ *
+ * 与 head/drain 同一口径：写错的阈值不会报错，只会让朝向静默恒为某一档或逐帧翻转。
+ *   · `frontMax >= backMin`：正面/背面的区间重叠或颠倒，侧对永远判不出来；
+ *   · `sideRatio <= 0`：2D 肩宽比永远不小于它，侧对彻底失效；
+ *   · `sideNoseRatio` 越界：侧对方向要么恒判、要么永不判。
+ *
+ * `enabled:false` 时不校验：关掉就是不要这个信号。
+ *
+ * @param {object} cfg 已合并默认值的 signals.bodyFacing
+ * @throws {Error} 任一值非法时
+ */
+function validateBodyFacingParams(cfg = null) {
+  if (!isPlain(cfg)) {
+    throw new Error(
+      `参数组合非法：signals.bodyFacing=${JSON.stringify(cfg)} 必须是对象。`,
+    );
+  }
+  if (cfg.enabled === false) return;
+  const num = (key, lo, hi) => {
+    const v = cfg[key];
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < lo || v > hi) {
+      throw new Error(
+        `参数组合非法：signals.bodyFacing.${key}=${JSON.stringify(v)} 必须在 ${lo}~${hi} 之间。`,
+      );
+    }
+    return v;
+  };
+  num('visMin', 0, 1);
+  const frontMax = num('frontMax', 0, 90);
+  const backMin = num('backMin', 90, 180);
+  if (!(frontMax < backMin)) {
+    throw new Error(
+      `参数组合非法：signals.bodyFacing.frontMax=${frontMax} 必须小于 backMin=${backMin}，`
+      + ' 否则正面/背面的区间重叠，侧对永远判不出来。',
+    );
+  }
+  num('sideRatio', 1e-6, 2);
+  num('sideNoseRatio', 0, 1);
+  num('minConfidence', 0, 1);
+  if (cfg.holdMs < 0 || !Number.isFinite(cfg.holdMs)) {
+    throw new Error(
+      `参数组合非法：signals.bodyFacing.holdMs=${JSON.stringify(cfg.holdMs)} 必须 >= 0（0 = 关闭去抖）。`,
+    );
+  }
+}
+
+/**
+ * 蹲下姿态（`actions.posture.crouch`）的值域校验。
+ *
+ * 这些阈值写错不会报错，只会让蹲下静默恒为 false（或恒为 true）：
+ *   · `kneeGt >= kneeLt`：膝角区间为空；
+ *   · `legVerticalLt` 过大：站立/坐姿都过不了，蹲下永远不成立；
+ *   · `hipKneeDropGt` 写反：跪姿/弓步反而被放行。
+ * 站/坐的阈值仍是历史口径，暂不在这里扩展校验。
+ *
+ * @param {object} crouch 已合并默认值的 actions.posture.crouch
+ * @throws {Error} 任一值非法时
+ */
+function validateCrouchParams(crouch = null) {
+  if (!isPlain(crouch)) {
+    throw new Error(
+      `参数组合非法：actions.posture.crouch=${JSON.stringify(crouch)} 必须是对象。`,
+    );
+  }
+  const num = (key, lo, hi) => {
+    const v = crouch[key];
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < lo || v > hi) {
+      throw new Error(
+        `参数组合非法：actions.posture.crouch.${key}=${JSON.stringify(v)} 必须在 ${lo}~${hi} 之间。`,
+      );
+    }
+    return v;
+  };
+  const kneeGt = num('kneeGt', 0, 180);
+  const kneeLt = num('kneeLt', 0, 180);
+  if (!(kneeGt < kneeLt)) {
+    throw new Error(
+      `参数组合非法：actions.posture.crouch.kneeGt=${kneeGt} 必须小于 kneeLt=${kneeLt}，`
+      + ' 否则蹲下的膝角区间为空。',
+    );
+  }
+  num('uprightnessGt', -1, 1);
+  num('legVerticalLt', 0, 3);
+  num('hipKneeDropGt', -3, 3);
+  if (!(crouch.minMs >= 0) || !Number.isFinite(crouch.minMs)) {
+    throw new Error(
+      `参数组合非法：actions.posture.crouch.minMs=${JSON.stringify(crouch.minMs)} 必须 >= 0。`,
+    );
+  }
+  if (!Number.isInteger(crouch.streak) || crouch.streak < 1) {
+    throw new Error(
+      `参数组合非法：actions.posture.crouch.streak=${JSON.stringify(crouch.streak)} 必须是 >=1 的整数。`,
+    );
+  }
+}
+
+/**
  * `signals.arm.operating` / `nearEquipment` 的结构校验。
  *
  * deepMerge 遇到 null / 数组 / 字符串会**整段替换**默认对象：
@@ -683,7 +812,11 @@ function validateArmStructure(arm = null) {
  *      这些值写错时动作会静默失效，排查只能逐帧看信号，所以在加载/评估器读取时就拦住。
  *   2. 头部朝向（`signals.head`）：鼻-眼几何区间、2D/3D 的 enter/exit 滞回对、尺度门
  *      （`minPairPx`/`goodPairPx`）与其余值域；写错的后果同上（三轴恒 null 或方向抖动）。
- *   3. 设备框的时序确认要求框的有效期覆盖检测间隔：
+ *   3. 人体朝向（`signals.bodyFacing`）：正面/背面区间不能重叠，肩宽比/鼻偏移/去抖值域；
+ *      写错时朝向静默恒一档或逐帧翻转。
+ *   4. 蹲下姿态（`actions.posture.crouch`）：膝角区间不能为空，腿竖直比/髋-膝差/保持窗
+ *      值域；写错时蹲下静默恒 false 或把跪姿放进来。
+ *   5. 设备框的时序确认要求框的有效期覆盖检测间隔：
  *   `equipmentLabels` 非空 且（`boxMinHits > 1` 或 fail-closed `equipmentFallbackRoi=false`）时，
  *   `boxMaxAgeMs >= objects.intervalMs + 300`。
  * 违反时，两次检测之间的普通帧会先把轨迹过期：`boxMinHits > 1` 时下一次检测又从 hits=1 开始，
@@ -702,6 +835,8 @@ export function validateParams(overrides = {}) {
   const resolved = resolveParams(overrides);
   validateDrainParams(resolved.signals?.arm?.drain);
   validateHeadParams(resolved.signals?.head);
+  validateBodyFacingParams(resolved.signals?.bodyFacing);
+  validateCrouchParams(resolved.actions?.posture?.crouch);
   validateArmStructure(resolved.signals?.arm);
   const op = resolved.signals?.arm?.operating || {};
   const labels = Array.isArray(op.equipmentLabels) ? op.equipmentLabels : [];

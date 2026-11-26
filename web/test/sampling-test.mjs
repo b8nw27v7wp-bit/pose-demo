@@ -112,13 +112,15 @@ console.log('\n[6] 3D 方位角门：手在身前才算，侧后方不算');
 {
   // 2D 骨架固定在「腕贴鼻尖」，只换 world 里腕的位置——这样距离判据恒过，
   // 单独检验「手在身体前方」这道门（这是 oil_sample 与 hand_head 的唯一区别）。
+  // world 取正面朝向：受试者左肩在 +x（画面右）。方位角门现在是**受试者自身**的
+  // 「前」（见 signals.js 的人体朝向换算），所以夹具必须和朝向自洽。
   const mkWorld = (wristL) => {
     const w = new Array(33).fill(null).map(() => [0, 0, 0]);
     w[23] = [-0.1, 0, 0]; w[24] = [0.1, 0, 0];
-    w[11] = [-0.16, -0.48, 0]; w[12] = [0.16, -0.48, 0];
-    w[0] = [0, -0.62, 0];
-    w[13] = [-0.2, -0.3, 0]; w[15] = wristL;
-    w[14] = [0.2, -0.3, 0]; w[16] = [0.2, 0.3, 0];
+    w[11] = [0.16, -0.48, 0]; w[12] = [-0.16, -0.48, 0];
+    w[0] = [0, -0.62, -0.1];
+    w[13] = [0.2, -0.3, 0]; w[15] = wristL;
+    w[14] = [-0.2, -0.3, 0]; w[16] = [-0.2, 0.3, 0];
     return w;
   };
   const withWorld = (world) => ({ ...mkPerson(AT_EYE), kp_world: world });
@@ -128,11 +130,11 @@ console.log('\n[6] 3D 方位角门：手在身前才算，侧后方不算');
     for (let ts = 1000; ts <= 2200; ts += 100) out = feed(withWorld(world), ts);
     return out;
   };
-  // 腕在肩前方（z 负）偏内侧：方位角 ≈ +48°
-  const front = run(mkWorld([-0.05, -0.6, -0.1]));
+  // 腕在肩前方（z 负，朝镜头）偏内侧：自身方位角 ≈ 48°
+  const front = run(mkWorld([0.05, -0.6, -0.1]));
   check('手在身前 → 成立', front.flags.oilSample === true, `azim≈48°`);
-  // 腕在肩侧后方：方位角 ≈ 146°，距离判据仍然通过
-  const side = run(mkWorld([-0.12, -0.6, 0.06]));
+  // 腕在肩侧后方：自身方位角 ≈ 146°，距离判据仍然通过
+  const side = run(mkWorld([0.12, -0.6, 0.06]));
   check('手在侧后方 → 不成立（方位角门）', side.flags.oilSample === false);
 }
 

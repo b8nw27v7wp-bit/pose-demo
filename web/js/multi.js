@@ -58,7 +58,8 @@ function handOwnedByPerson(hd, p) {
  *
  * 手势去抖（HandShapeStabilizer）是有记忆的 streak 计数。全局只有一套实例时，
  * A 连续握拳会推着 B 的握拳候选计数走——两人做不同手势时，B 的稳定结果会被 A 带偏
- * （PLAN §16.3 R12-2）。单人道固定用 track 0，行为与旧版逐位一致。
+ * （PLAN §16.3 R12-2）。单人道固定用 track 0，**路由**与全局一套稳定器逐位等价
+ * （稳定器自身的判定口径见 docs/signals.md）。
  */
 export class TrackShapeStabilizers {
   constructor(cfg = {}) {

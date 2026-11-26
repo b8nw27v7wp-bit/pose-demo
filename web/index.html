@@ -13,17 +13,19 @@
     --ink: #1b1e19;
     --sub: #565c52;
     --mute: #63695f;
-    --line: #d9dcd4;
-    --line-strong: #b7bcb2;
+    --line: #d8dcd3;
+    --line-strong: #b3b9ad;
     --ok: #2f8f5b;
     --warn: #a8741a;
     --bad: #b23b2e;
     --ok-wash: rgba(47, 143, 91, .10);
     --ok-edge: rgba(47, 143, 91, .34);
     --stage: #0f110e;
-    --radius: 12px;
-    --font-ui: "Microsoft YaHei UI", "PingFang SC", "Segoe UI", system-ui, sans-serif;
-    --font-num: "Bahnschrift", "DIN Alternate", "Avenir Next Condensed", "Segoe UI", sans-serif;
+    --radius: 16px;
+    /* 思源黑体做工学界面；站名用宋体做唯一的编辑性文字（Windows 的宋体有合成粗体，Mac 走 Songti SC） */
+    --font-ui: "Noto Sans SC", "思源黑体", "Microsoft YaHei UI", "PingFang SC", "Segoe UI", system-ui, sans-serif;
+    --font-serif: "SimSun", "Songti SC", "STSong", "Noto Serif SC", serif;
+    --font-num: "Noto Sans SC", "Segoe UI", sans-serif;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
@@ -32,8 +34,8 @@
     background: var(--bg);
     color: var(--ink);
     font-family: var(--font-ui);
-    font-size: 14px;
-    line-height: 1.55;
+    font-size: 15px;
+    line-height: 1.6;
     -webkit-font-smoothing: antialiased;
     display: flex; flex-direction: column;
     min-height: 100%;
@@ -43,19 +45,20 @@
 
   /* ---------- 顶栏 ---------- */
   .topbar {
-    height: 44px; padding: 0 20px;
+    height: 56px; padding: 0 22px;
     display: flex; align-items: center; justify-content: space-between; gap: 16px;
     background: var(--bg);
     border-bottom: 1px solid var(--line);
     position: sticky; top: 0; z-index: 20;
   }
-  .brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
-  .mark { width: 20px; height: 20px; flex: 0 0 auto; color: var(--ink); }
-  .mark .joint { fill: var(--ok); }
-  .brand h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em; white-space: nowrap; }
-  .brand .slug { font-family: var(--font-num); font-size: 12px; color: var(--mute); letter-spacing: .02em; }
-  .metrics { display: flex; align-items: center; gap: 18px; font-size: 12.5px; color: var(--sub); font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .metrics .num { font-family: var(--font-num); font-size: 13px; font-weight: 500; color: var(--ink); }
+  .brand { display: flex; align-items: center; min-width: 0; }
+  /* 站名用宋体：全站唯一的编辑性字体，不做二次装饰 */
+  .brand h1 {
+    margin: 0; font-family: var(--font-serif); font-size: 22px; font-weight: 700;
+    letter-spacing: .01em; white-space: nowrap;
+  }
+  .metrics { display: flex; align-items: center; gap: 22px; font-size: 13.5px; color: var(--sub); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .metrics .num { font-family: var(--font-num); font-size: 14.5px; font-weight: 600; color: var(--ink); }
   .status { display: inline-flex; align-items: center; gap: 7px; max-width: 52vw; overflow: hidden; text-overflow: ellipsis; }
   .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); flex: 0 0 auto; }
   .status.ok::before { background: var(--ok); }
@@ -64,65 +67,65 @@
 
   /* ---------- 控制条 ---------- */
   .controls {
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 8px 20px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 22px;
     border-bottom: 1px solid var(--line);
   }
-  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--surface); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--surface); }
   .seg button {
-    height: 30px; padding: 0 13px; border: 0; background: transparent;
-    color: var(--sub); font-size: 13px; cursor: pointer;
+    height: 36px; padding: 0 15px; border: 0; background: transparent;
+    color: var(--sub); font-size: 14px; cursor: pointer;
     transition: color .15s, background-color .15s;
   }
   .seg button:hover { color: var(--ink); }
   .seg button.on { background: var(--ink); color: #f7f8f4; }
   .btn {
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-    height: 30px; padding: 0 12px;
-    border: 1px solid var(--line); border-radius: 7px;
+    height: 36px; padding: 0 14px;
+    border: 1px solid var(--line); border-radius: 8px;
     background: var(--surface); color: var(--ink);
-    font-size: 13px; white-space: nowrap; cursor: pointer;
+    font-size: 14px; white-space: nowrap; cursor: pointer;
     transition: border-color .15s, background-color .15s, color .15s;
   }
   .btn:hover:not(:disabled) { border-color: var(--line-strong); }
   .btn.solid { background: var(--ink); border-color: var(--ink); color: #f7f8f4; }
   .btn.solid:hover:not(:disabled) { background: #000; }
   .btn:disabled { color: var(--mute); background: transparent; border-color: var(--line); cursor: default; }
-  .settings { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .settings { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   select {
     appearance: none; -webkit-appearance: none;
-    height: 30px; padding: 0 26px 0 10px;
-    border: 1px solid var(--line); border-radius: 7px;
+    height: 36px; padding: 0 30px 0 12px;
+    border: 1px solid var(--line); border-radius: 8px;
     background-color: var(--surface);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='9' height='6'%3E%3Cpath d='M1 1.2 4.5 4.7 8 1.2' fill='none' stroke='%23565c52' stroke-width='1.3' stroke-linecap='round'/%3E%3C/svg%3E");
-    background-repeat: no-repeat; background-position: right 9px center;
-    font-size: 13px; color: var(--ink); cursor: pointer;
+    background-repeat: no-repeat; background-position: right 11px center;
+    font-size: 14px; color: var(--ink); cursor: pointer;
     transition: border-color .15s;
   }
   select:hover { border-color: var(--line-strong); }
   /* profile 名已经在下拉里，标签只在「模型档位与 profile 声明不一致」时出现 */
-  .badge-profile { display: none; font-size: 11.5px; color: var(--mute); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .badge-profile { display: none; font-size: 12px; color: var(--mute); white-space: nowrap; font-variant-numeric: tabular-nums; }
   .badge-profile.warn { display: inline; color: var(--warn); }
   .spacer { flex: 1; }
-  .toggles { display: flex; align-items: center; gap: 15px; }
-  .toggles label { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--sub); cursor: pointer; user-select: none; }
+  .toggles { display: flex; align-items: center; gap: 18px; }
+  .toggles label { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--sub); cursor: pointer; user-select: none; }
   /* 开关：不用伪元素（input 上的 ::after 不可靠），用圆点背景做滑块 */
   .sw {
     appearance: none; -webkit-appearance: none;
-    width: 26px; height: 15px; margin: 0; border: 0; border-radius: 99px;
+    width: 30px; height: 17px; margin: 0; border: 0; border-radius: 99px;
     background-color: #cbd0c6;
-    background-image: radial-gradient(circle, #fff 0 5px, transparent 5.2px);
-    background-repeat: no-repeat; background-size: 11px 11px; background-position: 2px 2px;
+    background-image: radial-gradient(circle, #fff 0 6px, transparent 6.2px);
+    background-repeat: no-repeat; background-size: 13px 13px; background-position: 2px 2px;
     cursor: pointer; transition: background-color .15s, background-position .15s;
   }
   /* 选中的开关用中性石墨色：它只是设置项，不该和主按钮抢注意力 */
-  .sw:checked { background-color: var(--sub); background-position: 13px 2px; }
+  .sw:checked { background-color: var(--sub); background-position: 15px 2px; }
 
   /* ---------- 主体 ---------- */
   /* 顶栏/控制条固定高，主体吃掉剩余视口；不写死 calc，工具条换行时也不会溢出 */
   main {
-    display: grid; grid-template-columns: minmax(0, 1fr) 380px;
-    gap: 20px; padding: 18px 20px 20px;
+    display: grid; grid-template-columns: minmax(0, 1fr) 428px;
+    gap: 22px; padding: 20px 22px 24px;
     flex: 1 1 auto; min-height: 0;
     align-items: stretch;
   }
@@ -135,8 +138,8 @@
   }
   /* 取景框：一圈内缩的发丝线，不做装饰性角标 */
   .stage::before {
-    content: ""; position: absolute; inset: 12px; z-index: 1;
-    border: 1px solid rgba(255, 255, 255, .09); border-radius: 7px;
+    content: ""; position: absolute; inset: 14px; z-index: 1;
+    border: 1px solid rgba(255, 255, 255, .09); border-radius: 10px;
     pointer-events: none;
   }
   .stage video, .stage canvas, .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
@@ -145,8 +148,8 @@
 
   .badges { position: absolute; inset: 20px 20px auto 20px; z-index: 2; display: flex; justify-content: space-between; pointer-events: none; }
   .badge {
-    font-family: var(--font-num); font-size: 11px; letter-spacing: .02em;
-    padding: 2px 7px; border-radius: 5px;
+    font-family: var(--font-num); font-size: 12px; letter-spacing: .02em;
+    padding: 3px 8px; border-radius: 6px;
     background: rgba(15, 17, 14, .58); color: #e7e9e2;
     backdrop-filter: blur(4px); font-variant-numeric: tabular-nums;
   }
@@ -162,31 +165,31 @@
     background-size: 13px 1px, 1px 13px;
     background-position: center; background-repeat: no-repeat;
   }
-  .placeholder p { margin: 0; font-size: 14px; }
-  .placeholder .hint { margin-top: 6px; font-size: 12px; color: #767c72; }
+  .placeholder p { margin: 0; font-size: 15px; }
+  .placeholder .hint { margin-top: 7px; font-size: 13px; color: #767c72; }
 
   /* ---------- 播放条 ---------- */
   .player {
-    position: absolute; left: 20px; right: 20px; bottom: 18px; z-index: 3;
-    display: flex; align-items: center; gap: 9px;
-    padding: 6px 9px; border-radius: 9px;
+    position: absolute; left: 22px; right: 22px; bottom: 20px; z-index: 3;
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 10px; border-radius: 10px;
     background: rgba(15, 17, 14, .74);
     border: 1px solid rgba(255, 255, 255, .08);
     backdrop-filter: blur(10px);
-    color: #e7e9e2; font-size: 12.5px;
+    color: #e7e9e2; font-size: 13.5px;
   }
   .pbtn {
-    flex: 0 0 auto; width: 26px; height: 26px; padding: 0;
-    border: 0; border-radius: 6px; background: rgba(255, 255, 255, .12);
-    color: #fff; font-size: 11px; line-height: 1; cursor: pointer;
+    flex: 0 0 auto; width: 28px; height: 28px; padding: 0;
+    border: 0; border-radius: 7px; background: rgba(255, 255, 255, .12);
+    color: #fff; font-size: 12px; line-height: 1; cursor: pointer;
   }
   .pbtn:hover { background: rgba(255, 255, 255, .2); }
-  .ptime { flex: 0 0 auto; font-family: var(--font-num); font-size: 12px; color: #c9cec4; font-variant-numeric: tabular-nums; }
-  .pseek { flex: 1 1 auto; min-width: 80px; height: 14px; accent-color: #e7e9e2; cursor: pointer; }
-  .ploop { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; color: #c9cec4; font-size: 12px; cursor: pointer; user-select: none; }
-  .ploop .sw { width: 24px; height: 14px; background-size: 10px 10px; background-position: 2px 2px; }
-  .ploop .sw:checked { background-color: #e7e9e2; background-image: radial-gradient(circle, #171a16 0 4.5px, transparent 4.7px); background-position: 12px 2px; }
-  .rec { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; color: #8fd6aa; font-size: 11px; }
+  .ptime { flex: 0 0 auto; font-family: var(--font-num); font-size: 13px; color: #c9cec4; font-variant-numeric: tabular-nums; }
+  .pseek { flex: 1 1 auto; min-width: 80px; height: 15px; accent-color: #e7e9e2; cursor: pointer; }
+  .ploop { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 7px; color: #c9cec4; font-size: 12.5px; cursor: pointer; user-select: none; }
+  .ploop .sw { width: 28px; height: 16px; background-size: 12px 12px; background-position: 2px 2px; }
+  .ploop .sw:checked { background-color: #e7e9e2; background-image: radial-gradient(circle, #171a16 0 5px, transparent 5.2px); background-position: 14px 2px; }
+  .rec { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; color: #8fd6aa; font-size: 12px; }
   .rec::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
   .rec.stopped { color: #e3b74f; }
 
@@ -201,35 +204,80 @@
   /* ---------- 读数栏：连续分栏，不再堆卡片 ---------- */
   .panel {
     display: flex; flex-direction: column; min-height: 0;
-    border-left: 1px solid var(--line); padding-left: 20px;
+    border-left: 1px solid var(--line); padding-left: 22px;
   }
-  .mod { padding: 9px 0; border-bottom: 1px solid var(--line); }
-  .mod:first-child { padding-top: 1px; }
+  .mod { padding: 14px 0; border-bottom: 1px solid var(--line); }
+  .mod:first-child { padding-top: 0; }
   .mod:last-child { border-bottom: 0; padding-bottom: 0; }
-  .mod-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
-  .mod-head h2 { margin: 0; font-size: 12.5px; font-weight: 600; color: var(--sub); }
-  .meta { font-size: 11.5px; color: var(--mute); text-align: right; font-variant-numeric: tabular-nums; }
-  /* 调试区折叠：原始信号只在调参时需要 */
-  .dbg summary { font-size: 11.5px; color: var(--mute); cursor: pointer; padding: 2px 0; list-style-position: inside; }
-  .dbg summary:hover { color: var(--ink); }
-  .dbg .kv { margin-top: 6px; }
+  .mod-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+  /* 栏目标题保持黑体：宋体只留给站名，避免头重脚轻 */
+  .mod-head h2 {
+    margin: 0; font-size: 15px; font-weight: 600;
+    letter-spacing: .01em; color: var(--ink);
+  }
+  .meta { font-size: 12.5px; color: var(--mute); text-align: right; font-variant-numeric: tabular-nums; }
 
-  .posture-row { display: flex; align-items: baseline; gap: 10px; }
-  .posture { font-size: 36px; font-weight: 600; line-height: 1.08; letter-spacing: -.02em; }
-  .posture.dim { font-size: 23px; color: var(--mute); font-weight: 500; }
+  .actions-mod .mod-head h2 { font-size: 16px; }
+  /* 核心动作（操作设备/油样取样/放油取样）：动作面板的主视觉，一行一张大卡 */
+  .core-actions { display: grid; grid-template-columns: 1fr; gap: 10px; }
+  .core-act {
+    display: grid; grid-template-columns: 1fr auto 13px; align-items: center; gap: 12px;
+    padding: 15px 16px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--surface);
+    font-size: 18px; font-weight: 500; line-height: 1.3; color: var(--sub); white-space: nowrap;
+    cursor: help;
+    transition: border-color .15s, background-color .15s, color .15s;
+  }
+  .core-act .ca-state { font-size: 13px; font-weight: 400; color: var(--mute); font-variant-numeric: tabular-nums; }
+  .core-act .ca-state::before { content: "未触发"; }
+  /* 右侧指示灯：每张卡一盏，只对应该卡片自己的动作；触发时亮绿 */
+  .ca-lamp {
+    width: 13px; height: 13px; border-radius: 50%;
+    background: #c9cec4;
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .05);
+    transition: background-color .15s, box-shadow .15s;
+  }
+  .core-act.on { color: var(--ink); background: var(--ok-wash); border-color: var(--ok-edge); }
+  .core-act.on .ca-state { color: var(--ok); }
+  .core-act.on .ca-state::before { content: "进行中"; }
+  .core-act.on .ca-lamp {
+    background: var(--ok);
+    box-shadow: 0 0 0 4px rgba(47, 143, 91, .16), 0 0 12px rgba(47, 143, 91, .55);
+  }
+  .core-act.na:not(.on) { opacity: .55; }
+  .core-act.na:not(.on) .ca-lamp { background: transparent; box-shadow: inset 0 0 0 1.5px var(--line-strong); }
+  .core-act.na:not(.on) .ca-state::before { content: "不可判"; }
 
-  /* 动作网格：当前产品动作 5 个，4 列一行放得下；上下文事件单独一行 */
-  .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px 4px; }
-  .ctx-row { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; margin-top: 2px; }
-  .ctx-tag { font-size: 10.5px; color: var(--mute); margin-right: 2px; }
+  /* 触发框：三张核心动作卡的文字输出（画面上不叠加框），本身画成一个框 */
+  .trigger-box {
+    margin-top: 12px; padding: 12px 14px;
+    border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+  }
+  .tr-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+  .tr-title { font-size: 13.5px; font-weight: 600; color: var(--ink); letter-spacing: .01em; }
+  .trigger-now { display: flex; flex-direction: column; gap: 4px; }
+  .tr-line { display: flex; align-items: baseline; gap: 10px; font-size: 15px; color: var(--ink); }
+  .tr-line .tr-dur { margin-left: auto; font-family: var(--font-num); font-size: 13px; color: var(--ok); font-variant-numeric: tabular-nums; }
+  .tr-empty { font-size: 14px; color: var(--mute); }
+  .tr-cap { font-size: 11.5px; color: var(--mute); margin: 12px 0 5px; letter-spacing: .02em; }
+  .trigger-log { display: flex; flex-direction: column; gap: 3px; }
+  .tr-ev { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; color: var(--sub); }
+  .tr-ev .tr-time, .tr-ev .tr-dur { font-family: var(--font-num); color: var(--mute); font-variant-numeric: tabular-nums; }
+  .tr-ev .tr-dur { margin-left: auto; }
+
+  /* 动作网格：其余产品动作 4 个，4 列一行放得下；上下文事件单独一行 */
+  .sub-label { font-size: 11.5px; color: var(--mute); margin: 15px 0 8px; letter-spacing: .02em; }
+  .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px 6px; }
+  .ctx-row { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 6px; margin-top: 3px; }
+  .ctx-tag { font-size: 11.5px; color: var(--mute); margin-right: 2px; }
   .act {
-    display: flex; align-items: center; gap: 6px;
-    padding: 3px 6px; border-radius: 6px;
-    font-size: 12px; color: var(--mute); white-space: nowrap;
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 9px; border-radius: 8px;
+    font-size: 14.5px; color: var(--mute); white-space: nowrap;
     cursor: help;
     transition: background-color .12s, color .12s;
   }
-  .act::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: #c9cec4; flex: 0 0 auto; }
+  .act::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #c9cec4; flex: 0 0 auto; }
   .act.on { color: var(--ink); background: var(--ok-wash); }
   .act.on::before { background: var(--ok); }
   /* 当前条件下判不了的动作（手部模型没开、没有 3D、单帧图片）：空心点 + 降透明度。
@@ -237,17 +285,17 @@
   .act.na:not(.on) { opacity: .55; }
   .act.na:not(.on)::before { background: transparent; box-shadow: inset 0 0 0 1.5px var(--line-strong); }
   /* 一行当前提示 + 右侧「准确率」开关。放不下就省略，全文在 title 里 */
-  .act-hint-row { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; line-height: 1.4; }
+  .act-hint-row { display: flex; align-items: baseline; gap: 10px; margin-top: 8px; line-height: 1.45; }
   .act-hint {
-    flex: 1 1 auto; min-width: 0; font-size: 11px; color: var(--mute);
+    flex: 1 1 auto; min-width: 0; font-size: 12px; color: var(--mute);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  #btnAccuracy { font-size: 11px; }
+  #btnAccuracy { font-size: 12px; }
   button.link.on { color: var(--ink); text-decoration: none; }
   /* 准确率明细：默认收起，点「准确率」展开（展开后页面可以滚动） */
   .acc-list {
-    margin-top: 6px; display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px;
-    font-size: 11px; line-height: 1.5;
+    margin-top: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 3px 12px;
+    font-size: 12px; line-height: 1.55;
   }
   .acc-item { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; min-width: 0; }
   .acc-item .an { color: var(--sub); white-space: nowrap; }
@@ -255,77 +303,61 @@
   .acc-item .av.good { color: var(--ok); }
   .acc-item .av.warn { color: var(--warn); }
   .acc-item .av.bad { color: var(--bad); }
-  .acc-note { grid-column: 1 / -1; color: var(--mute); font-size: 10.5px; line-height: 1.4; margin-top: 2px; }
+  .acc-note { grid-column: 1 / -1; color: var(--mute); font-size: 11.5px; line-height: 1.45; margin-top: 3px; }
 
   /* 人员列表（多人 / PPE）：一人一行。工程风，不加色块，只用文字与发丝线。 */
-  .people { display: flex; flex-direction: column; margin-top: 2px; }
-  .person { display: grid; grid-template-columns: 30px 1fr auto; gap: 8px; align-items: baseline;
-            padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+  .people { display: flex; flex-direction: column; margin-top: 4px; }
+  .person { display: grid; grid-template-columns: 34px 1fr auto; gap: 10px; align-items: baseline;
+            padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
   .person:last-child { border-bottom: 0; padding-bottom: 0; }
-  .person .pid { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--mute); }
+  .person .pid { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; color: var(--mute); }
   .person .pstate { color: var(--ink); }
-  .person .pbadge { font-size: 11.5px; color: var(--mute); font-variant-numeric: tabular-nums; }
+  .person .pbadge { font-size: 12.5px; color: var(--mute); font-variant-numeric: tabular-nums; }
   .person .pbadge.ok { color: var(--ok); }
   .person .pbadge.warn { color: #b23b2e; }
-  select.mini { padding: 2px 4px; font-size: 12px; }
+  select.mini { padding: 2px 4px; font-size: 13px; }
 
-  .hands { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .hands { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
   .hand {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 5px 9px; border: 1px solid var(--line); border-radius: 6px; font-size: 12.5px;
+    padding: 8px 11px; border: 1px solid var(--line); border-radius: 8px; font-size: 13.5px;
   }
-  .hand .hk { font-size: 11.5px; color: var(--mute); }
+  .hand .hk { font-size: 12.5px; color: var(--mute); }
   .hand .hv { font-weight: 500; color: var(--mute); }
   .hand.on .hv { color: var(--ink); }
   /* 侧对镜头时手势不可靠：虚线边框 + 灰字 */
   .hand.edge { border-style: dashed; }
   .hand.edge .hv { font-weight: 400; }
 
-  table.kv { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-  table.kv td { padding: 3px 0; font-size: 13.5px; }
-  table.kv td:first-child { color: var(--sub); }
-  table.kv td:last-child { text-align: right; font-family: var(--font-num); font-size: 14px; color: var(--ink); }
-  table.kv tr + tr td { border-top: 1px solid rgba(27, 30, 25, .06); }
-
-  .reps { display: grid; grid-template-columns: 1fr; gap: 8px; }
-  .rep .num { font-family: var(--font-num); font-size: 26px; font-weight: 600; line-height: 1.1; letter-spacing: -.01em; }
-  .rep .cap { font-size: 11px; color: var(--mute); margin-top: 1px; }
-
-  .row { display: flex; gap: 8px; margin-top: 11px; }
-  .row .btn { flex: 1; }
-  .hardcase-row { display: flex; gap: 8px; margin-top: 8px; }
-  .hardcase-row select { flex: 1; min-width: 0; }
-  .hardcase-row .btn { flex: 0 0 auto; }
-
-  .hint-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; }
-  .hint {
-    font-size: 11px; color: var(--mute); min-width: 0;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    font-variant-numeric: tabular-nums;
-  }
   button.link {
-    border: 0; background: none; padding: 0; color: var(--sub); font-size: 11.5px;
+    border: 0; background: none; padding: 0; color: var(--sub); font-size: 12.5px;
     cursor: pointer; text-decoration: underline; text-underline-offset: 2px; white-space: nowrap;
   }
   button.link:hover:not(:disabled) { color: var(--ink); }
   button.link:disabled { color: var(--mute); text-decoration: none; cursor: default; }
 
   /* ---------- 响应式 ---------- */
+  /* 中等宽度：保留左右两栏，只收窄读数栏；动作识别必须一直在画面旁边 */
   @media (max-width: 1080px) {
+    main { grid-template-columns: minmax(0, 1fr) 360px; }
+  }
+  /* 窄窗口/竖屏：改单列，但给视频限高——16:9 会把画面撑得很高，
+     下面的「动作识别」被推到首屏之外，看起来就像整块消失了。 */
+  @media (max-width: 900px) {
     main { grid-template-columns: 1fr; flex: 0 0 auto; gap: 16px; }
-    .stage { height: auto; aspect-ratio: 16 / 9; min-height: 280px; }
+    .stage { height: auto; aspect-ratio: 16 / 9; min-height: 220px; max-height: 42vh; }
     .panel { border-left: 0; border-top: 1px solid var(--line); padding-left: 0; padding-top: 16px; }
   }
   @media (max-width: 720px) {
-    .topbar { padding: 0 14px; }
-    .brand .slug { display: none; }
-    .metrics { gap: 10px; font-size: 11px; }
+    .topbar { padding: 0 16px; }
+    .brand h1 { font-size: 18px; }
+    .metrics { gap: 12px; font-size: 12px; }
     .status { max-width: 38vw; }
-    .controls { padding: 8px 14px; }
-    main { padding: 14px 14px 18px; }
+    .controls { padding: 10px 16px; }
+    main { padding: 16px 16px 20px; }
     .actions { grid-template-columns: repeat(3, 1fr); }
     /* 竖屏视频在 16:9 的窗口里只剩一条，给手机一个高一点的取景窗 */
-    .stage { height: 52vh; aspect-ratio: auto; min-height: 260px; }
+    .stage { height: 46vh; aspect-ratio: auto; min-height: 240px; }
     .badges { inset: 16px 16px auto 16px; }
     .player { left: 10px; right: 10px; bottom: 10px; gap: 6px; padding: 5px 7px; }
     .ptime, .rec { display: none; }
@@ -339,13 +371,7 @@
 
 <header class="topbar">
   <div class="brand">
-    <svg class="mark" viewBox="0 0 20 20" aria-hidden="true">
-      <circle class="joint" cx="10" cy="4.2" r="2.2"/>
-      <path d="M10 6.8v5.4M10 8.4 5.6 6.2M10 8.4l4.4 2.4M10 12.2l-3.6 5M10 12.2l3.6 5"
-            fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-    </svg>
     <h1>通用姿态识别</h1>
-    <span class="slug">pose-demo</span>
   </div>
   <div class="metrics">
     <span id="status" class="status">初始化…</span>
@@ -407,6 +433,8 @@
     <canvas id="overlay"></canvas>
     <div class="badges">
       <span class="badge" id="badgeRes" hidden>—</span>
+      <span class="badge" id="badgePosture" hidden>—</span>
+      <span class="badge" id="badgeFacing" hidden>—</span>
       <span class="badge warn" id="badgeNoPerson" hidden>未检出人体</span>
     </div>
     <div class="player" id="player" hidden>
@@ -424,18 +452,19 @@
   </section>
 
   <aside class="panel">
-    <section class="mod" id="peopleMod" hidden>
-      <div class="mod-head"><h2>人员</h2><span class="meta" id="peopleMeta">—</span></div>
-      <div class="people" id="peopleList"></div>
-    </section>
+    <section class="mod actions-mod">
+      <div class="mod-head"><h2>动作识别</h2><span class="meta" id="handMeta">—</span></div>
+      <div class="core-actions" id="coreActions"></div>
 
-    <section class="mod">
-      <div class="mod-head"><h2>当前姿态</h2><span class="meta" id="postureMeta">—</span></div>
-      <div class="posture-row"><div class="posture dim" id="posture">—</div></div>
-    </section>
+      <!-- 触发框：三张核心动作卡的文字输出，紧跟在卡下面 -->
+      <div class="trigger-box">
+        <div class="tr-head"><span class="tr-title">触发</span><span class="meta" id="triggerMeta">—</span></div>
+        <div class="trigger-now" id="triggerNow"><div class="tr-empty">无触发</div></div>
+        <div class="tr-cap" id="triggerCap" hidden>最近触发</div>
+        <div class="trigger-log" id="triggerLog" hidden></div>
+      </div>
 
-    <section class="mod">
-      <div class="mod-head"><h2>动作与手势</h2><span class="meta" id="handMeta">—</span></div>
+      <div class="sub-label">其他动作</div>
       <div class="actions" id="armGrid"></div>
       <div class="ctx-row" id="ctxActions"></div>
       <div class="act-hint-row">
@@ -450,35 +479,30 @@
       </div>
     </section>
 
-    <section class="mod">
-      <div class="mod-head"><h2>信号</h2><span class="meta" id="signalMeta">—</span></div>
-      <!-- 原始角度默认收起：日常看判定结论，调阈值时才展开 -->
-      <details class="dbg">
-        <summary>调试信号</summary>
-        <table class="kv" id="angles"></table>
-      </details>
-    </section>
-
-    <section class="mod">
-      <div class="mod-head"><h2>计数与记录</h2><span class="meta" id="repMeta">—</span></div>
-      <div class="reps">
-        <div class="rep"><div class="num" id="repGrasp">0</div><div class="cap">拿取</div></div>
-      </div>
-      <div class="row">
-        <button id="btnReset" class="btn">重置计数</button>
-        <button id="btnExport" class="btn solid">导出 JSON</button>
-      </div>
-      <div class="hardcase-row">
-        <select id="hardcaseSel" title="选择这条难例「应该是什么」或「不应该出现什么」，再点右侧按钮导出前后 5 秒的帧"></select>
-        <button id="btnHardcase" class="btn" title="导出点击前 3 秒 + 之后 2 秒的帧和草稿 label">判错了</button>
-      </div>
-      <div class="hint-row">
-        <div class="hint" id="logInfo">—</div>
-        <button id="btnClearLog" class="link" title="清空已记录的帧、计数与曲线（不改变播放位置）">清空记录</button>
-      </div>
+    <section class="mod" id="peopleMod" hidden>
+      <div class="mod-head"><h2>人员</h2><span class="meta" id="peopleMeta">—</span></div>
+      <div class="people" id="peopleList"></div>
     </section>
   </aside>
 </main>
+
+<!--
+  计数/记录/难例导出已从界面移除（设备作业场景只看动作识别）。
+  这些 id 仍被自动化脚本与无头测试驱动（scripts/deterministic-replay.mjs、
+  scripts/clip-recognition.mjs、scripts/refuel-sampling-suite.mjs、
+  web/test/headless-check.mjs），所以保留在隐藏容器里维持行为；
+  新代码不要再依赖这些控件，优先用 window.__pose 暴露的 API。
+-->
+<div id="legacyControls" hidden>
+  <span id="repGrasp">0</span>
+  <span id="repMeta">—</span>
+  <span id="logInfo">—</span>
+  <button id="btnReset" type="button"></button>
+  <button id="btnExport" type="button"></button>
+  <button id="btnClearLog" type="button"></button>
+  <select id="hardcaseSel"></select>
+  <button id="btnHardcase" type="button"></button>
+</div>
 
 <script type="module" src="js/app.js"></script>
 </body>

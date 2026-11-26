@@ -29,3 +29,6 @@ eval-data/*
 
 # 由 npm run accuracy 从 eval-data 生成，随素材变；不进 git
 web/accuracy.json
+
+# Claude Code 本地会话配置与临时 worktree（不进 git）
+.claude/

@@ -29,9 +29,16 @@ export const SHAPE_LABELS = {
 export const SHAPE_IDS = Object.keys(SHAPE_LABELS).filter((k) => k !== 'unknown');
 
 /**
- * 手势去抖：连续 N 帧命中同一手势才切换。
- * 没有它，「张开」和「剪刀手」在阈值附近会来回闪（PLAN §12.1 的「手势偶尔串」就是它）。
- * 当前手势持续命中时保持；出现新的稳定手势才切换；判不出来时保留上一结果若干帧再清空。
+ * 手势去抖：同一手势要**累计命中 streak 次**（判不出来的帧在 keepMs 内跳过、不清零）才切换。
+ *
+ * 为什么要去抖：「张开」和「剪刀手」在阈值附近会来回闪（PLAN §12.1 的「手势偶尔串」就是它）。
+ * 但「连续」不能把 unknown 也算进去：手被遮挡、侧对镜头的一两帧会判成 unknown，
+ * 若 unknown 清零计数，手型明明稳定也永远切不过去——实测同一段素材里，
+ * 有 5/26 的手明明判出了具体手型、最终却停在「—」，其中多数就是这么被清零的。
+ * 现在的口径：unknown 在 keepMs 内跳过（超时则整体过期、半途候选一并丢弃），换成**另一个手势**才清零。
+ * 过期按 `update()` 的调用时间算：手完全没检出时调用方不会推帧，这段静默间隔同样计入 keepMs
+ * （否则「两帧误检 + 长时间消失 + 一帧同手势」仍会直接凑满 streak）。
+ * 交替手势（A、B、A、B…）依然凑不够累计命中，防闪烁的原始保证不变。
  */
 export class HandShapeStabilizer {
   constructor({ streak = 3, keepMs = 250 } = {}) {
@@ -44,11 +51,21 @@ export class HandShapeStabilizer {
   }
 
   update(shape, ts) {
+    // 先按 keepMs 过期，**再看这一帧的判定**。放在 unknown 分支里是不够的：
+    // 这只手完全没检出时调用方（multi.js 的 classifyHandsByTrack 只遍历本帧检出的手）
+    // 根本不会调用 update()，过期就永远等不到触发点——手出画几秒再回来，
+    // 两帧旧候选 + 一帧同手势会直接切换。过期条件不看 last（冷启动时 last 恒为 unknown）。
+    if (ts - this.lastSeenTs > this.keepMs) {
+      if (this.last !== 'unknown') this.last = 'unknown';
+      this.candidate = null;
+      this.candidateCount = 0;
+    }
+
     if (shape && shape !== 'unknown') {
+      this.lastSeenTs = ts;
       if (shape === this.last) {
         this.candidate = null;
         this.candidateCount = 0;
-        this.lastSeenTs = ts;
         return this.last;
       }
       if (shape === this.candidate) this.candidateCount++;
@@ -58,19 +75,12 @@ export class HandShapeStabilizer {
         this.last = shape;
         this.candidate = null;
         this.candidateCount = 0;
-        this.lastSeenTs = ts;
       }
       return this.last;
     }
 
-    // 判不出来：中断候选计数。streak 必须是**连续**命中，
-    // 否则 unknown 隔开的零散误判也能凑满（victory,victory,unknown,victory 就会切换）。
-    this.candidate = null;
-    this.candidateCount = 0;
-    // 但短时间内保留上一次结果（手转个角度不该让面板闪成「—」）
-    if (this.last !== 'unknown' && ts - this.lastSeenTs > this.keepMs) {
-      this.last = 'unknown';
-    }
+    // 判不出来：**不清零**候选计数（遮挡/侧对的一两帧不该把稳定手势打回「—」）。
+    // 过期已经在函数开头按 keepMs 处理：结果置空、半途候选一并丢弃。
     return this.last;
   }
 

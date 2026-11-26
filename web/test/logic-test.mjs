@@ -189,13 +189,14 @@ console.log('\n[6] 姿态判定');
   const ae2 = new ActionEngine();
   let act2 = null;
   for (let i = 0; i <= 10; i++) act2 = ae2.update(se2.update(person(lieKp), 1000 + i * 100), 1000 + i * 100);
-  // 躺卧/下蹲已下线（需要全身/地面机位）：卧姿不再被硬凑成任何静态姿态
-  check('卧姿不再判成站/坐（躺卧已下线）', act2.postureId === null, `posture=${act2.posture}`);
+  // 躺卧已下线（需要全身/地面机位）：卧姿不再被硬凑成任何静态姿态
+  check('卧姿不再判成站/坐/蹲（躺卧已下线）', act2.postureId === null, `posture=${act2.posture}`);
 
-  // 坐姿与深蹲的膝角/直立度量级相同，只能靠腿竖直比分：
-  // 少了这道门，「坐」会被更高优先级的「下蹲」吃掉（实测膝 90°、腿竖直比 0.6）。
+  // 坐姿与蹲下的膝角/直立度量级相同，靠「髋是否明显下沉」区分：
+  // 坐在椅子上腿竖直比 ≈0.9~1.0（>0.8）归坐；蹲下时髋下沉（<0.8）。
   const poseSig = (o = {}) => ({
     ok: true, knee_pick: 170, elbow_pick: 170, uprightness: 0.95, leg_vertical: 1.3,
+    legs_visible: true, hip_knee_drop: 0,
     arm: {}, armPose: {}, wave: { L: 0, R: 0, amp: 0 }, extrapolated: [], ...o,
   });
   const runPose = (sig, n = 12) => {
@@ -204,10 +205,13 @@ console.log('\n[6] 姿态判定');
     for (let i = 1; i <= n; i++) r = ae.update(sig, 1000 + i * 100);
     return r;
   };
-  const sitAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.9, leg_vertical: 0.6 }));
-  check('坐姿（腿不竖直）→ 坐，而不是下蹲', sitAct.postureId === 'sit', `posture=${sitAct.postureId}`);
-  const squatAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.9, leg_vertical: 1.3 }));
-  check('腿仍竖直的屈膝不再是任何姿态（下蹲已下线）', squatAct.postureId === null, `posture=${squatAct.postureId}`);
+  const sitAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.9, leg_vertical: 0.9 }));
+  check('坐姿（髋不低）→ 坐，而不是蹲下', sitAct.postureId === 'sit', `posture=${sitAct.postureId}`);
+  const squatAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.7, leg_vertical: 0.5 }));
+  check('髋明显下沉的屈膝 → 蹲下', squatAct.postureId === 'crouch', `posture=${squatAct.postureId}`);
+  const kneelAct = runPose(poseSig({ knee_pick: 90, uprightness: 0.7, leg_vertical: 0.5, hip_knee_drop: -0.95 }));
+  check('髋远高于膝（单膝跪地/弓步）→ 不算蹲下', kneelAct.postureId !== 'crouch',
+    `posture=${kneelAct.postureId}`);
 
   // 注册表一致性：ARM_ACTIONS.flag 是页面、评估器、难例导出共用的键名。
   // 写错一个字母不会报错，只会让这个动作在 UI/评估里永远为 false——手抄时代就这么漏过。
@@ -897,12 +901,52 @@ console.log('\n[21] 回归（审查修复）');
   }
   check('3D 举手 + 挥手 → 两者都成立', r2.flags.armRaised === true && r2.flags.waving === true);
 
-  // 21.3 手势去抖：unknown 必须中断 streak
+  // 21.3 手势去抖：连续 streak 次命中才切换，但 unknown 跳过、不清零
   const st = new HandShapeStabilizer({ streak: 3, keepMs: 1000 });
-  st.update('open', 0); st.update('open', 100); st.update('open', 200);
-  st.update('victory', 300); st.update('victory', 400);
-  st.update('unknown', 500);
-  check('unknown 中断候选计数（非连续命中不切换）', st.update('victory', 600) === 'open');
+  const feed = (seq) => seq.map((sh) => st.update(sh, (feed.t += 100)));
+  feed.t = 0;
+  check('攒够 3 次命中才切换', JSON.stringify(feed(['open', 'open', 'open']))
+    === JSON.stringify(['unknown', 'unknown', 'open']));
+  check('交替手势不切换（防「张开→剪刀手」来回闪）',
+    JSON.stringify(feed(['victory', 'open', 'victory', 'open', 'victory', 'open']))
+    === JSON.stringify(['open', 'open', 'open', 'open', 'open', 'open']));
+  const st3 = new HandShapeStabilizer({ streak: 3, keepMs: 1000 });
+  let t3 = 0;
+  const f3 = (seq) => seq.map((sh) => st3.update(sh, (t3 += 100)));
+  f3(['open', 'open', 'open']);
+  check('unknown 跳过、不清零：fist,fist,unknown,fist 仍能切换',
+    JSON.stringify(f3(['fist', 'fist', 'unknown', 'fist']))
+    === JSON.stringify(['open', 'open', 'open', 'fist']));
+  const st4 = new HandShapeStabilizer({ streak: 3, keepMs: 1000 });
+  let t4 = 0;
+  const f4 = (seq) => seq.map((sh) => st4.update(sh, (t4 += 100)));
+  f4(['open', 'open', 'open']);
+  check('换成另一个手势才清零：fist,fist,open,fist 不切换',
+    JSON.stringify(f4(['fist', 'fist', 'open', 'fist']))
+    === JSON.stringify(['open', 'open', 'open', 'open']));
+
+  // keepMs 过期时连半途候选一起丢弃：换手势攒到一半被打断，要重新攒满
+  const st5 = new HandShapeStabilizer({ streak: 3, keepMs: 250 });
+  st5.update('open', 0); st5.update('open', 100); st5.update('open', 200);
+  st5.update('fist', 300); st5.update('fist', 400);   // 候选 fist 计 2
+  check('keepMs 超时清空结果并丢弃半途候选', st5.update('unknown', 700) === 'unknown');
+  check('候选丢弃后单帧不切换', st5.update('fist', 800) === 'unknown');
+
+  // 冷启动时 last 恒为 unknown，半途候选也必须按 keepMs 过期（不能跨长间隔存活）
+  const st6 = new HandShapeStabilizer({ streak: 3, keepMs: 250 });
+  check('冷启动积累两帧不切换',
+    st6.update('open', 0) === 'unknown' && st6.update('open', 100) === 'unknown');
+  check('冷启动长间隔后单帧不切换（候选已过期）',
+    st6.update('unknown', 5000) === 'unknown' && st6.update('open', 5100) === 'unknown');
+
+  // 手完全没检出时管线不会调用 update()：中间没有 unknown 帧，候选同样必须按期过期。
+  // 这一条覆盖真实链路的静默间隔（classifyHandsByTrack 只遍历本帧检出的手）。
+  const st7 = new HandShapeStabilizer({ streak: 3, keepMs: 250 });
+  check('无推帧的长间隔：重新检出的首帧先过期',
+    st7.update('open', 0) === 'unknown' && st7.update('open', 100) === 'unknown'
+      && st7.update('open', 5000) === 'unknown');
+  check('无推帧的长间隔：候选从 1 重新计数',
+    st7.update('open', 5100) === 'unknown' && st7.update('open', 5200) === 'open');
 
   // keepMs 内 unknown 保持原手势，超过则清空
   const st2 = new HandShapeStabilizer({ streak: 3, keepMs: 250 });

@@ -80,6 +80,9 @@ node web/test/evaluate.mjs --dir eval-data
   `near_equipment`；姿态与上半身只作上下文。
 - **不在范围内**：多人、8 类手势精度、PPE 准确率、头部角度精度、`oil_sample`、
   valve/gauge 作为主判据、跨机位/换人泛化。引擎仍会算这些信号，但不得写进验收。
+- **关键点精度**：无真值时代理指标（抖动 / 骨长 CV / 尺度 CV）已可跑，见
+  `docs/signals.md`「手部关键点质量」；**准确率**（PCK/MPJPE）需要 `handkp-gt v0` 真值，
+  仍不在本轮验收范围。
 - **验收数字**：每个方向 n≥20 才报百分比；同时报 Wilson 95%CI、事件时延/抖动、误报/小时。
   当前 `web/accuracy.json` 只有 operating/near 两项有数据，n=6/6、7，**样本不足**。
 - **跨机位**：labels 写 `camera`（clip 级或段级），报告按机位分组并给跨组退化；
@@ -109,7 +112,7 @@ node web/test/evaluate.mjs --dir eval-data
 
 ## 把结果回显到 Demo（accuracy.json）
 
-Demo 的「动作与手势 → 准确率」读的是 `web/accuracy.json`，由评估器的 `--json` 输出转换而来：
+Demo 的「动作识别 → 准确率」读的是 `web/accuracy.json`，由评估器的 `--json` 输出转换而来：
 
 ```bash
 npm run accuracy
@@ -249,7 +252,7 @@ node web/test/evaluate.mjs --input eval-data/a.jsonl --autolabel --out eval-data
 
 | 类别 | 取值 |
 |---|---|
-| 姿态 | `stand` / `sit` / `upper_upright` / `upper_lean`（`squat_static` / `lying` 已下线，写了会被 `parseSegment` 拒绝）。后两个只用于上半身构图，标注时按「躯干直立/前倾」标，不要拿它们当站/坐 |
+| 姿态 | `stand` / `sit` / `crouch` / `upper_upright` / `upper_lean`（`squat_static` / `lying` 已下线，写了会被 `parseSegment` 拒绝）。`crouch` 需要膝/踝可见的全身机位，背对相机时靠 3D 膝角；坐与蹲只能靠腿竖直比分，标注时要互配反例。后两个只用于上半身构图，标注时按「躯干直立/前倾」标，不要拿它们当站/坐 |
 | 手臂 | `armRaised` / `bothHandsUp` / `waving` / `crossed` / `onHips` / `armsOpen` / `handAtHead` / `oilSample` / `reaching` / `carrying` / `operating` / `near_equipment` / `pointing` / `armFront` / `armSide` |
 | 上下文 | `near_equipment` 是上下文事件（人在设备旁），**不能**和 `operating` 互相替代 |
 | 计数 | `grasp`（`clap` 仅用于历史数据/旧标签；`squat` / `pushup` 已下线）|
@@ -403,9 +406,12 @@ labels 里写 `camera` / `subject`，报告会分别给出：
 | 漏判的 `observed` | 当时实际判成了什么（常见是串判到相邻姿态） |
 | 误报的 `falseAlarms` | `!动作` 只记该动作（不牵连同时成立的 stand）；`noArm` 记抢占的手臂 flag；`none` 记所有在跳的姿态/flag。汇总时 FP 记到它们头上 |
 
-关键信号按动作选：姿态看 `uprightness / knee / leg_vertical`，抬臂看 `elev_* / elev_torso_*`，
-举手看 `elev_*`，油样取样看 `reach_head_* / azimuth_*`，操作设备/伸手/持物/指向看 `reach_*`，
-在设备旁看 `near_equipment_overlap`。完整映射见 `evaluate.mjs` 的 `SIGNALS_FOR`。
+关键信号按动作选：姿态看 `uprightness / knee / leg_vertical`（蹲下另看 `leg_vertical_pick /
+hip_knee_drop`），抬臂看 `elev_* / elev_torso_*`，举手看 `elev_*`，油样取样看 `reach_head_* /
+azimuth_body_* / body_yaw`，指向看 `reach_* / elev_torso_* / azimuth_body_*`，操作设备/伸手/持物看
+`reach_*`，在设备旁看 `near_equipment_overlap`。完整映射见 `evaluate.mjs` 的 `SIGNALS_FOR`。
+`azimuth_body_*` 是受试者自身方位角（相机方位角减去 `body_yaw`），背身/侧身时与
+`azimuth_*` 不同；失败区间里两者一起看，才能区分「朝向判错」和「手臂不对」。
 
 > 导出帧的 `actions.unreliable` 记录逐帧弃权原因（低置信 / 外推 / 骨骼异常 / 角度坏点，
 > 见 `docs/signals.md` §三·九）。**报告不按它筛选**——报告比的是「规则最终判定 vs 标注」。
@@ -441,6 +447,9 @@ node web/test/evaluate.mjs --dir eval-data --fit --report eval-data/report.md
 - 阈值不要贴着分位写，按比例留 10% 余量，否则滤波器稍慢一点就漏。
 - 已下线动作（鼓掌/前平举/侧平举/叉腰/抱臂/挥手）的分位示例不再维护。
 - 深蹲/俯卧撑的阈值拟合已随动作下线（`actions.reps.squat|pushup` 不再存在）
+- **蹲下（`crouch`）的阈值仍手动定**：`--fit-out` 还没有 `crouch.kneeLt / legVerticalLt` 的映射
+  （蹲/坐/跪的分位互相重叠，背身 2D 膝角又会被压扁）；先补全身蹲姿标注，再按
+  `crouch` 段的 `knee / leg_vertical_pick / hip_knee_drop` 分位人工写 profile。
 
 拟合出来的值写进 profile（`web/profiles/*.json` 的 `params` 段），不要改源码。
 
@@ -463,6 +472,7 @@ node web/test/evaluate.mjs --dir eval-data --fit --fit-out /tmp/fitness-fit.json
 | `stand.kneeGt` / `sit.kneeGt` | 对应 `knee.p5` | P5 − margin |
 | `sit.kneeLt` / `sit.legVerticalLt` | 对应 `p95` | P95 + margin |
 | `stand/sit.uprightnessGt`、`stand.legVerticalGt` | 对应 `p5` | P5 − margin |
+| ~~`crouch.*`~~ | — | 暂不自动拟合，见上面「蹲下的阈值仍手动定」 |
 | `reps.clap.down/up` | `clap_baseline/hands_close.p5/p95` | P5 − / P95 + margin |
 | ~~`reps.squat.*` / `reps.pushup.*` / `gates.*`~~ | — | 动作已下线，不再拟合 |
 | `signals.arm.elevTorso.raised` | `armRaised/elev_torso_L/R.p95` | 取两侧**较低** P95 + margin（上限型） |

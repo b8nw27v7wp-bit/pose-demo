@@ -11,12 +11,12 @@ import {
   ARM_VISIBLE_ACTIONS, REP_ACTIONS,
 } from './actions.js';
 import { explainArmActions, DEFAULT_HINT } from './armhint.js';
+import { bodyFacingText } from './bodyfacing.js';
 import { loadAccuracyReport, accuracyFor, formatAccuracy, accuracyStale } from './accuracy.js';
 import {
   resolveParams, validateParams, profileParams, profileName as profileNameOf, paramsHash,
 } from './params.js';
 import { hasRegionConfig, personPlausibility, personDisplayable, personCoveredByHand } from './geometry.js';
-import { headPoseText, HEAD_DIR_LABELS } from './headpose.js';
 import { buildHardcase, HARDCASE_ACTIONS, HARDCASE_AFTER_MS, HARDCASE_BEFORE_MS } from './hardcase.js';
 import { drawSkeleton, drawHand, drawBoxes, drawTrackLabel, clearCanvas } from './draw.js';
 import { Tracker, area } from './track.js';
@@ -34,6 +34,15 @@ import {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+/** 多人标签里的朝向短标记（侧对不再细分左右，标签太长）。 */
+const facingTag = (sig) => {
+  const f = sig?.body?.facing;
+  if (f === 'back') return '·背面';
+  if (f === 'front') return '·正面';
+  if (f === 'left' || f === 'right' || f === 'side') return '·侧对';
+  return '';
+};
+const facingWord = (sig) => facingTag(sig).replace('·', '');
 const videoEl = $('video');
 const photoEl = $('photo');
 const canvas = $('overlay');
@@ -147,9 +156,9 @@ let lastObjectsTs = null;
 let lastVerdicts = [];
 
 
-// 手势稳定器：**按 track_id 各一套** L/R/U。streak 是连续命中计数，全局一套时
-// A 的手势会推着 B 的状态走（PLAN §16.3 R12-2）；单人道固定用 track 0，行为不变。
-// streak/keepMs 从 params 读，profile 才能调。
+// 手势稳定器：**按 track_id 各一套** L/R/U。streak 是累计命中计数，全局一套时
+// A 的手势会推着 B 的状态走（PLAN §16.3 R12-2）；单人道固定用 track 0，路由不变。
+// streak 从 params 读，profile 才能调；keepMs 用稳定器默认值（250ms），目前未暴露成参数。
 function makeShapeStable(params) {
   return new TrackShapeStabilizers(resolveParams(params).signals.gesture);
 }
@@ -783,6 +792,7 @@ function resetRuntime() {
   // 不清掉的话，暂停中的视频或切换 profile 后面板会继续显示旧结论。
   lastResult = null;
   renderReps({ grasp: 0 });
+  resetTriggerBox();
   updateUI();
 }
 
@@ -1111,7 +1121,8 @@ function clearPhoto() {
 /**
  * 手势分类 + 去抖：实时与静态两条路径共用。
  * **必须在 assignHands() 之后调用**（顺序反了就会用错人的稳定器，见 PLAN §16.3 R12-2）。
- * 单人道 ownerOf 恒为 0（与旧版全局一套稳定器逐位一致）；多人的未归属手不做去抖——
+ * 单人道 ownerOf 恒为 0（**路由**与全局一套稳定器逐位等价，稳定器判定口径见 docs/signals.md）；
+ * 多人的未归属手不做去抖——
  * 它们不进任何人的动作层，只是整帧绘制/导出用。
  */
 function classifyAndBind(rawHands, ts, assigned, single) {
@@ -1484,7 +1495,8 @@ async function analyzeStill(img) {
       const hat = ppe ? (ppe.helmet.alert !== 'none' ? '缺帽!' : ppe.helmet.state === 'worn' ? '帽✓' : '帽?') : '';
       const glove = ppe ? (ppe.glove.alert !== 'none' ? '手套!' : ppe.glove.state === 'worn' ? '手套✓' : '手套?') : '';
       drawTrackLabel(ctx, vd.bbox[0], vd.bbox[1],
-        `#${vd.track_id} ${vd.act?.postureId || '—'}${hat ? ` · ${hat}` : ''}${glove ? ` ${glove}` : ''}`);
+        `#${vd.track_id} ${vd.act?.postureId || '—'}${facingTag(vd.sig)}`
+        + `${hat ? ` · ${hat}` : ''}${glove ? ` ${glove}` : ''}`);
     }
     for (const hd of hands) drawHand(ctx, hd.kp, w, h, { alpha: 0.9 });
     $('badgeNoPerson').hidden = true;
@@ -1971,7 +1983,8 @@ async function loop() {
       const ppe = vd.ppe;
       const hat = ppe ? (ppe.helmet.alert !== 'none' ? '缺帽!' : ppe.helmet.state === 'worn' ? '帽✓' : '帽?') : '';
       const glove = ppe ? (ppe.glove.alert !== 'none' ? '手套!' : ppe.glove.state === 'worn' ? '手套✓' : '手套?') : '';
-      const label = `#${vd.track_id} ${vd.act?.postureId || '—'}${hat ? ` · ${hat}` : ''}${glove ? ` ${glove}` : ''}`;
+      const label = `#${vd.track_id} ${vd.act?.postureId || '—'}${facingTag(vd.sig)}`
+        + `${hat ? ` · ${hat}` : ''}${glove ? ` ${glove}` : ''}`;
       drawTrackLabel(ctx, vd.bbox[0], vd.bbox[1], label, {
         // lastVerdicts 是 verdicts 的副本，对象引用永远不相等；按 id 比才认得出主目标
         color: vd.track_id === primaryV?.track_id ? '#1d1d1f' : '#6b6b70',
@@ -2106,6 +2119,13 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       elbow: r1(sig.elbow_pick),
       uprightness: r2(sig.uprightness),
       leg_vertical: r2(sig.leg_vertical),
+      // 单腿竖直延伸（蹲下姿态用；背身时远侧腿常被挡住）
+      leg_vertical_pick: r2(sig.leg_vertical_pick),
+      leg_vertical_pick_side: sig.leg_vertical_pick_side ?? null,
+      // 髋-膝高度差 / 躯干长：蹲下的深度（正=髋在膝下方），也用于排除跪姿/弓步
+      hip_knee_drop: r2(sig.hip_knee_drop),
+      hip_knee_drop_2d: r2(sig.hip_knee_drop_2d),
+      hip_knee_drop_3d: r2(sig.hip_knee_drop_3d),
       // 上半身姿态的依据：腿证据是否完整 / 是否只判上半身（评估/难例复盘不用再猜）
       legs_visible: !!sig.legs_visible,
       upper_body: !!sig.upper_body,
@@ -2160,6 +2180,14 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       near_equipment_validity: sig.arm.near_equipment_validity ?? null,
       azimuth_L: r1(sig.armPose.azimuth_L),
       azimuth_R: r1(sig.armPose.azimuth_R),
+      // 受试者自身方位角（0°=身体前方）：背身/侧身时与上面的相机方位角相差 body.yaw。
+      // 油样取样、背身的前伸/指向用这一对；离线复核时可直接看出差在朝向还是手臂。
+      azimuth_body_L: r1(sig.armPose.azimuth_body_L),
+      azimuth_body_R: r1(sig.armPose.azimuth_body_R),
+      // 这一对用的是哪种朝向（3d/2d/null = 没换算）。frame-schema 有这一列，导出必须给。
+      azimuth_body_source: sig.armPose.azimuth_body_source ?? null,
+      arm_front_body_L: !!sig.armPose.arm_front_body_L,
+      arm_front_body_R: !!sig.armPose.arm_front_body_R,
       // —— R3：2D/3D 双份信号。离线对比「哪套在正/侧面更可分」必须两边都有，
       // 只导判定用的那一份，事后就没法回答「3D 到底有没有更好」。
       knee_2d: r1(sig.knee_pick_2d),
@@ -2178,6 +2206,9 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       bones_ok: sig.world.bones,
       // 头部朝向：与躯干无关，设备特写/头~胸构图也能有值（旧导出没有这个字段）
       head: sig.head ? { ...sig.head } : null,
+      // 人体朝向：正面/背面/侧对。背对相机时头部几何不可信，但躯干朝向仍可判；
+      // facing 为去抖后的状态，facing_raw 是本帧原始分类（旧导出没有这个字段）。
+      body: sig.body ? { ...sig.body } : null,
     } : null,
     actions: act ? {
       posture: act.postureId,
@@ -2197,6 +2228,9 @@ function pushLog(ts, p, sig, act, personCount = 1, hands = [], extra = null) {
       ...(vd.track_uid !== undefined ? { track_uid: vd.track_uid } : {}),
       bbox: vd.bbox.map(r1),
       posture: vd.act?.postureId ?? null,
+      // 逐 track 的人体朝向（只在多人才有意义；signals.body 只描述主目标）
+      body_facing: vd.sig?.body?.facing ?? null,
+      body_yaw: r1(vd.sig?.body?.yaw),
       frozen: !!vd.act?.frozen,
       flags: vd.act?.flags ?? null,
       reps: vd.act?.reps ?? null,
@@ -2620,15 +2654,90 @@ function renderReps(reps) {
   $('repGrasp').textContent = reps?.grasp ?? 0;
 }
 
+// 业务核心动作：操作设备 / 油样取样 / 放油取样。面板里单独放大成三张大卡，
+// 其余产品动作按小格排在「其他动作」下；上下文事件（在设备旁）单独一行。
+const CORE_ACTION_IDS = ['operating', 'oil_sample', 'drain_sample'];
+
 function buildGrids() {
-  // 动作网格只放当前产品动作；上下文事件（在设备旁）单独一行，不和手臂动作混排。
+  const card = (a) => `<div class="act" data-id="${a.id}"><span>${a.name}</span></div>`;
+  $('coreActions').innerHTML = ARM_UI_ACTIONS
+    .filter((a) => CORE_ACTION_IDS.includes(a.id))
+    .map((a) => `<div class="core-act" data-id="${a.id}">`
+      + `<span class="ca-name">${a.name}</span><span class="ca-state"></span>`
+      + '<span class="ca-lamp" aria-hidden="true"></span></div>')
+    .join('');
   $('armGrid').innerHTML = ARM_UI_ACTIONS
-    .map((a) => `<div class="act" data-id="${a.id}"><span>${a.name}</span></div>`)
+    .filter((a) => !CORE_ACTION_IDS.includes(a.id))
+    .map(card)
     .join('');
   $('ctxActions').innerHTML = '<span class="ctx-tag">上下文</span>'
     + ARM_CONTEXT_ACTIONS
-      .map((a) => `<div class="act" data-id="${a.id}"><span>${a.name}</span></div>`)
+      .map(card)
       .join('');
+}
+
+// —— 触发框（右侧文字）—————————————————————————————————————————
+// 只读 act.flags：列出三张主卡（操作设备/油样取样/放油取样）此刻是否触发、已持续时长，
+// 并在动作结束时留一条历史。不跟伸手/指向/举手、也不跟上下文「在设备旁」：它们是逐帧
+// 保持窗的瞬时动作，放进来会把「最近触发」刷成噪声，框的用途就是主卡的文字读数。
+// 不新增判定，也不往画面上叠加框——判定口径仍然完全由 actions.js 决定。
+const TRIGGER_ACTIONS = ARM_UI_ACTIONS.filter((a) => CORE_ACTION_IDS.includes(a.id));
+const triggerActive = new Map();   // flag -> { since }
+const triggerRecent = [];          // 最近的在前：{ id, name, at, ms }
+let triggerTotal = 0;
+let triggerPaintedAt = 0;
+
+function resetTriggerBox() {
+  triggerActive.clear();
+  triggerRecent.length = 0;
+  triggerTotal = 0;
+  triggerPaintedAt = 0;
+}
+
+const fmtClock = (d) => `${String(d.getHours()).padStart(2, '0')}`
+  + `:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+
+function updateTriggerBox(act) {
+  const now = performance.now();
+  for (const a of TRIGGER_ACTIONS) {
+    const on = !!act?.flags?.[a.flag];
+    const cur = triggerActive.get(a.flag);
+    if (on && !cur) {
+      triggerActive.set(a.flag, { since: now });
+    } else if (!on && cur) {
+      triggerActive.delete(a.flag);
+      triggerRecent.unshift({ id: a.id, name: a.name, at: new Date(), ms: now - cur.since });
+      if (triggerRecent.length > 6) triggerRecent.length = 6;
+      triggerTotal++;
+      triggerPaintedAt = 0;   // 新增历史必须立刻重绘，不能等节流窗口
+    }
+  }
+  // 持续时间只显示到 0.1s：10Hz 重绘足够，别跟着逐帧推理刷 DOM
+  if (now - triggerPaintedAt < 100) return;
+  triggerPaintedAt = now;
+  paintTriggerBox(now);
+}
+
+function paintTriggerBox(now) {
+  const nowEl = $('triggerNow');
+  const logEl = $('triggerLog');
+  if (!nowEl || !logEl) return;
+  const active = TRIGGER_ACTIONS.filter((a) => triggerActive.has(a.flag));
+  nowEl.innerHTML = active.length
+    ? active.map((a) => {
+      const secs = ((now - triggerActive.get(a.flag).since) / 1000).toFixed(1);
+      return `<div class="tr-line"><span class="tr-name">${esc(a.name)}</span>`
+        + `<span class="tr-dur">进行中 ${secs}s</span></div>`;
+    }).join('')
+    : '<div class="tr-empty">无触发</div>';
+  logEl.innerHTML = triggerRecent.map((e) => `<div class="tr-ev" title="${esc(e.name)} · ${fmtClock(e.at)}">`
+    + `<span class="tr-time">${fmtClock(e.at)}</span><span class="tr-name">${esc(e.name)}</span>`
+    + `<span class="tr-dur">${(e.ms / 1000).toFixed(1)}s</span></div>`).join('');
+  logEl.hidden = !triggerRecent.length;
+  const capEl = $('triggerCap');
+  if (capEl) capEl.hidden = !triggerRecent.length;
+  const metaEl = $('triggerMeta');
+  if (metaEl) metaEl.textContent = triggerTotal ? `已触发 ${triggerTotal} 次` : '—';
 }
 
 // 准确率只显示评估报告里的实测值：没有报告/样本不足都明确写出来。
@@ -2671,28 +2780,44 @@ function renderAccuracy(items) {
 function updateUI() {
   const { sig, act, hands } = lastResult || {};
 
-  const postureEl = $('posture');
-  // 只有上半身在画面里时，站/坐判不了（缺膝、踝）。这不是「没识别」，
-  // 而是信息不足——明确写出来，别让用户以为模型挂了。
-  const upperOnly = !!(sig && sig.ok && !Number.isFinite(sig.leg_vertical));
-  postureEl.textContent = act?.posture
-    || (sig ? (sig.ok ? (upperOnly ? '上半身' : '未判定') : '置信不足') : '—');
-  postureEl.classList.toggle('dim', !act?.posture);
+  // 当前静态姿态：站/坐/蹲下。信号面板移除后，单人模式没有别的地方显示 posture；
+  // 蹲下尤其需要可见（它依赖 3D 膝角，用户要能确认背影机位确实判出来了）。
+  const postureEl = $('badgePosture');
+  if (postureEl) {
+    const pid = act?.postureId;
+    postureEl.hidden = !pid;
+    if (pid) {
+      postureEl.textContent = ACTION_CATALOG.find((a) => a.id === pid)?.name || pid;
+      // 来源与数值都必须跟随「判定实际用的那条腿」：knee_pick 可能来自右腿
+      // （knee_side），蹲下用的也是单腿 leg_vertical_pick——背身远侧腿被挡时
+      // 两侧平均的 leg_vertical 常为 NaN，徽标恰恰在那种场景下会漏掉关键数值。
+      const kneeSide = sig?.knee_side === 'R' ? 'R' : 'L';
+      const knee = Number.isFinite(sig?.knee_pick) ? `膝 ${Math.round(sig.knee_pick)}°` : '膝角不可用';
+      const kneeSrc = sig?.angle_source?.[`knee_${kneeSide}`];
+      const src = kneeSrc === '3d' ? `3D·${kneeSide}` : kneeSrc === '2d' ? `2D·${kneeSide}` : '—';
+      const legV = Number.isFinite(sig?.leg_vertical_pick) ? sig.leg_vertical_pick : sig?.leg_vertical;
+      const legSide = sig?.leg_vertical_pick_side;
+      postureEl.title = `姿态：${postureEl.textContent}（${knee}，${src}`
+        + `${Number.isFinite(legV) ? `，腿竖直比 ${legV.toFixed(2)}${legSide ? `（${legSide} 腿）` : ''}` : ''}）`;
+    }
+  }
 
-  if (act?.posture) {
-    const secs = (act.postureMs / 1000).toFixed(1);
-    // 上半身姿态是「推断」：膝/踝不可见，只能看躯干朝向，不等于站/坐
-    const inferred = act.postureId === 'upper_upright' || act.postureId === 'upper_lean';
-    $('postureMeta').textContent = act.frozen
-      ? `保持 ${secs}s · 置信不足`
-      : `${inferred ? '仅上半身可见 · 推断 · ' : ''}持续 ${secs}s`;
-  } else if (sig && !sig.ok) {
-    $('postureMeta').textContent = `画面内置信 ${r2(sig.score)} · 人体太小/光线不足/被遮挡`;
-  } else if (upperOnly) {
-    $('postureMeta').textContent = '下半身不可见（出画/遮挡），站/坐无法判定';
-  } else {
-    $('postureMeta').textContent = sig ? '—'
-      : (mode === 'idle' ? '无画面' : mode === 'image' ? '—' : '等待下一帧');
+  // 人体朝向：背对/侧对相机时明确标出来。背身时头部几何不可信（yaw/pitch/roll 多为 null），
+  // 有这块提示才不会把「背对镜头」当成「模型坏了」。
+  const facingEl = $('badgeFacing');
+  if (facingEl) {
+    const b = sig?.body;
+    const on = !!(b && b.enabled !== false && b.facing && b.facing !== 'unknown');
+    facingEl.hidden = !on;
+    if (on) {
+      facingEl.textContent = bodyFacingText(b);
+      facingEl.classList.toggle('warn', b.facing === 'back');
+      const src = b.yaw_source === '3d' ? '3D 肩线'
+        : b.yaw_source === '2d' ? '2D 肩宽投影' : '无角度';
+      const conf = Number.isFinite(b.confidence) ? `，置信 ${b.confidence.toFixed(2)}` : '';
+      facingEl.title = `人体朝向：${bodyFacingText(b)}（${src}${conf}）`
+        + (b.facing === 'back' ? '；背身时头部朝向不可信，手臂「前方」用身体自身坐标' : '');
+    }
   }
 
   // 动作判不判得出来取决于运行条件（手部模型 / 3D / 设备 ROI/检测框是否配置），
@@ -2713,8 +2838,9 @@ function updateUI() {
   });
 
   for (const a of [...ARM_UI_ACTIONS, ...ARM_CONTEXT_ACTIONS]) {
-    const sel = a.context ? '#ctxActions' : '#armGrid';
-    const el = document.querySelector(`${sel} .act[data-id="${a.id}"]`);
+    const sel = a.context ? '#ctxActions'
+      : (CORE_ACTION_IDS.includes(a.id) ? '#coreActions' : '#armGrid');
+    const el = document.querySelector(`${sel} [data-id="${a.id}"]`);
     if (!el) continue;
     const hint = armHints.byId[a.id];
     const on = !!act?.flags?.[a.flag];
@@ -2752,47 +2878,14 @@ function updateUI() {
   $('handLCard').title = hl ? '' : noHandTitle;
   $('handRCard').title = hr ? '' : noHandTitle;
 
-  const fmt = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : '—');
-  const rows = [
-    // 头部朝向不依赖躯干/髋：设备特写、头~胸构图里姿态可能判不出来，但头还能判。
-    ['头部朝向', sig?.head ? headPoseText(sig.head) : null],
-    ['膝角 °', sig ? r1(sig.knee_pick) : null],
-    ['肘角 °', sig ? r1(sig.elbow_pick) : null],
-    ['抬臂角 L/R', sig ? `${fmt(sig.armPose.elev_L, 0)} / ${fmt(sig.armPose.elev_R, 0)}` : null],
-    // 3D 相对躯干的抬臂角：俯拍时以这一行为准（有 world 才显示数值）
-    ['抬臂角3D L/R', sig ? `${fmt(sig.armPose.elev_torso_L, 0)} / ${fmt(sig.armPose.elev_torso_R, 0)}` : null],
-    ['直立度', sig ? r2(sig.uprightness) : null],
-    ['腿竖直比', sig ? r2(sig.leg_vertical) : null],
-  ];
-  $('angles').innerHTML = rows
-    .map(([k, v]) => `<tr><td>${k}</td><td>${v === null || v === undefined ? '—' : v}</td></tr>`)
-    .join('');
-
-  // 下半身是否入镜：髋/膝/踝任一不可见就提示。用户据此知道该退后还是换机位，
-  // 而不是对着一个空姿态反复试。
-  const vis = sig?.vis;
-  const lowerHidden = !!vis && (vis.hip < 0.4 || vis.knee < 0.3 || vis.ankle < 0.3);
-  // 判定不可靠的原因：让用户知道这一帧别太当真，而不是把误判当成结论
-  const UNRELIABLE = {
-    low_confidence: '低置信', extrapolated: '外推',
-    bone_blocked: '骨骼异常', angle_outlier: '角度坏点',
-  };
-  const unrel = (act?.unreliable || []).map((r) => UNRELIABLE[r] || r);
-  const head = sig?.head;
-  const headShort = head?.visible && head.dir
-    ? `${HEAD_DIR_LABELS[head.dir] || head.dir}${Number.isFinite(head.yaw) ? `${head.yaw_approx ? '≈' : ''}${Math.abs(head.yaw).toFixed(0)}°` : ''}`
-    : '';
-  $('signalMeta').textContent = sig
-    ? `膝角取${sig.knee_side === 'L' ? '左' : '右'}腿 · 置信 ${r2(sig.score)}`
-      + `${lowerHidden ? ' · 下半身不可见' : ''}${headShort ? ` · 头部 ${headShort}（受试者方向）` : ''}`
-      + `${unrel.length ? ` · 不可靠：${unrel.join('/')}` : ''}`
-    : '—';
-
   if (act?.reps) renderReps(act.reps);
   // 拿取是「伸手 → 合手」两段，把当前阶段写出来，便于判断计数为什么没加
   $('repMeta').textContent = act
     ? `当前阶段 ${act.repPhase?.grasp || 'idle'}`
     : '—';
+
+  // 右侧触发框：当前触发动作 + 持续时间 + 最近几次已结束的触发
+  updateTriggerBox(act);
 
   // —— 人员列表（多人 / PPE）——
   // 只有开了多人或物体检测才显示：单人无 PPE 时这块没有信息量，显示出来只是噪声。
@@ -2816,8 +2909,9 @@ function updateUI() {
         else good.push('手套?');
       }
       const cls = bad.length ? 'warn' : (good.length ? 'ok' : '');
+      const face = facingWord(vd.sig);
       return `<div class="person"><span class="pid">#${vd.track_id}</span>`
-        + `<span class="pstate">${nameOf(vd.act?.postureId)}</span>`
+        + `<span class="pstate">${nameOf(vd.act?.postureId)}${face ? ` ${face}` : ''}</span>`
         + `<span class="pbadge ${cls}">${(bad.length ? bad : good).join(' · ') || '—'}</span></div>`;
     }).join('');
     $('peopleList').innerHTML = rows
@@ -2848,9 +2942,6 @@ function updateUI() {
   $('btnExport').disabled = !frameLog.length;
   $('btnClearLog').disabled = !frameLog.length;
   $('btnHardcase').disabled = !frameLog.length || !!hardcasePending;
-
-  // 曲线图例已有数值，这里给悬停说明当前门限与参数指纹
-  $('signalMeta').title = `参数指纹 ${activeParamsHash}`;
 
   syncPlayer();
 }
@@ -3127,20 +3218,31 @@ window.__pose = {
     }));
   },
   get ui() {
+    const acts = (sel) => [...document.querySelectorAll(sel)].map((el) => ({
+      id: el.dataset.id,
+      on: el.classList.contains('on'),
+      na: el.classList.contains('na'),
+    }));
     return {
-      posture: $('posture').textContent,
-      meta: $('postureMeta').textContent,
+      // 姿态面板与信号面板已从界面移除（设备作业场景只关注动作），
+      // 保留这两个键为 null，脚本报告里显示「—」而不是报错。
+      posture: null,
+      meta: null,
+      signalMeta: null,
       handMeta: $('handMeta').textContent,
       handL: $('handL').textContent,
       handR: $('handR').textContent,
       armHint: $('armHint').textContent,
       accuracyItems: document.querySelectorAll('#accList .acc-item').length,
       accuracyLoaded: !!accuracyReport,
-      signalMeta: $('signalMeta').textContent,
       repMeta: $('repMeta').textContent,
       logInfo: $('logInfo').textContent,
-      contextActions: [...document.querySelectorAll('#ctxActions .act')].map((el) => ({ id: el.dataset.id, on: el.classList.contains('on') })),
-      armActions: [...document.querySelectorAll('#armGrid .act')].map((el) => ({ id: el.dataset.id, on: el.classList.contains('on') })),
+      // 触发框（右侧文字）：当前触发动作与历史条数，脚本回放时用来断言
+      triggerNow: $('triggerNow').textContent.trim(),
+      triggerEvents: triggerTotal,
+      contextActions: acts('#ctxActions .act'),
+      // 含三张核心动作大卡：外部脚本按 id 找 operating/oil_sample/drain_sample
+      armActions: acts('#coreActions .core-act, #armGrid .act'),
     };
   },
   /**

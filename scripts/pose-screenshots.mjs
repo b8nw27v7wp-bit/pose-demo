@@ -123,8 +123,6 @@ const SNAPSHOT_EXPR = `(() => {
     tracks: st.tracks,
     verdicts: st.verdicts,
     status: (document.getElementById('status') || {}).textContent || '',
-    postureUi: ui.posture,
-    postureMeta: ui.meta,
     handMeta: ui.handMeta,
     handL: ui.handL,
     handR: ui.handR,
@@ -248,7 +246,7 @@ function mdReport(results, meta) {
     const s = r.state;
     const arms = (s.armsOn || []).join(', ') || '—';
     const key = [
-      `姿态 ${s.postureUi || '—'}`,
+      `姿态 ${s.last?.posture || '—'}`,
       `手臂 ${arms}`,
       s.multiOn ? `track ${s.tracks} / verdicts ${(s.last?.verdicts || []).length}` : '',
       s.last?.time != null ? `t=${s.last.time.toFixed(2)}s` : '',
@@ -266,7 +264,7 @@ function mdReport(results, meta) {
     lines.push(`- 素材：${r.source}`);
     lines.push(`- 用时：${(r.elapsedMs / 1000).toFixed(1)}s`);
     lines.push(`- 结果：${r.pass ? 'PASS' : 'FAIL'}（等待条件 ${r.ready ? '已满足' : '超时'}）`);
-    lines.push(`- 姿态：${s.postureUi || '—'} / 判定 id：${s.last?.posture || '—'}；meta：${s.postureMeta || '—'}`);
+    lines.push(`- 姿态判定 id：${s.last?.posture || '—'}（姿态/信号面板已从界面移除，信号见下方「信号」行）`);
     lines.push(`- 手臂动作：${(s.armsOn || []).join(', ') || '—'}；不可判：${(s.armsNa || []).join(', ') || '—'}`);
     lines.push(`- 手势：左手 ${s.handL || '—'}；右手 ${s.handR || '—'}；提示：${s.armHint || '—'}`);
     const v = s.last?.verdicts || [];
@@ -299,7 +297,7 @@ async function main() {
       try {
         const r = await runCase(cdp, c, errMark);
         results.push(r);
-        console.log(`${r.pass ? 'PASS' : 'FAIL'} · 姿态 ${r.state.postureUi} · 手臂 ${(r.state.armsOn || []).join(',') || '—'} · ${(r.elapsedMs / 1000).toFixed(1)}s`);
+        console.log(`${r.pass ? 'PASS' : 'FAIL'} · 姿态 ${r.state.last?.posture || '—'} · 手臂 ${(r.state.armsOn || []).join(',') || '—'} · ${(r.elapsedMs / 1000).toFixed(1)}s`);
       } catch (e) {
         results.push({
           id: c.id, title: c.title, source: c.url, screenshot: null,

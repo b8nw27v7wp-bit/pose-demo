@@ -839,6 +839,9 @@ const SIGNAL_GETTERS = {
   elbow: (s) => s.elbow_pick,
   uprightness: (s) => s.uprightness,
   leg_vertical: (s) => s.leg_vertical,
+  // 蹲下实际用的是单腿竖直延伸（背身远侧腿常被挡）；两侧平均的 leg_vertical 只在 pick 缺失时兜底
+  leg_vertical_pick: (s) => s.leg_vertical_pick,
+  hip_knee_drop: (s) => s.hip_knee_drop,
   elev_L: (s) => s.armPose.elev_L,
   elev_R: (s) => s.armPose.elev_R,
   elev_torso_L: (s) => s.armPose.elev_torso_L,
@@ -849,6 +852,10 @@ const SIGNAL_GETTERS = {
   reach_head_R: (s) => s.armPose.reach_head_R,
   azimuth_L: (s) => s.armPose.azimuth_L,
   azimuth_R: (s) => s.armPose.azimuth_R,
+  // 受试者自身方位角（0°=身体前方）：背身/侧身时油样取样「手在身前」看的是这一对
+  azimuth_body_L: (s) => s.armPose.azimuth_body_L,
+  azimuth_body_R: (s) => s.armPose.azimuth_body_R,
+  body_yaw: (s) => s.body?.yaw,
   hands_close: (s) => s.armPose.hands_close,
   near_equipment_overlap: (s) => s.arm.near_equipment_overlap,
   wave_flips: (s) => Math.max(s.wave.L, s.wave.R),
@@ -859,6 +866,9 @@ const SIGNAL_GETTERS = {
 const SIGNALS_FOR = {
   stand: ['uprightness', 'knee', 'leg_vertical'],
   sit: ['knee', 'uprightness', 'leg_vertical'],
+  // 蹲下：膝角（3D 优先）+ 单腿竖直延伸；背身时 2D 膝角会被压扁，失败区间里要能看出
+  // 是 3D 没进来还是深度不够（hip_knee_drop）。leg_vertical 只作 pick 缺失时的兜底列。
+  crouch: ['knee', 'uprightness', 'leg_vertical_pick', 'leg_vertical', 'hip_knee_drop'],
   // 上半身姿态只凭躯干朝向判；没有腿证据，所以只看 uprightness。
   upper_upright: ['uprightness'],
   upper_lean: ['uprightness'],
@@ -869,14 +879,15 @@ const SIGNALS_FOR = {
   onHips: ['reach_L', 'reach_R', 'hands_close'],
   armsOpen: ['elev_L', 'elev_R', 'reach_L', 'reach_R'],
   handAtHead: ['reach_head_L', 'reach_head_R'],
-  // 油样取样：腕-鼻距离 + 3D 方位角（无 3D 时方位角为 NaN，退化成纯距离）
-  oilSample: ['reach_head_L', 'reach_head_R', 'azimuth_L', 'azimuth_R'],
+  // 油样取样：腕-鼻距离 + 3D 方位角（无 3D 时方位角为 NaN，退化成纯距离）。
+  // 朝向门用的是受试者自身方位角（body_yaw 换算），背身/侧身时与相机方位角不同。
+  oilSample: ['reach_head_L', 'reach_head_R', 'azimuth_body_L', 'azimuth_body_R', 'body_yaw'],
   // §12.7：这 5 个动作靠「臂是否伸出 + 抬臂角/方位角」判定；手部开合状态不在信号层，
   // 但漏判时看这几列仍能判断是信号没到阈值还是手部没检出。
   reaching: ['reach_L', 'reach_R', 'elev_L', 'elev_R'],
   carrying: ['reach_L', 'reach_R'],
-  pointing: ['reach_L', 'reach_R', 'elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
-  armFront: ['elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
+  pointing: ['reach_L', 'reach_R', 'elev_torso_L', 'elev_torso_R', 'azimuth_body_L', 'azimuth_body_R'],
+  armFront: ['elev_torso_L', 'elev_torso_R', 'azimuth_body_L', 'azimuth_body_R'],
   armSide: ['elev_torso_L', 'elev_torso_R', 'azimuth_L', 'azimuth_R'],
   // 操作设备：ROI/设备框命中不是标量信号，失败时先用 reach/elev 判断「手是否伸出/抬高」；
   // 具体 gate（not_near/no_grip/...）仍在导出帧的 signals.operating_gate* 里。
@@ -1619,6 +1630,9 @@ export function fitThresholds(labelsByClip, timelines, framesByClip) {
     // §12.7：前/侧平举的方位角阈值靠这一列拟合（只在手臂接近水平时有意义）
     azimuth_L: (s) => s.armPose.azimuth_L,
     azimuth_R: (s) => s.armPose.azimuth_R,
+    // 身体方位角：背身/侧身的「手在身体前方」阈值（油样取样）按这一列拟合
+    azimuth_body_L: (s) => s.armPose.azimuth_body_L,
+    azimuth_body_R: (s) => s.armPose.azimuth_body_R,
     hands_close: (s) => s.armPose.hands_close,
   };
 

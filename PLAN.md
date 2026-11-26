@@ -645,7 +645,7 @@ MediaPipe `worldLandmarks` 实测：33 点、米制、**原点在髋中心**、y
 | 手在头部 | `reach_head_L/R`（腕到鼻尖 / scale）+ 腕不低于肩的门控 | 新增「扶额/摸头」类信号；门控排除走路时手臂前摆经过脸前 |
 | 双手高举 | `bothHandsUp`：两侧都举起才算 | 与单臂举手区分（欢呼 vs 挥手示意） |
 | 叉腰判据 | 腕贴髋 **且肘外张**（肘到肩-髋连线的横向偏移 > 0.22·scale） | **真 bug**：自然下垂的手会被判成叉腰（实测腕距髋仅 0.19·scale） |
-| 手势去抖 | `HandShapeStabilizer`：连续 3 帧才切换，判不出保留 250ms | §12.1 的「手势偶尔串」「张开→剪刀手」 |
+| 手势去抖 | `HandShapeStabilizer`：同一手势累计 3 次命中才切换（`unknown` 在 `keepMs` 内跳过），判不出保留 250ms | §12.1 的「手势偶尔串」「张开→剪刀手」 |
 | 新手势 | 手枪（拇指+食指）、摇滚（食指+小指） | 扩展动作字典 |
 | 手部朝向 | `orient.facing = front/edge`（掌宽/掌长） | 手掌侧对时手势本就不可靠；UI 用虚线边框明示「别信这个」 |
 | 手指张开度 | `spread`：食指与小指指尖的扇开夹角 | 辅助信息，**不参与判定**（单靠它分不开「张开」和「并拢前伸」） |
@@ -1685,7 +1685,7 @@ R12-2 的遗留：ROI 预算按「人数」而非推理次数计（2 人各缺�
 - **确定性回放**：`scripts/deterministic-replay.mjs`（`?det=1` + 媒体时间 ts + 固定 seek），
   同一素材两次回放逐帧 sha256 一致；`confirmRate` 口径改为 `confirmedWithRawFrames/rawFrames`。
 - **切片与整段识别**：`scripts/slice-video.py`、`scripts/clip-recognition.mjs`、
-  `scripts/pose-screenshots.mjs`；R1–R11 审查修复已合入（报告在 `docs/code-review-2026-11-12.md`）。
+  `scripts/pose-screenshots.mjs`；R1–R11 审查修复已合入（审核报告已删除，细节见提交历史）。
 - **新素材接入文档**：`docs/annotation-kit.md`（ROI 重画、接触表、operating/near_equipment 标注口径）。
 - **人物有效性门（2026-11-17 工作区改动）**：`perception.personGate` 默认开。低清晰度特写里
   「手 + 取样管」被 MediaPipe 补成「人」时，用两道几何门剔除：bbox 过窄/躯干长超过框高/
@@ -1723,10 +1723,32 @@ R12-2 的遗留：ROI 预算按「人数」而非推理次数计（2 人各缺�
 - `headless-ppe-onnx` 仍受本机缺 `eval-data/ppe-yolo/images/val` 阻塞；`npm run shots` 与
   `mot17-eval` 在接手轮各跑过（mot17 仅用于 maxLostMs A/B，结果见 §19.2）。
 
-### 19.4 本轮配套
+### 19.4 审核记录的去向
 
-- 代码审核报告：`docs/code-review-2026-11-17.md`
-- 接手轮（C3~C8）记录：`docs/round2-2026-11-17.md`
+审核/接手报告（`docs/code-review-*.md`、`docs/round2-*.md`）已在 2026-11-26 清理，
+结论按「已修 / 未处理」并入本节：
+
+- 2026-11-12、p0-p1-2026-11-12、drain-sample-2026-11-18、2026-11-26 的发现已全部修复，
+  细节见代码、测试与提交历史；
+- 2026-11-17 的 C3~C8 处理结果见 §19.2，未处理项见 §19.3；
+- 2026-11-20 的 U-1~U-7（未验证的代码观察）见 §19.5；
+- 2026-11-26 的设计风险（3D yaw 未平滑、crouch 腿竖直比按 2D 标定、低帧率下的 keepMs）
+  已写进 `docs/signals.md` 对应小节。
+
+### 19.5 迁移：2026-11-20 审核的未验证代码观察
+
+原 `docs/code-review-2026-11-20.md` 已删除。下面 7 条当时**没有下结论**，后续轮次也未复核；
+动之前先按当前代码确认是否仍成立（不能直接当 bug 清单）。行号是审核当时的位置。
+
+| # | 位置 | 观察 |
+|---|---|---|
+| U-1 | `scripts/deterministic-replay.mjs:190` | 用已弃用的 `Page.setDownloadBehavior` 且 `.catch(()=>{})`；若 Chrome 不再支持，导出落默认目录，30s 后只报「没拿到 JSONL」。`clip-recognition` 用的是 `Browser.setDownloadBehavior` |
+| U-2 | `scripts/slice-video.py:157` | 依赖 seek 后的 `CAP_PROP_POS_MSEC`；个别容器恒 0 时会写满到文件尾（有 `written==0` 守卫，没有上限守卫） |
+| U-3 | `web/test/mot17-eval.mjs:239` | `seqinfo.ini` 缺失时 `imageSize` 为 0×0，gt 裁剪被静默关闭 |
+| U-4 | `web/test/cdp.mjs` | WebSocket 断开/浏览器崩溃时 `CDP.send` 的 Promise 可能永不 settle，脚本挂起 |
+| U-5 | `web/test/signal-compare.mjs` | 无 `video_time` 或循环导出时按 `t0 + sec*1000` 取样，录制起点不在 0s 时区间整体偏移 |
+| U-6 | `web/js/geometry.js:404` | `drawMinTorsoDrop=0` 在俯拍/深弯腰（髋高于肩）时会隐藏真人骨架；文档只讨论了误检，未覆盖这种机位 |
+| U-7 | `web/js/signals.js` head | `use3d` 实际依赖 `signals.world.enabled`；两者不一致时静默退回 2D，`validateParams` 不提示 |
 
 ---
 

@@ -40,6 +40,12 @@
     "leg_vertical": 1.29,           // 踝中点在髋中点下方的距离 / scale
     "leg_vertical_2d": 1.29,
     "leg_vertical_3d": 1.91,        // 注意：3D 用 scale_world，量纲与 2D 不同
+    // 单腿竖直延伸（可见性更高的一条腿）：背身时远侧腿常被近侧腿挡住，
+    // 蹲下姿态用它；stand/sit 仍用两侧平均的 leg_vertical。
+    "leg_vertical_pick": 1.33, "leg_vertical_pick_side": "R",
+    // 髋-膝高度差 / 躯干长：正=髋在膝下方（蹲），负=髋在膝上方（站/跪）。
+    // 蹲下姿态用它排除单膝跪地/弓步；3D 优先（背身时 2D 投影更容易骗人）。
+    "hip_knee_drop": -0.42, "hip_knee_drop_2d": -0.42, "hip_knee_drop_3d": -0.4,
     "scale_world": 0.48,            // 世界躯干长（米）
     "legs_visible": true,           // 膝角与腿竖直比是否都有值（false = 站/坐不可判）
     "upper_body": false,            // 肩+髋可信、腿不足：动作层据此判上半身直立/前倾
@@ -47,6 +53,21 @@
     "angle_source": { "knee_L": "3d", "knee_R": "3d", "elbow_L": "2d", "...": "..." },
     "extrapolated": [],             // 本帧按最后速度外推的点
     "bones_ok": { "foreArm_L": true, "thigh_R": false, "...": true },
+    // 手臂方位角（3D）：azimuth_* 是相机口径（0°=朝镜头，±180°=远离镜头）；
+    // azimuth_body_* 是受试者自身口径（0°=身体前方）= azimuth − body.yaw。
+    // 背对/侧对相机时两者相差一个朝向；油样取样、背身的前伸/指向看后一对。
+    "azimuth_L": -12.0, "azimuth_R": 90.0,
+    "azimuth_body_L": -12.0, "azimuth_body_R": 90.0,
+    "azimuth_body_source": "3d",       // 3d|2d|null
+    "arm_front_body_L": true, "arm_front_body_R": false, // 前平举/指向用身体口径；无朝向时等于相机口径
+    // 人体朝向：只看肩线/躯干（不看脸）。facing 去抖后状态，facing_raw 本帧原始分类；
+    // yaw：0=正对镜头，±180=背对，正=面向画面右。旧导出没有这个字段。
+    "body": {
+      "enabled": true, "facing": "back", "facing_raw": "back",
+      "yaw": 176.3, "yaw_source": "3d", "confidence": 0.89,
+      "side": null, "shoulder_ratio": 0.21, "width_ratio": 0.57,
+      "reasons": []
+    },
     // 操作设备：ROI 是否配置 + 手/肘判据的逐侧原始布尔（动作层的 operating 还要过 800ms 保持窗；
     // refuel profile 覆盖为 1500ms）
     "operating_roi": true,
@@ -88,7 +109,7 @@
     }
   },
   "actions": {                      // 规则层输出
-    "posture": "stand",             // stand|sit|upper_upright|upper_lean；连髋都不可见时为 null。躺卧/下蹲已下线
+    "posture": "stand",             // stand|sit|crouch|upper_upright|upper_lean；腿/髋证据不足时为 null。躺卧已下线
     "flags": {
       "armRaised": false, "bothHandsUp": false, "waving": false, "crossed": false,
       "onHips": false, "armsOpen": false, "handAtHead": false, "oilSample": false,
@@ -140,6 +161,8 @@
       "track_uid": 7,               // 可选：与 persons[] 同源，原样透传；缺失表示导出侧还没有 uid
       "bbox": [20.2, 333, 101.9, 737],
       "posture": "stand",
+      "body_facing": "back",        // 可选：该 track 的人体朝向（signals.body 只描述主目标）
+      "body_yaw": 176.3,            // 可选：0=正对镜头，±180=背对
       "frozen": false,
       "flags": { "armRaised": false, "...": false },
       "reps": { "clap": 0, "grasp": 0 },   // 深蹲/俯卧撑计数已下线
@@ -173,8 +196,9 @@
 > `hands[].shape` 是**稳定后**的结果，动作层（以及离线 `replay`）看到的就是它；
 > `shape_raw` 保留逐帧分类，用于复查稳定器是否把结果拖慢。
 > 手势去抖（`HandShapeStabilizer`）按 `track_id` 隔离：每一帧先把手归属到人，再推进
-> 该 track 自己的 L/R/U 稳定器，避免 A 的连续手势把 B 的候选计数带满（R12-2）。
-> 单人道固定用 track 0，结果与旧版逐位一致；多人时未归属到任何人的手只有 `shape_raw`，
+> 该 track 自己的 L/R/U 稳定器，避免 A 的手势把 B 的候选计数带满（R12-2）。
+> 单人道固定用 track 0，**路由**与「一套全局稳定器」逐位等价；稳定器自身的判定口径（`unknown`
+> 在 `keepMs` 内跳过、超时整体过期）见 `docs/signals.md`。多人时未归属到任何人的手只有 `shape_raw`，
 > `shape` 不做去抖（它们不进任何人的动作层）。
 > `unknown` 表示判不出来，不是「张开」。动作层按 `signals.hand.openShapes` /
 > `pointShapes` / `closedShapes` 分组判定：伸手只认 `open`，指向只认 `pointing` / `gun`，
@@ -219,11 +243,29 @@
 | kp_format | 点数 | 来源 | 状态 |
 |---|---|---|---|
 | `mediapipe33` | 33（内部取 13） | MediaPipe PoseLandmarker | **已实现**，浏览器 Demo 默认 |
+| `mediapipe21` | 21 | MediaPipe HandLandmarker | **已实现**，`hands[].kp`（21×[x,y] 帧像素，无逐点置信度） |
 | `coco17` | 17 | RTMPose / ViTPose | 计划中（`kpt.js` 尚无映射表） |
 | `halpe26` | 26 | RTMPose Halpe | 计划中（含颈、髋，判弯腰更好） |
 
 内部统一骨架 = `KPT` 的 13 点（COCO-17 子集）：鼻、双肩、双肘、双腕、双髋、双膝、双踝。
 新增格式时在 `kpt.js` 的 `MP_INDEX` 旁加一张映射表即可。
+
+## 手部关键点真值（可选，`handkp-gt v0`）
+
+`web/test/handkp-eval.mjs --gt` 接受手部 21 点真值，用于 PCK/MPJPE；本轮未采集。
+没有这个文件时，评测器只报无真值代理指标（见 `docs/signals.md`「手部关键点质量」）。
+
+```json
+{
+  "schema": "handkp-gt v0",
+  "hands": [
+    { "t": 1.25, "side": "Right", "kp": [[x, y], "...共 21 点，帧像素"] }
+  ]
+}
+```
+
+- `t`：秒（与 labels 的 `startSec` 同基）；`side`：`Left|Right|L|R`；`kp`：21 点帧像素、MediaPipe 顺序。
+- 归一化用 **GT 自己的**手尺度 `‖kp[0]−kp[9]‖`；PCK 阈值写成 α·scale，避免预测尺度错被自洽掩盖。
 
 ## 记录与导出
 

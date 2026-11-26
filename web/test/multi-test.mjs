@@ -536,8 +536,10 @@ console.log('\n[6d] 逐 track 手势稳定器');
     shared.forTrack(0).L.last);
 
   // 分类后的对象要回填到槽位，PersonPipelines 才能读到 hands.L.cls.shape
+  // 时间戳要紧跟上一次 update（上一步最后一帧 ts=29×33=957ms）：稳定器按 keepMs
+  // （250ms）过期，隔 4 秒再推帧会先清成 unknown，这里测的是槽位回填而不是过期。
   const assigned = new Map([[1, { L: a, R: null, list: [a] }], [2, { L: b, R: null, list: [b] }]]);
-  const cls = classifyHandsByTrack([a, b], 5000, st, (hd) => hd.track, fake);
+  const cls = classifyHandsByTrack([a, b], 1000, st, (hd) => hd.track, fake);
   const bound = bindClassifiedHands(assigned, cls.byOriginal);
   check('槽位结构 {L,R,list} 不变且带 cls.shape',
     bound.get(1).L.cls.shape === 'fist' && bound.get(2).L.cls.shape === 'open'
@@ -549,19 +551,20 @@ console.log('\n[6d] 逐 track 手势稳定器');
   const fresh = st.forTrack(2);
   check('prune 后再出现是同 track 的全新状态', fresh.L.last === 'unknown');
 
-  // 单人道：ownerOf 恒为 0 时，结果与「一套全局稳定器」逐帧一致（回归）
+  // 单人道：ownerOf 恒为 0 时，逐帧**路由**结果与「直接喂同一 track 的稳定器」一致（回归）。
+  // 这只验证路由等价，不代表稳定器行为没变——判定口径由 logic-test [19]/[21] 覆盖。
   const singleNew = new TrackShapeStabilizers({ streak: 3, keepMs: 250 });
-  const singleOld = new TrackShapeStabilizers({ streak: 3, keepMs: 250 });
+  const singleDirect = new TrackShapeStabilizers({ streak: 3, keepMs: 250 });
   const seq = ['fist', 'fist', 'open', 'fist', 'unknown', 'open', 'open', 'open'];
   let same = true;
   seq.forEach((shape, i) => {
     const hd = hand(0, shape);
     const got = classifyHandsByTrack([hd], i * 100, singleNew, () => 0, fake).list[0].cls.shape;
-    // 旧实现等价于「直接把这个 track 的稳定器喂一遍」
-    const oldShape = singleOld.forTrack(0).L.update(shape, i * 100);
-    if (got !== oldShape) same = false;
+    // 等价于「直接把这个 track 的稳定器喂一遍」
+    const directShape = singleDirect.forTrack(0).L.update(shape, i * 100);
+    if (got !== directShape) same = false;
   });
-  check('单人（track 0）分类与旧实现逐帧一致', same);
+  check('单人（track 0）路由与直接喂稳定器逐帧一致', same);
 }
 
 // —— 6e. 多人 ROI 预算 ——

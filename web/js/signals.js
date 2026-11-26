@@ -11,6 +11,7 @@ import {
 } from './geometry.js';
 import { EquipmentBoxTracker } from './equipment.js';
 import { headPose, headDirection, headDirWord, DirectionHold } from './headpose.js';
+import { bodyFacing } from './bodyfacing.js';
 
 // MediaPipe worldLandmarks：米制、原点在髋中心、**y 向下为正**（docs/signals.md §一·五）。
 // 重力方向向量因此是 [0,1,0]；「竖直向上」是 [0,-1,0]。
@@ -36,6 +37,13 @@ const finite3 = (p) => Array.isArray(p)
 const v3sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const v3norm = (a) => Math.hypot(a[0], a[1], a[2]);
 const v3mid = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+/** 角度归一到 (-180, 180]。用于把相机方位角换算成受试者自身方位。 */
+const norm180 = (a) => {
+  let v = a % 360;
+  if (v > 180) v -= 360;
+  else if (v <= -180) v += 360;
+  return v;
+};
 
 function median(values) {
   const s = [...values].sort((a, b) => a - b);
@@ -499,6 +507,10 @@ export class SignalEngine {
     this.headCfg = p.head || {};
     this.headPrev = { yawDir: null, pitchDir: null };
     this.headDirHold = new DirectionHold();
+    // 人体朝向（正面/背面/侧对）：只看肩线/躯干，不看脸。背对相机时用来把
+    // 相机方位角换算成受试者自身方位（油样取样「手在身体前方」、背身的前伸/指向）。
+    this.bodyFacingCfg = p.bodyFacing || {};
+    this.bodyFacingHold = new DirectionHold();
   }
 
   reset() {
@@ -522,6 +534,7 @@ export class SignalEngine {
     this.boneGuard.reset();
     this.headPrev = { yawDir: null, pitchDir: null };
     this.headDirHold.reset();
+    this.bodyFacingHold.reset();
   }
 
   /**
@@ -729,6 +742,28 @@ export class SignalEngine {
       };
     }
 
+    // —— 人体朝向：正面/背面/侧对 ——
+    // 只吃肩线/躯干（3D 优先，2D 退回），不看脸：背对相机时 MediaPipe 仍可能给
+    // 高可见度的鼻/眼点，头部几何不可信（see headpose.js 的门控）。
+    let body = {
+      enabled: false, facing: 'unknown', facing_raw: 'unknown',
+      yaw: null, yaw_source: null, confidence: 0,
+      side: null, shoulder_ratio: null, width_ratio: null, reasons: [],
+    };
+    if (this.bodyFacingCfg.enabled !== false) {
+      // 2D 侧对判据要的是「躯干长」尺度。髋不可见时 scale 会退回「肩宽 × 1.4」——
+      // 用肩宽去除肩宽是循环论证（比值恒 ≈0.71，侧对被判成正/背面）。这种情况把
+      // scale 传 null，让 bodyFacing 明确给 unknown；3D 肩线不受影响。
+      const bodyScale = visHip >= this.minTorsoVis ? scale : null;
+      const raw = bodyFacing(kp, w3, { ...this.bodyFacingCfg, scale: bodyScale });
+      // 朝向状态去抖只影响 UI/导出；yaw 本身仍是原始值（下游按连续角换算方位）。
+      const held = this.bodyFacingHold.update(
+        'facing', raw.facing, tSec,
+        Number.isFinite(this.bodyFacingCfg.holdMs) ? this.bodyFacingCfg.holdMs : 200,
+      );
+      body = { enabled: true, ...raw, facing: held, facing_raw: raw.facing };
+    }
+
     // 直立度：优先用躯干轴（髋中点→肩中点），四点都得够可见（单点飘了，中点就在乱动）。
     // 上半身构图里髋不可见时退回「鼻尖→肩中点」：直立/端坐时鼻在肩上方，躺卧时两者接近水平，
     // 与躯干轴同向、同量纲。两条轴各自滤波，切换时不会出现台阶。
@@ -776,6 +811,72 @@ export class SignalEngine {
       if (Number.isFinite(raw)) leg3d = raw;
     }
     const legVertical = (WC.legVertical && Number.isFinite(leg3d)) ? leg3d : leg2d;
+
+    // 单腿竖直延伸（2D）：背身时远侧腿常被近侧腿挡住，两侧取平均会因为「min 可见性」
+    // 直接失效。蹲下姿态用可见性更高的一条腿；stand/sit 仍用两侧平均的 leg_vertical。
+    const legSide2d = (s) => {
+      if ((V(`ankle_${s}`) ?? 0) < VIS_MIN || (V(`hip_${s}`) ?? 0) < VIS_MIN) return NaN;
+      return (P(`ankle_${s}`)[1] - P(`hip_${s}`)[1]) / scale;
+    };
+    const legL2 = legSide2d('L'); const legR2 = legSide2d('R');
+    let legVerticalPick = NaN;
+    let legPickSide = null;
+    if (Number.isFinite(legL2) || Number.isFinite(legR2)) {
+      legPickSide = (!Number.isFinite(legR2)
+        || (Number.isFinite(legL2) && V('ankle_L') >= V('ankle_R'))) ? 'L' : 'R';
+      legVerticalPick = legPickSide === 'L' ? legL2 : legR2;
+    }
+
+    // 髋相对膝的高度（髋在膝下方为正，单位躯干长）：蹲下的深度信号，也用来排除
+    // 单膝跪地/弓步（髋远高于膝）。世界坐标 z/x 不影响重力轴投影，背身机位同样可算。
+    // 两侧都可见时用中点，否则退回可见性更高的一条腿（与 leg_vertical_pick 同口径）。
+    const visKnee = Math.min(V('knee_L'), V('knee_R'));
+    let hipKnee2d = NaN;
+    if (visHip >= VIS_MIN && visKnee >= VIS_MIN) {
+      const kneeMid2 = mid(P('knee_L'), P('knee_R'));
+      hipKnee2d = (hipMid[1] - kneeMid2[1]) / scale;
+    }
+    const hipKneeSide2d = (s) => {
+      if ((V(`hip_${s}`) ?? 0) < VIS_MIN || (V(`knee_${s}`) ?? 0) < VIS_MIN) return NaN;
+      return (P(`hip_${s}`)[1] - P(`knee_${s}`)[1]) / scale;
+    };
+    if (!Number.isFinite(hipKnee2d)) {
+      const hkL2 = hipKneeSide2d('L'); const hkR2 = hipKneeSide2d('R');
+      if (Number.isFinite(hkL2) || Number.isFinite(hkR2)) {
+        hipKnee2d = (!Number.isFinite(hkR2)
+          || (Number.isFinite(hkL2) && V('knee_L') >= V('knee_R'))) ? hkL2 : hkR2;
+      }
+    }
+    let hipKnee3d = NaN;
+    if (w3 && hipMidW && Number.isFinite(scaleWorld) && scaleWorld > 1e-6
+      && visKnee >= VIS_MIN && legOk('L') && legOk('R')) {
+      const kLW = Wp('knee_L'); const kRW = Wp('knee_R');
+      if (finite3(kLW) && finite3(kRW)) {
+        const kneeMidW = v3mid(kLW, kRW);
+        const drop = (hipMidW[0] - kneeMidW[0]) * GRAVITY_DOWN[0]
+          + (hipMidW[1] - kneeMidW[1]) * GRAVITY_DOWN[1]
+          + (hipMidW[2] - kneeMidW[2]) * GRAVITY_DOWN[2];
+        const raw = drop / scaleWorld;
+        if (Number.isFinite(raw)) hipKnee3d = raw;
+      }
+    }
+    if (!Number.isFinite(hipKnee3d) && w3 && Number.isFinite(scaleWorld) && scaleWorld > 1e-6) {
+      const hipKneeSide3d = (s) => {
+        if (!legOk(s) || (V(`knee_${s}`) ?? 0) < VIS_MIN) return NaN;
+        const h = Wp(`hip_${s}`); const k = Wp(`knee_${s}`);
+        if (!finite3(h) || !finite3(k)) return NaN;
+        const drop = (h[0] - k[0]) * GRAVITY_DOWN[0]
+          + (h[1] - k[1]) * GRAVITY_DOWN[1]
+          + (h[2] - k[2]) * GRAVITY_DOWN[2];
+        return drop / scaleWorld;
+      };
+      const hkL3 = hipKneeSide3d('L'); const hkR3 = hipKneeSide3d('R');
+      if (Number.isFinite(hkL3) || Number.isFinite(hkR3)) {
+        hipKnee3d = (!Number.isFinite(hkR3)
+          || (Number.isFinite(hkL3) && V('knee_L') >= V('knee_R'))) ? hkL3 : hkR3;
+      }
+    }
+    const hipKneeDrop = Number.isFinite(hipKnee3d) ? hipKnee3d : hipKnee2d;
 
     // —— 关节角：有 world 用 3D，无则退回 2D ——
     const raw2d = {
@@ -1215,7 +1316,7 @@ export class SignalEngine {
     const extendedR = Number.isFinite(reachR) && reachR > extendCfg.minReach && elevR > extendCfg.minElev;
 
     // 3D 水平方位角：肩→腕在水平面上的朝向。0°=正前方（朝镜头），±180°=正后方。
-    // 世界坐标 z 轴指向屏幕内，所以 atan2(x, -z) 得到「相对身体正前方」的偏角。
+    // 世界坐标 z 轴指向屏幕内，所以 atan2(x, -z) 得到「相对相机正前方」的偏角。
     let azimL = NaN, azimR = NaN;
     if (w3) {
       const azimuth = (sh, wr) => {
@@ -1226,18 +1327,35 @@ export class SignalEngine {
       if (visWristL >= VIS_MIN) azimL = azimuth(Wp('shoulder_L'), Wp('wrist_L'));
       if (visWristR >= VIS_MIN) azimR = azimuth(Wp('shoulder_R'), Wp('wrist_R'));
     }
+    // 受试者自身方位角 = 相机方位角 − 人体朝向 yaw。背对相机时「身体前方」在相机坐标
+    // 里是 ±180°，原来的相机方位角会把「手在身前」判成「手在身后」（反之亦然）。
+    // 没有可信 yaw 时保持 NaN，下游退回相机方位角（与旧行为一致）。
+    // 置信度不足的朝向只做 UI/导出，不拿去旋转方位角（坏肩线会把「身前」转到任意方向）。
+    const bodyYawOk = Number.isFinite(body.yaw)
+      && body.confidence >= (Number.isFinite(this.bodyFacingCfg.minConfidence)
+        ? this.bodyFacingCfg.minConfidence : 0.35);
+    const bodyYaw = bodyYawOk ? body.yaw : null;
+    const azimBodyOf = (a) => (bodyYaw != null && Number.isFinite(a) ? norm180(a - bodyYaw) : NaN);
+    const azimBodyL = azimBodyOf(azimL);
+    const azimBodyR = azimBodyOf(azimR);
+    /** 「前方」判据优先用受试者自身方位；没有人体朝向时退回相机方位。 */
+    const azimForBody = (azimCam, azimBody) => (Number.isFinite(azimBody) ? azimBody : azimCam);
+
     // —— 油样取样（举瓶到眼前对光检查）——
     // 复用 head 的距离判据（腕-鼻尖 < maxHeadDist 且不明显低于肩），再加一道
     // 「手在身体前方」：摸头/扶眼镜是从侧后方靠近，方位角偏大；取样是对着光看，手在面前。
-    // 没有 3D 时方位角是 NaN，此时只按距离判——与 hand_head 同口径，少一层区分度，
-    // 但不会把整个动作判掉（公开素材多为手持近景，3D 时有时无）。
+    // 背身/侧身时用受试者自身方位（见上）；没有 3D 时方位角是 NaN，此时只按距离判——
+    // 与 hand_head 同口径，少一层区分度，但不会把整个动作判掉（公开素材多为手持近景，3D 时有时无）。
     const sampleCfg = C.arm.sampling;
-    const sampleSide = (reachHead, azim, wr, sh) => Number.isFinite(reachHead)
-      && reachHead < sampleCfg.maxHeadDist
-      && wr[1] < sh[1] + C.arm.head.aboveShoulder * scale
-      && (!Number.isFinite(azim) || Math.abs(azim) <= sampleCfg.maxAzimuth);
-    const sampleL = sampleSide(reachHeadL, azimL, wristL, shL);
-    const sampleR = sampleSide(reachHeadR, azimR, wristR, shR);
+    const sampleSide = (reachHead, azim, azimBody, wr, sh) => {
+      const az = azimForBody(azim, azimBody);
+      return Number.isFinite(reachHead)
+        && reachHead < sampleCfg.maxHeadDist
+        && wr[1] < sh[1] + C.arm.head.aboveShoulder * scale
+        && (!Number.isFinite(az) || Math.abs(az) <= sampleCfg.maxAzimuth);
+    };
+    const sampleL = sampleSide(reachHeadL, azimL, azimBodyL, wristL, shL);
+    const sampleR = sampleSide(reachHeadR, azimR, azimBodyR, wristR, shR);
 
     const azimCfg = C.arm.azimuth;
     // 方位角只在手臂接近水平时才有意义：自然下垂时水平分量≈0，atan2 出来的是噪声。
@@ -1262,6 +1380,16 @@ export class SignalEngine {
     const armSideL = horizontal(elevTorsoL) && Math.abs(azimL) > azimCfg.sideMin
       && wristAtShoulder(shL, wristL) && armStraight('L');
     const armSideR = horizontal(elevTorsoR) && Math.abs(azimR) > azimCfg.sideMin
+      && wristAtShoulder(shR, wristR) && armStraight('R');
+    // 「受试者自身前方」的前平举：背对相机时前进方向与相机前方相反，用 azim_body。
+    // 侧平举左右对称，不需要这一份。无人体朝向时与相机版本逐位相同。
+    const azimFrontL = azimForBody(azimL, azimBodyL);
+    const azimFrontR = azimForBody(azimR, azimBodyR);
+    const armFrontBodyL = horizontal(elevTorsoL) && Number.isFinite(azimFrontL)
+      && Math.abs(azimFrontL) < azimCfg.frontMax
+      && wristAtShoulder(shL, wristL) && armStraight('L');
+    const armFrontBodyR = horizontal(elevTorsoR) && Number.isFinite(azimFrontR)
+      && Math.abs(azimFrontR) < azimCfg.frontMax
       && wristAtShoulder(shR, wristR) && armStraight('R');
 
     // 抱臂：两腕的左右顺序相对肩膀翻转（用顺序而不是固定符号，人转身背对镜头也成立）
@@ -1459,11 +1587,22 @@ export class SignalEngine {
       },
       // 头部朝向：只有头部点也能判（躯干/髋不可见时仍有效）
       head,
+      // 人体朝向：正面/背面/侧对（只看肩线/躯干）。facing 是去抖后的状态，
+      // facing_raw 是本帧原始分类；yaw 用于把相机方位角换算成受试者自身方位。
+      body,
       uprightness_2d: up2d,
       uprightness_3d: up3d,
       leg_vertical: legVertical,
       leg_vertical_2d: leg2d,
       leg_vertical_3d: leg3d,
+      // 单腿竖直延伸（背身时远侧脚常被挡住）：蹲下姿态用它，stand/sit 仍用两侧平均。
+      leg_vertical_pick: legVerticalPick,
+      leg_vertical_pick_side: legPickSide,
+      // 髋-膝高度差 / 躯干长：正=髋在膝下方（蹲），负=髋在膝上方（站/跪）。
+      // 蹲下姿态用它排除单膝跪地/弓步；3D 优先（背身时 2D 投影更容易骗人）。
+      hip_knee_drop: hipKneeDrop,
+      hip_knee_drop_2d: hipKnee2d,
+      hip_knee_drop_3d: hipKnee3d,
       shoulder_y: shoulderMid[1],
       hip_y: hipMid[1],
       ankle_y: ankleMid[1],
@@ -1576,10 +1715,17 @@ export class SignalEngine {
         operating_roi_mode: regionCfg.mode,
         operating_roi_zones: regionCfg.mode === 'polygon'
           ? regionCfg.normalizedZones.length : (regionCfg.mode === 'rect' ? 1 : 0),
+        // 相机方位角（0°=朝镜头）与受试者自身方位角（0°=身体前方）。
+        // 背对/侧对时两者相差一个 body.yaw，前平举/取样用后者。
         azimuth_L: azimL,
         azimuth_R: azimR,
+        azimuth_body_L: azimBodyL,
+        azimuth_body_R: azimBodyR,
+        azimuth_body_source: bodyYaw != null ? body.yaw_source : null,
         arm_front_L: armFrontL,
         arm_front_R: armFrontR,
+        arm_front_body_L: armFrontBodyL,
+        arm_front_body_R: armFrontBodyR,
         arm_side_L: armSideL,
         arm_side_R: armSideR,
         ratio_source: useRatios ? '3d-if-available' : '2d',

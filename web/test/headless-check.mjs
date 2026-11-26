@@ -313,7 +313,8 @@ async function main() {
     // 必须放在「清空记录」之前——清空后 lastResult 归零，提示行会变回「—」。
     const armHint = await cdp.eval(`(() => {
       const el = document.getElementById('armHint');
-      const acts = [...document.querySelectorAll('#armGrid .act')];
+      // 面板分层：三个业务核心动作是大卡（#coreActions），其余产品动作在小格（#armGrid）
+      const acts = [...document.querySelectorAll('#coreActions .core-act, #armGrid .act')];
       return {
         hasHint: !!el,
         line: el ? el.textContent.trim() : null,
@@ -340,6 +341,30 @@ async function main() {
         filled: items.filter((i) => i.name && i.value).length,
         titled: items.filter((i) => /n=|样本不足|未评估/.test(i.title)).length,
         hint: document.getElementById('armHint').textContent,
+      };
+    })()`);
+
+    // 触发框：右侧用文字列出当前/最近触发。这里只要求框存在且有文案
+    // （样例片段不一定触发动作，具体动作的触发见 refuel-sampling-suite）。
+    const triggerBox = await cdp.eval(`(() => ({
+      hasNow: !!document.getElementById('triggerNow'),
+      hasLog: !!document.getElementById('triggerLog'),
+      hasMeta: !!document.getElementById('triggerMeta'),
+      nowText: (document.getElementById('triggerNow') || {}).textContent || '',
+    }))()`);
+
+    // 新增导出字段与姿态徽标（2026-11-26 审核修复）：
+    //   · frame-schema 承诺 signals.azimuth_body_source，pushLog 必须真的写进帧；
+    //   · 姿态徽标 title 要跟随判定实际用的那条腿（knee_side / leg_vertical_pick）。
+    const newFields = await cdp.eval(`(() => {
+      const f = window.__pose.lastFrame || null;
+      const sig = f && f.signals ? f.signals : null;
+      const el = document.getElementById('badgePosture');
+      return {
+        hasSignals: !!sig,
+        azimuthBodySource: sig ? ('azimuth_body_source' in sig ? sig.azimuth_body_source : 'missing') : null,
+        postureHidden: el ? el.hidden : null,
+        postureTitle: el ? el.title : '',
       };
     })()`);
 
@@ -400,6 +425,8 @@ async function main() {
     console.log('准确率：', JSON.stringify(accuracyUi));
     console.log('手部接线：', JSON.stringify(handWiring));
     console.log('动作提示：', JSON.stringify(armHint));
+    console.log('触发框：', JSON.stringify(triggerBox));
+    console.log('新增字段/姿态徽标：', JSON.stringify(newFields));
     console.log('布局：', JSON.stringify(layout));
     console.log('状态栏：', profileEcho);
     console.log('JS 错误：', errors.length ? errors : '无');
@@ -426,6 +453,14 @@ async function main() {
       && accuracyUi.count === ARM_VISIBLE_ACTIONS.length
       && accuracyUi.filled === ARM_VISIBLE_ACTIONS.length && accuracyUi.titled === ARM_VISIBLE_ACTIONS.length
       && !!accuracyUi.hint
+      && triggerBox.hasNow && triggerBox.hasLog && triggerBox.hasMeta
+      && triggerBox.nowText.trim().length > 0
+      // 导出字段：有 signals 时 azimuth_body_source 必须存在（null 也算「存在」）
+      && newFields.azimuthBodySource !== 'missing'
+      // 姿态徽标可见时，title 必须写明判定用的腿（3D·L / 2D·R …）或明确说膝角不可用
+      && (newFields.postureHidden !== false
+        || (/姿态：/.test(newFields.postureTitle)
+          && /(3D|2D)·[LR]|膝角不可用/.test(newFields.postureTitle)))
       && (!handWiring.handReady || handWiring.withHands > 0)
       && hardcase.options >= 10 && hardcase.hasButton && hardcase.frames > 0
       && hardcase.segment && hardcase.action === 'grasp'

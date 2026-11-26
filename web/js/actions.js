@@ -30,11 +30,35 @@ const EMPTY_FLAGS = {
  */
 export function buildPostures(actions) {
   const { posture } = actions;
-  // 只保留「站 / 坐」两种静态姿态。
-  // 躺卧、下蹲需要膝/踝同时可见且机位能拍到全身或地面，桌面摄像头与上半身构图下
-  // 判不了（不是识别失败，是信息不足）。与其留着一个恒为 null 的档位，
-  // 不如把姿态集合收敛到能在常见机位稳定判定的范围，见 README「初始版验证范围」。
+  // 静态姿态：站 / 坐 / 蹲下，加两个仅上半身的推断档。
+  // 蹲下需要膝/踝同时可见、机位拍到全身或地面；桌面摄像头与上半身构图下判不了
+  // （不是识别失败，是信息不足），此时保持 null，不硬凑（见 README「初始版验证范围」）。
   return [
+    {
+      // 蹲下（含背对相机的工人）：膝明显弯曲 + **髋明显下沉** + 躯干不接近水平。
+      // 背身时 2D 膝角会被透视压扁（看起来接近伸直），信号层默认优先用 world 3D 膝角，
+      // 所以这条在背影机位也能成立；没有 world 时才退回 2D。
+      // 「坐 vs 蹲」用 leg_vertical（踝-髋竖直距离 / 躯干长）区分：坐在椅子上约 0.9~1.0，
+      // 深蹲/半蹲约 0~0.7。低凳坐着髋同样很低，几何上仍无法与蹲分开（已知歧义）。
+      // 优先级高于「坐」：膝角/直立度量级太接近，反过来蹲会被「坐」吃掉。
+      id: 'crouch', name: '蹲下', prio: 25,
+      minMs: posture.crouch.minMs, streak: posture.crouch.streak,
+      cond: (s) => {
+        // 背身时远侧腿常被近侧腿挡住：leg_vertical_pick 用可见性更高的一条腿，
+        // 不再要求两侧膝/踝都可见（stand/sit 仍用两侧平均的 leg_vertical）。
+        const legV = Number.isFinite(s.leg_vertical_pick) ? s.leg_vertical_pick : s.leg_vertical;
+        return Number.isFinite(s.knee_pick)
+          && Number.isFinite(s.uprightness)
+          && Number.isFinite(legV)
+          && s.knee_pick > posture.crouch.kneeGt
+          && s.knee_pick < posture.crouch.kneeLt
+          && s.uprightness > posture.crouch.uprightnessGt
+          // 髋明显下沉才算蹲：坐在椅子上时踝-髋竖直距离≈小腿长，比值 0.9~1.0。
+          && legV < posture.crouch.legVerticalLt
+          // 髋不比膝高出太多：排除单膝跪地/弓步（髋远高于膝）；缺字段的手搓信号不设门。
+          && (s.hip_knee_drop == null || s.hip_knee_drop > posture.crouch.hipKneeDropGt);
+      },
+    },
     {
       id: 'sit', name: '坐', prio: 20,
       minMs: posture.sit.minMs, streak: posture.sit.streak,
@@ -282,17 +306,26 @@ export class ActionEngine {
     const carrying = this.carryHold.update(anyClosed
       && (ap.reach_L ?? 0) < this.carryCfg.maxReach
       && (ap.reach_R ?? 0) < this.carryCfg.maxReach, ts);
+    // 「前」以受试者自身为准：信号层给了 arm_front_body_*（背身时前进方向与相机相反）。
+    // 手搓信号对象/旧导出没有这个字段时退回相机版本，保持旧行为。
+    const armFrontOf = (side) => {
+      const body = side === 'L' ? ap.arm_front_body_L : ap.arm_front_body_R;
+      return body === undefined
+        ? !!(side === 'L' ? ap.arm_front_L : ap.arm_front_R)
+        : !!body;
+    };
+
     // 指向：伸出那条臂的手**判为指方向/手枪**，且**同一条臂**朝正面/侧面。
     // 以前只看「手被检出 + 任一臂朝前/侧」：张开手掌也算指向，还会出现
     // 「左臂伸出、右手做侧平举」把指向凑出来。现在手型与左右侧都绑定。
-    const pointArmL = extendedL && pointL && (ap.arm_front_L || ap.arm_side_L);
-    const pointArmR = extendedR && pointR && (ap.arm_front_R || ap.arm_side_R);
+    const pointArmL = extendedL && pointL && (armFrontOf('L') || ap.arm_side_L);
+    const pointArmR = extendedR && pointR && (armFrontOf('R') || ap.arm_side_R);
     const pointing = this.pointHold.update(pointArmL || pointArmR, ts);
 
     // 前/侧平举：信号层是瞬时布尔，这里补一个保持窗。
     // 走路摆臂时 3D 方位角的噪声会断续命中，实测最长一段只有 250ms；
     // 不加保持窗，界面会一直闪「前平举」。
-    const armFront = this.frontHold.update(!!(ap.arm_front_L || ap.arm_front_R), ts);
+    const armFront = this.frontHold.update(armFrontOf('L') || armFrontOf('R'), ts);
     const armSide = this.sideHold.update(!!(ap.arm_side_L || ap.arm_side_R), ts);
     // 操作设备（阀门/仪表）：手在设备区域/明显前伸，保持 800ms 才算「在做」
     const operating = this.operatingHold.update(!!(s.arm?.operating_any), ts);
@@ -380,6 +413,7 @@ export class ActionEngine {
 export const ACTION_CATALOG = [
   { id: 'stand', name: '站立', kind: '姿态' },
   { id: 'sit', name: '坐', kind: '姿态' },
+  { id: 'crouch', name: '蹲下', kind: '姿态' },
   // 上半身构图专用：膝/踝不可见时只凭肩+髋判躯干朝向，不是站/坐的替代（见 buildPostures）
   { id: 'upper_upright', name: '上半身直立', kind: '姿态' },
   { id: 'upper_lean', name: '上半身前倾', kind: '姿态' },
